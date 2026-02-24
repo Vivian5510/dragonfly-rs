@@ -233,6 +233,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
             let db = connection.parser.context.db_index;
             let reply = self.execute_user_command(db, &frame, None);
+            if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
+                // Dragonfly does not interleave ACK replies with journal stream writes.
+                // We model the same behavior by consuming successful ACK silently.
+                continue;
+            }
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
@@ -404,6 +409,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         frame: &CommandFrame,
     ) -> CommandReply {
         match frame.name.as_str() {
+            "INFO" => self.execute_info(frame),
+            "ROLE" => self.execute_role(frame),
+            "REPLCONF" => self.execute_replconf(frame),
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
             "MGET" => self.execute_mget(db, frame),
@@ -411,6 +419,97 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "GET" | "SET" | "EXPIRE" | "TTL" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
+    }
+
+    fn execute_info(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() > 1 {
+            return CommandReply::Error("wrong number of arguments for 'INFO' command".to_owned());
+        }
+
+        let section = match frame.args.first() {
+            None => "REPLICATION".to_owned(),
+            Some(raw) => match std::str::from_utf8(raw) {
+                Ok(value) => value.to_ascii_uppercase(),
+                Err(_) => {
+                    return CommandReply::Error("INFO section must be valid UTF-8".to_owned());
+                }
+            },
+        };
+
+        if !(section == "REPLICATION" || section == "ALL" || section == "DEFAULT") {
+            return CommandReply::Error(format!("unsupported INFO section '{section}'"));
+        }
+
+        let info = format!(
+            "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\nlast_ack_lsn:{}\r\n",
+            self.replication.connected_replicas(),
+            self.replication.master_replid(),
+            self.replication.replication_offset(),
+            self.replication.last_acked_lsn(),
+        );
+        CommandReply::BulkString(info.into_bytes())
+    }
+
+    fn execute_role(&self, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error("wrong number of arguments for 'ROLE' command".to_owned());
+        }
+
+        let replicas = Vec::with_capacity(self.replication.connected_replicas());
+        // Dragonfly reports master mode as:
+        // ["master", [[replica_ip, replica_port, replica_state], ...]]
+        CommandReply::Array(vec![
+            CommandReply::BulkString(b"master".to_vec()),
+            CommandReply::Array(replicas),
+        ])
+    }
+
+    fn execute_replconf(&mut self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+            return CommandReply::Error("syntax error".to_owned());
+        }
+
+        if frame.args.len() == 2
+            && frame.args[0].eq_ignore_ascii_case(b"CAPA")
+            && frame.args[1].eq_ignore_ascii_case(b"dragonfly")
+        {
+            return CommandReply::Array(vec![
+                CommandReply::BulkString(self.replication.master_replid().as_bytes().to_vec()),
+                CommandReply::BulkString(b"SYNC1".to_vec()),
+                CommandReply::Integer(i64::from(self.config.shard_count.get())),
+                CommandReply::Integer(1),
+            ]);
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let option = pair[0].as_slice();
+            let value = pair[1].as_slice();
+            if option.eq_ignore_ascii_case(b"ACK") {
+                let Ok(text) = std::str::from_utf8(value) else {
+                    return CommandReply::Error(
+                        "REPLCONF ACK offset must be valid UTF-8".to_owned(),
+                    );
+                };
+                let Ok(ack_lsn) = text.parse::<u64>() else {
+                    return CommandReply::Error(
+                        "value is not an integer or out of range".to_owned(),
+                    );
+                };
+                self.replication.record_replica_ack(ack_lsn);
+                continue;
+            }
+            if option.eq_ignore_ascii_case(b"LISTENING-PORT")
+                || option.eq_ignore_ascii_case(b"IP-ADDRESS")
+                || option.eq_ignore_ascii_case(b"CAPA")
+                || option.eq_ignore_ascii_case(b"CLIENT-ID")
+                || option.eq_ignore_ascii_case(b"CLIENT-VERSION")
+            {
+                continue;
+            }
+            return CommandReply::Error("syntax error".to_owned());
+        }
+
+        CommandReply::SimpleString("OK".to_owned())
     }
 
     fn execute_dfly_admin(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -662,6 +761,11 @@ fn wrong_arity(command_name: &str) -> Vec<u8> {
         "wrong number of arguments for '{command_name}' command"
     ))
     .to_resp_bytes()
+}
+
+/// Returns whether one command is `REPLCONF ACK <offset>`.
+fn is_replconf_ack_command(frame: &CommandFrame) -> bool {
+    frame.name == "REPLCONF" && frame.args.len() == 2 && frame.args[0].eq_ignore_ascii_case(b"ACK")
 }
 
 /// Returns journal op kind when the command mutated keyspace state.
@@ -1252,6 +1356,90 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_role_reports_master_with_empty_replica_list() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed");
+        assert_that!(&reply, eq(&vec![b"*2\r\n$6\r\nmaster\r\n*0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_info_replication_reports_master_offsets() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"info:key", b"info:value"]),
+            )
+            .expect("SET should succeed");
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("# Replication\r\n"), eq(true));
+        assert_that!(body.contains("role:master\r\n"), eq(true));
+        assert_that!(body.contains("connected_slaves:0\r\n"), eq(true));
+        assert_that!(body.contains("master_replid:"), eq(true));
+        assert_that!(body.contains("master_repl_offset:1\r\n"), eq(true));
+        assert_that!(body.contains("last_ack_lsn:0\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_replconf_ack_is_silent_and_tracks_ack_lsn() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
+            )
+            .expect("SET should succeed");
+
+        let ack_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
+            )
+            .expect("REPLCONF ACK should parse");
+        assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
+        assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+
+        let info = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_replconf_capa_dragonfly_returns_handshake_array() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        assert_that!(reply.len(), eq(1_usize));
+
+        let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
+        assert_that!(payload.starts_with("*4\r\n$40\r\n"), eq(true));
+        assert_that!(payload.contains("\r\n$5\r\nSYNC1\r\n"), eq(true));
+        let shard_and_version = format!(":{}\r\n:1\r\n", app.config.shard_count.get());
+        assert_that!(payload.contains(&shard_and_version), eq(true));
+    }
+
+    #[rstest]
     fn server_snapshot_roundtrip_restores_data_across_databases() {
         let mut source = ServerApp::new(RuntimeConfig::default());
         let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -1628,6 +1816,24 @@ mod tests {
             payload.extend_from_slice(b"\r\n");
         }
         payload
+    }
+
+    fn decode_resp_bulk_payload(frame: &[u8]) -> String {
+        assert_that!(frame.first(), eq(Some(&b'$')));
+
+        let Some(header_end) = frame.windows(2).position(|window| window == b"\r\n") else {
+            panic!("RESP bulk string must contain a header terminator");
+        };
+        let header = std::str::from_utf8(&frame[1..header_end]).expect("header must be UTF-8");
+        let payload_len = header
+            .parse::<usize>()
+            .expect("header must encode bulk payload length");
+
+        let payload_start = header_end + 2;
+        let payload_end = payload_start + payload_len;
+        std::str::from_utf8(&frame[payload_start..payload_end])
+            .expect("payload must be UTF-8")
+            .to_owned()
     }
 
     fn unique_test_snapshot_path(tag: &str) -> PathBuf {

@@ -4,6 +4,7 @@ pub mod journal;
 pub mod state;
 
 use journal::{InMemoryJournal, JournalEntry};
+use state::ReplicationState;
 
 /// Replication subsystem bootstrap module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +13,8 @@ pub struct ReplicationModule {
     pub enabled: bool,
     /// Append-only journal buffer.
     pub journal: InMemoryJournal,
+    /// Replication state and control-plane metadata.
+    pub state: ReplicationState,
 }
 
 impl ReplicationModule {
@@ -21,6 +24,7 @@ impl ReplicationModule {
         Self {
             enabled,
             journal: InMemoryJournal::new(),
+            state: ReplicationState::default(),
         }
     }
 
@@ -28,6 +32,8 @@ impl ReplicationModule {
     pub fn append_journal(&mut self, entry: JournalEntry) {
         if self.enabled {
             let _ = self.journal.append(entry);
+            self.state
+                .set_last_lsn_from_next_cursor(self.journal.current_lsn());
         }
     }
 
@@ -43,6 +49,18 @@ impl ReplicationModule {
         self.journal.current_lsn()
     }
 
+    /// Returns master replication id.
+    #[must_use]
+    pub fn master_replid(&self) -> &str {
+        &self.state.master_replid
+    }
+
+    /// Returns current master replication offset.
+    #[must_use]
+    pub fn replication_offset(&self) -> u64 {
+        self.state.last_lsn
+    }
+
     /// Returns whether one LSN can be served from current in-memory backlog.
     #[must_use]
     pub fn journal_contains_lsn(&self, lsn: u64) -> bool {
@@ -53,5 +71,22 @@ impl ReplicationModule {
     #[must_use]
     pub fn journal_entry_at_lsn(&self, lsn: u64) -> Option<JournalEntry> {
         self.journal.entry_at_lsn(lsn)
+    }
+
+    /// Records one replica ACK offset.
+    pub fn record_replica_ack(&mut self, ack_lsn: u64) {
+        self.state.record_ack_lsn(ack_lsn);
+    }
+
+    /// Returns highest acknowledged LSN from replicas.
+    #[must_use]
+    pub fn last_acked_lsn(&self) -> u64 {
+        self.state.last_acked_lsn
+    }
+
+    /// Returns connected replica count reported by control-plane state.
+    #[must_use]
+    pub fn connected_replicas(&self) -> usize {
+        self.state.connected_replicas
     }
 }
