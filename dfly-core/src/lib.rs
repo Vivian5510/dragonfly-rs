@@ -350,7 +350,11 @@ impl CoreModule {
     ///
     /// Runtime worker fibers already own their destination shard queue. This
     /// entrypoint keeps that ownership contract explicit by rejecting
-    /// non-single-key and cross-shard command shapes.
+    /// cross-shard command shapes.
+    ///
+    /// Supported worker command classes:
+    /// - single-key commands (`GET`, `SET`, `DEL`, ...)
+    /// - same-shard two-key copy/rename family (`COPY`, `RENAME`, `RENAMENX`)
     #[must_use]
     pub fn execute_on_shard_in_db(
         &self,
@@ -358,28 +362,49 @@ impl CoreModule {
         db: DbIndex,
         frame: &CommandFrame,
     ) -> CommandReply {
-        if !matches!(
+        if matches!(
             self.command_routing(frame),
             CommandRouting::SingleKey { .. }
         ) {
-            return CommandReply::Error(
-                "runtime worker only supports single-key commands".to_owned(),
-            );
-        }
-        let Some(key) = frame.args.first() else {
-            return CommandReply::Error("runtime worker requires one key argument".to_owned());
-        };
-        let resolved = self.resolve_shard_for_key(key);
-        if resolved != shard {
-            return CommandReply::Error(format!(
-                "runtime worker shard mismatch: envelope={shard}, key={resolved}",
-            ));
+            let Some(key) = frame.args.first() else {
+                return CommandReply::Error("runtime worker requires one key argument".to_owned());
+            };
+            let resolved = self.resolve_shard_for_key(key);
+            if resolved != shard {
+                return CommandReply::Error(format!(
+                    "runtime worker shard mismatch: envelope={shard}, key={resolved}",
+                ));
+            }
+
+            let Some(mut target_state) = self.lock_shard(shard) else {
+                return CommandReply::Error(format!("invalid target shard {shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, &mut target_state);
         }
 
-        let Some(mut target_state) = self.lock_shard(shard) else {
-            return CommandReply::Error(format!("invalid target shard {shard}"));
-        };
-        self.command_registry.dispatch(db, frame, &mut target_state)
+        if matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") && frame.args.len() >= 2 {
+            let source = self.resolve_shard_for_key(&frame.args[0]);
+            let destination = self.resolve_shard_for_key(&frame.args[1]);
+            if source != shard || destination != shard {
+                return CommandReply::Error(format!(
+                    "runtime worker shard mismatch: envelope={shard}, source={source}, destination={destination}",
+                ));
+            }
+
+            let Some(mut target_state) = self.lock_shard(shard) else {
+                return CommandReply::Error(format!("invalid target shard {shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, &mut target_state);
+        }
+
+        if matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") && frame.args.len() < 2 {
+            let Some(mut target_state) = self.lock_shard(shard) else {
+                return CommandReply::Error(format!("invalid target shard {shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, &mut target_state);
+        }
+
+        CommandReply::Error("runtime worker only supports single-key commands".to_owned())
     }
 
     fn execute_rename_in_db(
@@ -1090,6 +1115,70 @@ mod tests {
             eq(&CommandReply::Error(
                 "runtime worker only supports single-key commands".to_owned()
             ))
+        );
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_runs_same_shard_copy_command() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let source_key = b"runtime:copy:source".to_vec();
+        let shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"runtime:copy:destination".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard != shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("runtime:copy:destination:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let set = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let copy = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("COPY", vec![source_key.clone(), destination_key.clone()]),
+        );
+        assert_that!(&copy, eq(&CommandReply::Integer(1)));
+
+        let destination_value =
+            core.execute_on_shard_in_db(shard, 0, &CommandFrame::new("GET", vec![destination_key]));
+        assert_that!(
+            &destination_value,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_rejects_cross_shard_copy_command() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let source_key = b"runtime:copy:cross:source".to_vec();
+        let source_shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"runtime:copy:cross:destination".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard == source_shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("runtime:copy:cross:destination:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let copy = core.execute_on_shard_in_db(
+            source_shard,
+            0,
+            &CommandFrame::new("COPY", vec![source_key, destination_key]),
+        );
+        let CommandReply::Error(copy_error) = copy else {
+            panic!("cross-shard copy must fail");
+        };
+        assert_that!(
+            copy_error.contains("runtime worker shard mismatch"),
+            eq(true)
         );
     }
 

@@ -251,6 +251,11 @@ impl ServerApp {
                 return reply;
             }
 
+            if let Some(reply) = self.execute_same_shard_copy_rename_via_runtime(db, frame) {
+                self.maybe_append_journal_for_command(txid, db, frame, &reply);
+                return reply;
+            }
+
             if let Some(reply) = self.execute_multikey_string_commands_via_runtime(db, frame) {
                 self.maybe_append_journal_for_command(txid, db, frame, &reply);
                 return reply;
@@ -272,6 +277,63 @@ impl ServerApp {
         let reply = self.execute_command_without_side_effects(db, frame);
         self.maybe_append_journal_for_command(txid, db, frame, &reply);
         reply
+    }
+
+    pub(super) fn execute_same_shard_copy_rename_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> Option<CommandReply> {
+        if !matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") {
+            return None;
+        }
+        if frame.args.len() < 2 {
+            return None;
+        }
+
+        let keys_for_cluster_check: Vec<&[u8]> = match frame.name.as_str() {
+            "COPY" => frame.args.iter().take(2).map(Vec::as_slice).collect(),
+            _ => frame.args.iter().map(Vec::as_slice).collect(),
+        };
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(keys_for_cluster_check)
+        {
+            return Some(error_reply);
+        }
+
+        let source_shard = self.core.resolve_shard_for_key(&frame.args[0]);
+        let destination_shard = self.core.resolve_shard_for_key(&frame.args[1]);
+        if source_shard != destination_shard {
+            return None;
+        }
+        let shard = source_shard;
+        if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+
+        let sequence = match self.submit_runtime_envelope_with_sequence(shard, db, frame, true) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                return Some(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+            }
+        };
+        if let Err(error) = self.runtime.wait_until_processed_sequence(shard, sequence) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+        match self.runtime.take_processed_reply(shard, sequence) {
+            Ok(Some(reply)) => Some(reply),
+            Ok(None) => Some(CommandReply::Error(
+                "runtime dispatch failed: missing worker reply".to_owned(),
+            )),
+            Err(error) => Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            ))),
+        }
     }
 
     pub(super) fn execute_multikey_string_commands_via_runtime(

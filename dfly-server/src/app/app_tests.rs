@@ -2131,6 +2131,60 @@ fn direct_mset_executes_each_key_on_worker_fiber() {
 }
 
 #[rstest]
+fn direct_copy_same_shard_executes_on_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let source_key = b"direct:rt:copy:source".to_vec();
+    let shard = app.core.resolve_shard_for_key(&source_key);
+    let mut destination_key = b"direct:rt:copy:destination".to_vec();
+    let mut destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    let mut suffix = 0_u32;
+    while destination_shard != shard {
+        suffix = suffix.saturating_add(1);
+        destination_key = format!("direct:rt:copy:destination:{suffix}").into_bytes();
+        destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    }
+
+    let set = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        None,
+    );
+    assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+    for shard_id in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard_id)
+            .expect("drain should succeed");
+    }
+
+    let frame = CommandFrame::new("COPY", vec![source_key.clone(), destination_key.clone()]);
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::Integer(1)));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let destination_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+    assert_that!(
+        &destination_value,
+        eq(&CommandReply::BulkString(b"value".to_vec()))
+    );
+}
+
+#[rstest]
 fn direct_del_multikey_executes_each_key_on_worker_fiber() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:del:1".to_vec();
