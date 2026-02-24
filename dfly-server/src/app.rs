@@ -513,6 +513,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
         let txid = self.allocate_txid();
+        let touched_shards = self.collect_plan_touched_shards(queued_commands);
         let mut all_single_key = true;
         let mut all_read_only_single_key = true;
         for command in queued_commands {
@@ -534,6 +535,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 txid,
                 mode: TransactionMode::NonAtomic,
                 hops: self.build_single_key_hops(queued_commands),
+                touched_shards: touched_shards.clone(),
             };
         }
         if all_single_key {
@@ -541,6 +543,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 txid,
                 mode: TransactionMode::LockAhead,
                 hops: self.build_single_key_hops(queued_commands),
+                touched_shards: touched_shards.clone(),
             };
         }
 
@@ -556,7 +559,21 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             txid,
             mode: TransactionMode::Global,
             hops,
+            touched_shards,
         }
+    }
+
+    fn collect_plan_touched_shards(&self, queued_commands: &[CommandFrame]) -> Vec<u16> {
+        // Scheduler reservation must follow the runtime fanout footprint instead of
+        // planner-local shard hints, otherwise multi-shard commands in Global mode
+        // can bypass queue isolation on non-hinted shards.
+        let mut touched = queued_commands
+            .iter()
+            .flat_map(|command| self.runtime_target_shards_for_command(command))
+            .collect::<Vec<_>>();
+        touched.sort_unstable();
+        touched.dedup();
+        touched
     }
 
     fn build_single_key_hops(&self, queued_commands: &[CommandFrame]) -> Vec<TransactionHop> {
@@ -3858,6 +3875,9 @@ mod tests {
         assert_that!(plan.hops[0].per_shard[0].0, eq(first_shard));
         assert_that!(plan.hops[0].per_shard[1].0, eq(second_shard));
         assert_that!(plan.hops[1].per_shard[0].0, eq(first_shard));
+        assert_that!(plan.touched_shards.len(), eq(2_usize));
+        assert_that!(plan.touched_shards.contains(&first_shard), eq(true));
+        assert_that!(plan.touched_shards.contains(&second_shard), eq(true));
 
         let flattened = plan
             .hops
@@ -3893,6 +3913,9 @@ mod tests {
         assert_that!(plan.hops.len(), eq(2_usize));
         assert_that!(plan.hops[0].per_shard.len(), eq(2_usize));
         assert_that!(plan.hops[1].per_shard.len(), eq(1_usize));
+        assert_that!(plan.touched_shards.len(), eq(2_usize));
+        assert_that!(plan.touched_shards.contains(&first_shard), eq(true));
+        assert_that!(plan.touched_shards.contains(&second_shard), eq(true));
 
         let flattened = plan
             .hops
@@ -3910,6 +3933,7 @@ mod tests {
             CommandFrame::new("SET", vec![b"plan:key".to_vec(), b"value".to_vec()]),
             CommandFrame::new("TIME", Vec::new()),
         ];
+        let set_shard = app.core.resolve_shard_for_key(b"plan:key");
 
         let plan = app.build_exec_plan(&queued);
         assert_that!(plan.mode, eq(TransactionMode::Global));
@@ -3918,6 +3942,7 @@ mod tests {
             plan.hops.iter().all(|hop| hop.per_shard.len() == 1),
             eq(true)
         );
+        assert_that!(&plan.touched_shards, eq(&vec![set_shard]));
 
         let flattened = plan
             .hops
@@ -3997,6 +4022,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: vec![(shard, command.clone())],
             }],
+            touched_shards: vec![shard],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);
@@ -4029,6 +4055,7 @@ mod tests {
         )];
         let plan = app.build_exec_plan(&queued);
         assert_that!(plan.mode, eq(TransactionMode::Global));
+        assert_that!(&plan.touched_shards, eq(&vec![first_shard, second_shard]));
 
         let replies = app.execute_transaction_plan(0, &plan);
         assert_that!(
@@ -4240,6 +4267,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: vec![(u16::MAX, CommandFrame::new("PING", Vec::new()))],
             }],
+            touched_shards: vec![u16::MAX],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);
@@ -4269,6 +4297,7 @@ mod tests {
                     ),
                 ],
             }],
+            touched_shards: vec![shard, u16::MAX],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);
@@ -4308,6 +4337,7 @@ mod tests {
                     )],
                 },
             ],
+            touched_shards: vec![shard, u16::MAX],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);
@@ -4352,6 +4382,7 @@ mod tests {
                     )],
                 },
             ],
+            touched_shards: vec![0, key_shard],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);
@@ -4378,6 +4409,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: vec![(0, CommandFrame::new("PING", Vec::new()))],
             }],
+            touched_shards: vec![0],
         };
 
         let replies = app.execute_transaction_plan(0, &plan);

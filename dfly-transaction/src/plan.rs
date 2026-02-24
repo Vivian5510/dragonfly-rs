@@ -31,4 +31,10 @@ pub struct TransactionPlan {
     pub mode: TransactionMode,
     /// Ordered hop sequence.
     pub hops: Vec<TransactionHop>,
+    /// Full shard reservation footprint for this transaction.
+    ///
+    /// This set may be wider than `hops[*].per_shard[*].0` because some commands
+    /// fan out at runtime (for example `MSET` on keys belonging to different shards).
+    /// Scheduler queue reservation must use this full footprint to preserve isolation.
+    pub touched_shards: Vec<ShardId>,
 }

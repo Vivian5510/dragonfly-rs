@@ -98,11 +98,13 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             }
         };
 
-        let mut touched_shards = HashSet::new();
-        for hop in &plan.hops {
-            for (shard, command) in &hop.per_shard {
-                let _ = touched_shards.insert(*shard);
-                let _ = command;
+        let mut touched_shards = plan.touched_shards.iter().copied().collect::<HashSet<_>>();
+        if touched_shards.is_empty() {
+            // Keep a fallback for planner callsites that do not provide explicit footprint yet.
+            for hop in &plan.hops {
+                for (shard, _) in &hop.per_shard {
+                    let _ = touched_shards.insert(*shard);
+                }
             }
         }
 
@@ -334,6 +336,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: Vec::new(),
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -350,6 +353,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: vec![(0, command.clone()), (0, command)],
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -370,6 +374,7 @@ mod tests {
                     per_shard: vec![(1, CommandFrame::new("ECHO", vec![b"x".to_vec()]))],
                 },
             ],
+            touched_shards: vec![0, 1],
         };
 
         let result = scheduler.schedule(&plan);
@@ -388,6 +393,7 @@ mod tests {
                     CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -406,6 +412,7 @@ mod tests {
                     CommandFrame::new("EXISTS", vec![b"k1".to_vec(), b"k2".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -421,6 +428,7 @@ mod tests {
             hops: vec![TransactionHop {
                 per_shard: vec![(0, CommandFrame::new("GET", vec![b"k".to_vec()]))],
             }],
+            touched_shards: vec![0],
         };
         let lock_ahead = TransactionPlan {
             txid: 11,
@@ -431,6 +439,7 @@ mod tests {
                     CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         assert_that!(scheduler.schedule(&non_atomic).is_ok(), eq(true));
@@ -449,6 +458,7 @@ mod tests {
                     CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -475,6 +485,7 @@ mod tests {
                     ),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         let result = scheduler.schedule(&plan);
@@ -493,6 +504,7 @@ mod tests {
                     CommandFrame::new("SET", vec![b"k".to_vec(), b"1".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
         let second = TransactionPlan {
             txid: 11,
@@ -503,6 +515,7 @@ mod tests {
                     CommandFrame::new("SET", vec![b"k".to_vec(), b"2".to_vec()]),
                 )],
             }],
+            touched_shards: vec![0],
         };
 
         assert_that!(scheduler.schedule(&first).is_ok(), eq(true));
@@ -516,5 +529,45 @@ mod tests {
     fn scheduler_conclude_is_noop_for_unknown_txid() {
         let scheduler = InMemoryTransactionScheduler::default();
         assert_that!(scheduler.conclude(999).is_ok(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_global_mode_reserves_full_runtime_shard_footprint() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let global = TransactionPlan {
+            txid: 20,
+            mode: TransactionMode::Global,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new(
+                        "MSET",
+                        vec![
+                            b"cross:0".to_vec(),
+                            b"a".to_vec(),
+                            b"cross:1".to_vec(),
+                            b"b".to_vec(),
+                        ],
+                    ),
+                )],
+            }],
+            touched_shards: vec![0, 1],
+        };
+        let shard_one_writer = TransactionPlan {
+            txid: 21,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    1,
+                    CommandFrame::new("SET", vec![b"cross:1".to_vec(), b"next".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![1],
+        };
+
+        assert_that!(scheduler.schedule(&global).is_ok(), eq(true));
+        assert_that!(scheduler.schedule(&shard_one_writer).is_err(), eq(true));
+        assert_that!(scheduler.conclude(global.txid).is_ok(), eq(true));
+        assert_that!(scheduler.schedule(&shard_one_writer).is_ok(), eq(true));
     }
 }
