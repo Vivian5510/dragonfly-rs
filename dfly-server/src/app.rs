@@ -552,6 +552,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
+            "COPY" => self.execute_copy(db, frame),
             "RENAME" | "RENAMENX" => self.execute_rename(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "APPEND"
             | "STRLEN" | "MOVE" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
@@ -1425,6 +1426,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.core.execute_in_db(db, frame)
     }
 
+    fn execute_copy(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() >= 2
+            && let Some(error_reply) = self
+                .ensure_cluster_multi_key_constraints(frame.args.iter().take(2).map(Vec::as_slice))
+        {
+            return error_reply;
+        }
+        self.core.execute_in_db(db, frame)
+    }
+
     fn ensure_cluster_multi_key_constraints<'a, I>(&self, keys: I) -> Option<CommandReply>
     where
         I: IntoIterator<Item = &'a [u8]>,
@@ -1589,7 +1600,7 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         {
             Some(JournalOp::Command)
         }
-        ("SETNX" | "MSETNX" | "MOVE" | "RENAMENX", CommandReply::Integer(1))
+        ("SETNX" | "MSETNX" | "MOVE" | "RENAMENX" | "COPY", CommandReply::Integer(1))
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
         | ("GETDEL", CommandReply::BulkString(_))
         | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
@@ -2159,6 +2170,110 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dup"]))
             .expect("GET source should execute");
         assert_that!(&source, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_copy_follows_dragonfly_replace_and_error_semantics() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let missing = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", b"missing", b"dst"]),
+            )
+            .expect("COPY missing key should parse");
+        assert_that!(&missing, eq(&vec![b":0\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"src", b"60", b"v1"]),
+            )
+            .expect("SETEX src should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dst", b"v2"]))
+            .expect("SET dst should execute");
+
+        let blocked = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
+            .expect("COPY without REPLACE should execute");
+        assert_that!(&blocked, eq(&vec![b":0\r\n".to_vec()]));
+
+        let replaced = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
+            )
+            .expect("COPY REPLACE should execute");
+        assert_that!(&replaced, eq(&vec![b":1\r\n".to_vec()]));
+
+        let src = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"src"]))
+            .expect("GET src should execute");
+        let dst = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dst"]))
+            .expect("GET dst should execute");
+        assert_that!(&src, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+        assert_that!(&dst, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+
+        let same = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"dst", b"dst"]))
+            .expect("COPY same key should parse");
+        assert_that!(
+            &same,
+            eq(&vec![
+                b"-ERR source and destination objects are the same\r\n".to_vec()
+            ])
+        );
+
+        let unsupported_db = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", b"src", b"dst2", b"DB", b"1"]),
+            )
+            .expect("COPY with DB option should parse");
+        assert_that!(
+            &unsupported_db,
+            eq(&vec![b"-ERR syntax error\r\n".to_vec()])
+        );
+    }
+
+    #[rstest]
+    fn resp_copy_rejects_crossslot_keys_in_cluster_mode() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let source_key = b"copy:{100}".to_vec();
+        let mut destination_key = b"copy:{200}".to_vec();
+        let mut suffix = 0_u32;
+        while key_slot(&destination_key) == key_slot(&source_key) {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("copy:{{200}}:{suffix}").into_bytes();
+        }
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", &source_key, b"value"]),
+            )
+            .expect("SET source should execute");
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", &source_key, &destination_key]),
+            )
+            .expect("COPY should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]
@@ -3450,6 +3565,45 @@ mod tests {
         assert_that!(entries[1].op, eq(JournalOp::Command));
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("RENAMENX"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_copy_only_when_destination_is_written() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v1"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", b"missing", b"dst"]),
+            )
+            .expect("COPY missing should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
+            .expect("COPY success should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
+            .expect("COPY blocked should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
+            )
+            .expect("COPY REPLACE should execute");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("COPY"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[2].payload).contains("COPY"),
             eq(true)
         );
     }

@@ -8,7 +8,9 @@ pub mod sharding;
 use command::{CommandFrame, CommandReply};
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{DbIndex, ShardCount};
-use dispatch::{CommandRegistry, DispatchState, ValueEntry, rename_between_states};
+use dispatch::{
+    CommandRegistry, DispatchState, ValueEntry, copy_between_states, rename_between_states,
+};
 use sharding::{HashTagShardResolver, ShardResolver};
 
 /// Core module bootstrap object.
@@ -71,6 +73,7 @@ impl CoreModule {
     #[must_use]
     pub fn execute_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
         match frame.name.as_str() {
+            "COPY" => return self.execute_copy_in_db(db, frame),
             "RENAME" => return self.execute_rename_in_db(db, frame, false),
             "RENAMENX" => return self.execute_rename_in_db(db, frame, true),
             _ => {}
@@ -130,6 +133,35 @@ impl CoreModule {
             source_state,
             destination_state,
         )
+    }
+
+    fn execute_copy_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() < 2 {
+            return CommandReply::Error("wrong number of arguments for 'COPY' command".to_owned());
+        }
+
+        let source_key = &frame.args[0];
+        let destination_key = &frame.args[1];
+
+        let source_shard = usize::from(self.resolve_shard_for_key(source_key));
+        let destination_shard = usize::from(self.resolve_shard_for_key(destination_key));
+
+        if source_shard == destination_shard {
+            let Some(target_state) = self.shard_states.get_mut(source_shard) else {
+                return CommandReply::Error(format!("invalid target shard {source_shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, target_state);
+        }
+
+        let Some((source_state, destination_state)) =
+            shard_pair_mut(&mut self.shard_states, source_shard, destination_shard)
+        else {
+            return CommandReply::Error(format!(
+                "invalid copy shard pair {source_shard}->{destination_shard}"
+            ));
+        };
+
+        copy_between_states(db, &frame.args, source_state, destination_state)
     }
 
     /// Validates a command against core command-table arity/existence rules.
@@ -249,10 +281,10 @@ impl CoreModule {
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
         match frame.name.as_str() {
             "GET" | "SET" | "TYPE" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "DEL"
-            | "UNLINK" | "EXISTS" | "TOUCH" | "MOVE" | "RENAME" | "RENAMENX" | "GETRANGE"
-            | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT"
-            | "TTL" | "PTTL" | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME" | "INCR" | "DECR"
-            | "INCRBY" | "DECRBY" | "SETNX" => frame
+            | "UNLINK" | "EXISTS" | "TOUCH" | "MOVE" | "COPY" | "RENAME" | "RENAMENX"
+            | "GETRANGE" | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+            | "PEXPIREAT" | "TTL" | "PTTL" | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME" | "INCR"
+            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),
@@ -557,5 +589,40 @@ mod tests {
         let destination = core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
         assert_that!(&source, eq(&CommandReply::BulkString(b"src".to_vec())));
         assert_that!(&destination, eq(&CommandReply::BulkString(b"dst".to_vec())));
+    }
+
+    #[rstest]
+    fn core_copy_duplicates_value_across_shards_without_removing_source() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let source_key = b"copy:src".to_vec();
+        let source_shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"copy:dst".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard == source_shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("copy:dst:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        );
+
+        let copied = core.execute_in_db(
+            0,
+            &CommandFrame::new("COPY", vec![source_key.clone(), destination_key.clone()]),
+        );
+        assert_that!(&copied, eq(&CommandReply::Integer(1)));
+
+        let source = core.execute_in_db(0, &CommandFrame::new("GET", vec![source_key]));
+        let destination = core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+        assert_that!(&source, eq(&CommandReply::BulkString(b"value".to_vec())));
+        assert_that!(
+            &destination,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
     }
 }

@@ -290,6 +290,11 @@ impl CommandRegistry {
             handler: handle_move,
         });
         self.register(CommandSpec {
+            name: "COPY",
+            arity: CommandArity::AtLeast(2),
+            handler: handle_copy,
+        });
+        self.register(CommandSpec {
             name: "RENAME",
             arity: CommandArity::Exact(2),
             handler: handle_rename,
@@ -690,6 +695,10 @@ fn handle_move(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
     CommandReply::Integer(1)
 }
 
+fn handle_copy(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    copy_single_state(db, &frame.args, state)
+}
+
 fn handle_rename(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     rename_single_state(db, &frame.args[0], &frame.args[1], false, state)
 }
@@ -750,6 +759,86 @@ pub fn rename_between_states(
     }
 }
 
+/// Copies one key between two different shard states.
+///
+/// This helper exists for cross-shard `COPY` in `CoreModule`, where source and destination keys
+/// hash to different owners and therefore cannot be handled by one shard-local command dispatch.
+#[must_use]
+pub fn copy_between_states(
+    db: DbIndex,
+    args: &[Vec<u8>],
+    source_state: &mut DispatchState,
+    destination_state: &mut DispatchState,
+) -> CommandReply {
+    let copy = match parse_copy_command(args) {
+        Ok(copy) => copy,
+        Err(reply) => return reply,
+    };
+    if copy.source_key == copy.destination_key {
+        return CommandReply::Error("source and destination objects are the same".to_owned());
+    }
+
+    source_state.purge_expired_key(db, copy.source_key);
+    destination_state.purge_expired_key(db, copy.destination_key);
+
+    let Some(source_entry) = source_state
+        .db_map(db)
+        .and_then(|map| map.get(copy.source_key))
+        .cloned()
+    else {
+        return CommandReply::Integer(0);
+    };
+
+    if !copy.replace
+        && destination_state
+            .db_map(db)
+            .is_some_and(|map| map.contains_key(copy.destination_key))
+    {
+        return CommandReply::Integer(0);
+    }
+
+    destination_state
+        .db_map_mut(db)
+        .insert(copy.destination_key.to_vec(), source_entry);
+    destination_state.bump_key_version(db, copy.destination_key);
+    CommandReply::Integer(1)
+}
+
+fn copy_single_state(db: DbIndex, args: &[Vec<u8>], state: &mut DispatchState) -> CommandReply {
+    let copy = match parse_copy_command(args) {
+        Ok(copy) => copy,
+        Err(reply) => return reply,
+    };
+    if copy.source_key == copy.destination_key {
+        return CommandReply::Error("source and destination objects are the same".to_owned());
+    }
+
+    state.purge_expired_key(db, copy.source_key);
+    state.purge_expired_key(db, copy.destination_key);
+
+    let Some(source_entry) = state
+        .db_map(db)
+        .and_then(|map| map.get(copy.source_key))
+        .cloned()
+    else {
+        return CommandReply::Integer(0);
+    };
+
+    if !copy.replace
+        && state
+            .db_map(db)
+            .is_some_and(|map| map.contains_key(copy.destination_key))
+    {
+        return CommandReply::Integer(0);
+    }
+
+    state
+        .db_map_mut(db)
+        .insert(copy.destination_key.to_vec(), source_entry);
+    state.bump_key_version(db, copy.destination_key);
+    CommandReply::Integer(1)
+}
+
 fn rename_single_state(
     db: DbIndex,
     source_key: &[u8],
@@ -798,6 +887,41 @@ fn rename_single_state(
     } else {
         CommandReply::SimpleString("OK".to_owned())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyCommand<'a> {
+    source_key: &'a [u8],
+    destination_key: &'a [u8],
+    replace: bool,
+}
+
+fn parse_copy_command(args: &[Vec<u8>]) -> Result<CopyCommand<'_>, CommandReply> {
+    let Some(source_key) = args.first().map(Vec::as_slice) else {
+        return Err(CommandReply::Error(
+            "wrong number of arguments for 'COPY' command".to_owned(),
+        ));
+    };
+    let Some(destination_key) = args.get(1).map(Vec::as_slice) else {
+        return Err(CommandReply::Error(
+            "wrong number of arguments for 'COPY' command".to_owned(),
+        ));
+    };
+
+    let replace = match args.get(2) {
+        None => false,
+        Some(option) if option.eq_ignore_ascii_case(b"REPLACE") => true,
+        Some(_) => return Err(CommandReply::Error("syntax error".to_owned())),
+    };
+    if args.len() > 3 {
+        return Err(CommandReply::Error("syntax error".to_owned()));
+    }
+
+    Ok(CopyCommand {
+        source_key,
+        destination_key,
+        replace,
+    })
 }
 
 fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -1692,6 +1816,134 @@ mod tests {
         );
         assert_that!(&source, eq(&CommandReply::BulkString(b"db0".to_vec())));
         assert_that!(&target, eq(&CommandReply::BulkString(b"db1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_copy_duplicates_source_without_removing_it() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETEX",
+                vec![b"src".to_vec(), b"60".to_vec(), b"value".to_vec()],
+            ),
+            &mut state,
+        );
+
+        let copied = registry.dispatch(
+            0,
+            &CommandFrame::new("COPY", vec![b"src".to_vec(), b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&copied, eq(&CommandReply::Integer(1)));
+
+        let source = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"src".to_vec()]),
+            &mut state,
+        );
+        let destination = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&source, eq(&CommandReply::BulkString(b"value".to_vec())));
+        assert_that!(
+            &destination,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
+
+        let source_expire = state
+            .db_map(0)
+            .and_then(|map| map.get(b"src".as_slice()))
+            .and_then(|entry| entry.expire_at_unix_secs);
+        let destination_expire = state
+            .db_map(0)
+            .and_then(|map| map.get(b"dst".as_slice()))
+            .and_then(|entry| entry.expire_at_unix_secs);
+        assert_that!(source_expire, eq(destination_expire));
+    }
+
+    #[rstest]
+    fn dispatch_copy_requires_replace_to_overwrite_existing_destination() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"src".to_vec(), b"next".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"dst".to_vec(), b"old".to_vec()]),
+            &mut state,
+        );
+
+        let blocked = registry.dispatch(
+            0,
+            &CommandFrame::new("COPY", vec![b"src".to_vec(), b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&blocked, eq(&CommandReply::Integer(0)));
+
+        let replaced = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "COPY",
+                vec![b"src".to_vec(), b"dst".to_vec(), b"REPLACE".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&replaced, eq(&CommandReply::Integer(1)));
+
+        let destination = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &destination,
+            eq(&CommandReply::BulkString(b"next".to_vec()))
+        );
+    }
+
+    #[rstest]
+    fn dispatch_copy_validates_same_key_and_options() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let same = registry.dispatch(
+            0,
+            &CommandFrame::new("COPY", vec![b"k".to_vec(), b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &same,
+            eq(&CommandReply::Error(
+                "source and destination objects are the same".to_owned()
+            ))
+        );
+
+        let invalid_option = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "COPY",
+                vec![
+                    b"src".to_vec(),
+                    b"dst".to_vec(),
+                    b"DB".to_vec(),
+                    b"1".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &invalid_option,
+            eq(&CommandReply::Error("syntax error".to_owned()))
+        );
     }
 
     #[rstest]
