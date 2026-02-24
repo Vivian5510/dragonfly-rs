@@ -414,6 +414,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "ROLE" => self.execute_role(frame),
             "PSYNC" => self.execute_psync(frame),
             "REPLCONF" => self.execute_replconf(frame),
+            "WAIT" => self.execute_wait(frame),
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
             "MGET" => self.execute_mget(db, frame),
@@ -592,6 +593,36 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         self.replication.mark_replicas_full_sync();
         CommandReply::SimpleString(format!("FULLRESYNC {master_replid} {master_offset}"))
+    }
+
+    fn execute_wait(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error("wrong number of arguments for 'WAIT' command".to_owned());
+        }
+
+        let Ok(required_text) = std::str::from_utf8(&frame.args[0]) else {
+            return CommandReply::Error("WAIT numreplicas must be valid UTF-8".to_owned());
+        };
+        let Ok(required) = required_text.parse::<u64>() else {
+            return CommandReply::Error("value is not an integer or out of range".to_owned());
+        };
+        let Ok(timeout_text) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error("WAIT timeout must be valid UTF-8".to_owned());
+        };
+        let Ok(_timeout_millis) = timeout_text.parse::<u64>() else {
+            return CommandReply::Error("value is not an integer or out of range".to_owned());
+        };
+
+        // Learning-path approximation: when the latest ACK reached current offset,
+        // all connected replicas are treated as confirmed for this offset.
+        let replicated =
+            if self.replication.last_acked_lsn() >= self.replication.replication_offset() {
+                u64::try_from(self.replication.connected_replicas()).unwrap_or(u64::MAX)
+            } else {
+                0
+            };
+        let confirmed = replicated.min(required);
+        CommandReply::Integer(i64::try_from(confirmed).unwrap_or(i64::MAX))
     }
 
     fn execute_dfly_flow(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1719,6 +1750,50 @@ mod tests {
             .expect("INFO REPLICATION should succeed");
         let body = decode_resp_bulk_payload(&info[0]);
         assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_wait_reports_zero_without_replica_acks() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let wait = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_wait_counts_replicas_after_ack_reaches_current_offset() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"wait:key", b"v1"]),
+            )
+            .expect("SET should succeed");
+
+        let wait_before_ack = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_before_ack, eq(&vec![b":0\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("REPLCONF ACK should parse");
+
+        let wait_after_ack = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_after_ack, eq(&vec![b":1\r\n".to_vec()]));
     }
 
     #[rstest]
