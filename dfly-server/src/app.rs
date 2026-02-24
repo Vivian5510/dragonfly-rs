@@ -652,16 +652,28 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
         }
 
+        let hop_has_runtime_error = per_command_error.iter().any(std::option::Option::is_some)
+            || !shard_wait_error.is_empty();
+        if hop_has_runtime_error {
+            let fallback = "runtime dispatch failed: hop barrier aborted".to_owned();
+            return hop
+                .per_shard
+                .iter()
+                .enumerate()
+                .map(|(index, (shard, _))| {
+                    if let Some(error) = &per_command_error[index] {
+                        return CommandReply::Error(error.clone());
+                    }
+                    if let Some(error) = shard_wait_error.get(shard) {
+                        return CommandReply::Error(error.clone());
+                    }
+                    CommandReply::Error(fallback.clone())
+                })
+                .collect::<Vec<_>>();
+        }
+
         let mut replies = Vec::with_capacity(hop.per_shard.len());
-        for (index, (shard, command)) in hop.per_shard.iter().enumerate() {
-            if let Some(error) = &per_command_error[index] {
-                replies.push(CommandReply::Error(error.clone()));
-                continue;
-            }
-            if let Some(error) = shard_wait_error.get(shard) {
-                replies.push(CommandReply::Error(error.clone()));
-                continue;
-            }
+        for (_, command) in &hop.per_shard {
             replies.push(self.execute_user_command(db, command, Some(txid)));
         }
         replies
@@ -3814,6 +3826,43 @@ mod tests {
                     .to_owned()
             )])
         );
+    }
+
+    #[rstest]
+    fn exec_plan_aborts_whole_hop_when_runtime_dispatch_fails() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"plan:rt:abort".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::Global,
+            hops: vec![TransactionHop {
+                per_shard: vec![
+                    (u16::MAX, CommandFrame::new("PING", Vec::new())),
+                    (
+                        shard,
+                        CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+                    ),
+                ],
+            }],
+        };
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![
+                CommandReply::Error(
+                    "runtime dispatch failed: invalid runtime state: target shard is out of range"
+                        .to_owned()
+                ),
+                CommandReply::Error("runtime dispatch failed: hop barrier aborted".to_owned()),
+            ])
+        );
+
+        let value = app
+            .core
+            .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
+        assert_that!(&value, eq(&CommandReply::Null));
     }
 
     #[rstest]
