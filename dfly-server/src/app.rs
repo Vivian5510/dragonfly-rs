@@ -936,6 +936,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
             "MYID" => self.execute_cluster_myid(frame),
             "NODES" => self.execute_cluster_nodes(frame),
+            "SHARDS" => self.execute_cluster_shards(frame),
             "SLOTS" => self.execute_cluster_slots(frame),
             _ => CommandReply::Error(format!("unknown CLUSTER subcommand '{subcommand}'")),
         }
@@ -983,6 +984,50 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
         CommandReply::BulkString(self.cluster.node_id.as_bytes().to_vec())
+    }
+
+    fn execute_cluster_shards(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER SHARDS' command".to_owned(),
+            );
+        }
+
+        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
+        let slots = self
+            .cluster
+            .owned_ranges()
+            .iter()
+            .flat_map(|range| {
+                [
+                    CommandReply::Integer(i64::from(range.start)),
+                    CommandReply::Integer(i64::from(range.end)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let nodes = vec![CommandReply::Array(vec![
+            CommandReply::BulkString(b"id".to_vec()),
+            CommandReply::BulkString(self.cluster.node_id.as_bytes().to_vec()),
+            CommandReply::BulkString(b"endpoint".to_vec()),
+            CommandReply::BulkString(host.as_bytes().to_vec()),
+            CommandReply::BulkString(b"ip".to_vec()),
+            CommandReply::BulkString(host.as_bytes().to_vec()),
+            CommandReply::BulkString(b"port".to_vec()),
+            CommandReply::Integer(port),
+            CommandReply::BulkString(b"role".to_vec()),
+            CommandReply::BulkString(b"master".to_vec()),
+            CommandReply::BulkString(b"replication-offset".to_vec()),
+            CommandReply::Integer(0),
+            CommandReply::BulkString(b"health".to_vec()),
+            CommandReply::BulkString(b"online".to_vec()),
+        ])];
+
+        CommandReply::Array(vec![CommandReply::Array(vec![
+            CommandReply::BulkString(b"slots".to_vec()),
+            CommandReply::Array(slots),
+            CommandReply::BulkString(b"nodes".to_vec()),
+            CommandReply::Array(nodes),
+        ])])
     }
 
     fn execute_cluster_info(&self, frame: &CommandFrame) -> CommandReply {
@@ -2640,6 +2685,36 @@ mod tests {
         assert_that!(reply.len(), eq(1_usize));
         let body = decode_resp_bulk_payload(&reply[0]);
         assert_that!(body.as_str(), eq(app.cluster.node_id.as_str()));
+    }
+
+    #[rstest]
+    fn resp_cluster_shards_reports_single_master_descriptor() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        app.cluster.set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"SHARDS"]))
+            .expect("CLUSTER SHARDS should execute");
+        assert_that!(reply.len(), eq(1_usize));
+
+        let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
+        assert_that!(payload.starts_with("*1\r\n*4\r\n$5\r\nslots\r\n"), eq(true));
+        assert_that!(payload.contains(":0\r\n:99\r\n:200\r\n:300\r\n"), eq(true));
+        assert_that!(payload.contains("$5\r\nnodes\r\n"), eq(true));
+        assert_that!(payload.contains(&app.cluster.node_id), eq(true));
+        assert_that!(payload.contains("$6\r\nmaster\r\n"), eq(true));
+        assert_that!(payload.contains("$6\r\nonline\r\n"), eq(true));
     }
 
     #[rstest]
