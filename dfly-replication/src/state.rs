@@ -175,6 +175,12 @@ impl ReplicationState {
         {
             existing.state = ReplicaSyncState::Preparation;
             existing.last_acked_lsn = 0;
+            self.last_acked_lsn = self
+                .replicas
+                .iter()
+                .map(|replica| replica.last_acked_lsn)
+                .max()
+                .unwrap_or(0);
         } else {
             self.replicas.push(ReplicaEndpoint {
                 address,
@@ -564,11 +570,35 @@ mod tests {
             state.record_replica_ack_for_endpoint("10.0.0.1", 7001, 3),
             eq(true)
         );
+        assert_that!(state.last_acked_lsn, eq(3_u64));
         assert_that!(state.acked_replica_count_at_or_above(3), eq(1_usize));
 
         state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
         assert_that!(state.replicas[0].state, eq(ReplicaSyncState::Preparation));
         assert_that!(state.replicas[0].last_acked_lsn, eq(0_u64));
         assert_that!(state.acked_replica_count_at_or_above(1), eq(0_usize));
+        assert_that!(state.last_acked_lsn, eq(0_u64));
+    }
+
+    #[rstest]
+    fn re_registering_one_replica_recomputes_global_ack_from_remaining_endpoints() {
+        let mut state = ReplicationState::default();
+        state.set_last_lsn_from_next_cursor(6);
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        state.register_replica_endpoint("10.0.0.2".to_owned(), 7002);
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.1", 7001, 5),
+            eq(true)
+        );
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.2", 7002, 3),
+            eq(true)
+        );
+        assert_that!(state.last_acked_lsn, eq(5_u64));
+
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        assert_that!(state.replicas[0].last_acked_lsn, eq(0_u64));
+        assert_that!(state.replicas[1].last_acked_lsn, eq(3_u64));
+        assert_that!(state.last_acked_lsn, eq(3_u64));
     }
 }
