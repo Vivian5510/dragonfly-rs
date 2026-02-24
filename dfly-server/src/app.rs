@@ -332,6 +332,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if !frame.args.is_empty() {
             return wrong_arity("EXEC");
         }
+        if !connection.transaction.in_multi() {
+            return CommandReply::Error("EXEC without MULTI".to_owned()).to_resp_bytes();
+        }
+        if connection
+            .transaction
+            .watching_other_dbs(connection.parser.context.db_index)
+        {
+            let _ = connection.transaction.discard();
+            return CommandReply::Error(
+                "Dragonfly does not allow WATCH and EXEC on different databases".to_owned(),
+            )
+            .to_resp_bytes();
+        }
         if !connection
             .transaction
             .watched_keys_are_clean(|db, key| self.core.key_version(db, key))
@@ -1686,6 +1699,25 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_exec_without_multi_remains_error_even_when_watch_is_dirty() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"key"]))
+            .expect("WATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut writer_conn, &resp_command(&[b"SET", b"key", b"other"]))
+            .expect("writer SET should succeed");
+
+        let exec = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
+    }
+
+    #[rstest]
     fn resp_watch_aborts_exec_when_watched_key_changes() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
@@ -1783,6 +1815,44 @@ mod tests {
             .feed_connection_bytes(&mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
             .expect("EXEC should run queued SET");
         assert_that!(&exec, eq(&vec![b"*1\r\n+OK\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_exec_rejects_watch_and_exec_across_databases() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WATCH", b"cross:key"]))
+            .expect("WATCH should succeed in DB 0");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let queued = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"cross:key", b"db1-value"]),
+            )
+            .expect("SET should queue");
+        assert_that!(&queued, eq(&vec![b"+QUEUED\r\n".to_vec()]));
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR Dragonfly does not allow WATCH and EXEC on different databases\r\n".to_vec()
+            ])
+        );
+
+        let multi_again = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed after EXEC failure cleanup");
+        assert_that!(&multi_again, eq(&vec![b"+OK\r\n".to_vec()]));
     }
 
     #[rstest]

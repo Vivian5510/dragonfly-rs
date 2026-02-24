@@ -120,6 +120,12 @@ impl TransactionSession {
             .iter()
             .all(|entry| current_version(entry.db, &entry.key) == entry.version)
     }
+
+    /// Returns whether this session watches any keys outside of the provided logical DB.
+    #[must_use]
+    pub fn watching_other_dbs(&self, db: u16) -> bool {
+        self.watched_keys.iter().any(|entry| entry.db != db)
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +183,17 @@ mod tests {
 
         session.unwatch();
         assert_that!(session.watched_keys_are_clean(|_, _| 0), eq(true));
+    }
+
+    #[rstest]
+    fn watching_other_dbs_reflects_registered_watch_scope() {
+        let mut session = TransactionSession::default();
+        assert_that!(session.watching_other_dbs(0), eq(false));
+
+        assert_that!(session.watch_key(0, b"same-db".to_vec(), 1), eq(true));
+        assert_that!(session.watching_other_dbs(0), eq(false));
+
+        assert_that!(session.watch_key(2, b"other-db".to_vec(), 1), eq(true));
+        assert_that!(session.watching_other_dbs(0), eq(true));
     }
 }
