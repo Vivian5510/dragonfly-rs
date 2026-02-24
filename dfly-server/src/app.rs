@@ -1307,6 +1307,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         let requested_offset = if frame.args.len() == 6 {
+            if !frame.args[4].eq_ignore_ascii_case(b"LASTMASTER") {
+                return CommandReply::Error("syntax error".to_owned());
+            }
             let Ok(lsn_vec_text) = std::str::from_utf8(&frame.args[5]) else {
                 return CommandReply::Error("DFLY FLOW lsn vector must be valid UTF-8".to_owned());
             };
@@ -6252,6 +6255,40 @@ mod tests {
             .expect("DFLY FLOW should succeed");
         let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
         assert_that!(sync_type.as_str(), eq("PARTIAL"));
+    }
+
+    #[rstest]
+    fn resp_dfly_flow_rejects_invalid_lastmaster_marker() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+        let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
+            .join("-")
+            .into_bytes();
+
+        let flow_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[
+                    b"DFLY",
+                    b"FLOW",
+                    &master_id,
+                    &sync_id,
+                    b"0",
+                    b"BADMARKER",
+                    &lsn_vec,
+                ]),
+            )
+            .expect("DFLY FLOW should parse");
+        assert_that!(&flow_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
     }
 
     #[rstest]
