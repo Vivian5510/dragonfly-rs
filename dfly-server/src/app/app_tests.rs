@@ -2243,7 +2243,6 @@ fn direct_mget_dispatches_runtime_to_each_touched_shard() {
 fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:same:1".to_vec();
-    let first_key_for_assert = first_key.clone();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:same:2".to_vec();
     let mut second_shard = app.core.resolve_shard_for_key(&second_key);
@@ -2253,21 +2252,30 @@ fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
         second_key = format!("direct:rt:same:2:{suffix}").into_bytes();
         second_shard = app.core.resolve_shard_for_key(&second_key);
     }
-    let second_key_for_assert = second_key.clone();
 
-    let frame = CommandFrame::new("MGET", vec![first_key, second_key]);
-    let _ = app.execute_user_command(0, &frame, None);
+    let frame = CommandFrame::new("MGET", vec![first_key.clone(), second_key.clone()]);
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(
+        &reply,
+        eq(&CommandReply::Array(vec![
+            CommandReply::Null,
+            CommandReply::Null
+        ]))
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
     let runtime = app
         .runtime
         .drain_processed_for_shard(shard)
         .expect("drain should succeed");
-    assert_that!(runtime.len(), eq(2_usize));
-    assert_that!(&runtime[0].command.name, eq(&"GET".to_owned()));
-    assert_that!(&runtime[1].command.name, eq(&"GET".to_owned()));
-    assert_that!(&runtime[0].command.args, eq(&vec![first_key_for_assert]));
-    assert_that!(&runtime[1].command.args, eq(&vec![second_key_for_assert]));
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
     assert_that!(runtime[0].execute_on_worker, eq(true));
-    assert_that!(runtime[1].execute_on_worker, eq(true));
 }
 
 #[rstest]
@@ -2330,6 +2338,56 @@ fn direct_mset_executes_each_key_on_worker_fiber() {
     );
     assert_that!(first_runtime[0].execute_on_worker, eq(true));
     assert_that!(second_runtime[0].execute_on_worker, eq(true));
+}
+
+#[rstest]
+fn direct_mset_same_shard_executes_single_worker_command() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"direct:rt:mset:same:1".to_vec();
+    let shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"direct:rt:mset:same:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("direct:rt:mset:same:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let frame = CommandFrame::new(
+        "MSET",
+        vec![
+            first_key.clone(),
+            b"a".to_vec(),
+            second_key.clone(),
+            b"b".to_vec(),
+        ],
+    );
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::SimpleString("OK".to_owned())));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let first_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![first_key]));
+    let second_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![second_key]));
+    assert_that!(&first_value, eq(&CommandReply::BulkString(b"a".to_vec())));
+    assert_that!(&second_value, eq(&CommandReply::BulkString(b"b".to_vec())));
 }
 
 #[rstest]
@@ -2456,6 +2514,56 @@ fn direct_del_multikey_executes_each_key_on_worker_fiber() {
     assert_that!(&second_runtime[0].command.args, eq(&vec![second_key]));
     assert_that!(first_runtime[0].execute_on_worker, eq(true));
     assert_that!(second_runtime[0].execute_on_worker, eq(true));
+}
+
+#[rstest]
+fn direct_del_same_shard_executes_single_worker_command() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"direct:rt:del:same:1".to_vec();
+    let shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"direct:rt:del:same:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("direct:rt:del:same:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+        None,
+    );
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        None,
+    );
+    for shard_id in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard_id)
+            .expect("drain should succeed");
+    }
+
+    let frame = CommandFrame::new("DEL", vec![first_key.clone(), second_key.clone()]);
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::Integer(2)));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
 }
 
 #[rstest]

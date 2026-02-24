@@ -402,11 +402,65 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
+        if let Some(reply) = self.execute_same_shard_multikey_string_via_runtime(db, frame) {
+            return Some(reply);
+        }
+
         match frame.name.as_str() {
             "MGET" => Some(self.execute_mget_via_runtime(db, frame)),
             "MSET" => Some(self.execute_mset_via_runtime(db, frame)),
             "MSETNX" => Some(self.execute_msetnx_via_runtime(db, frame)),
             _ => None,
+        }
+    }
+
+    fn execute_same_shard_multikey_string_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> Option<CommandReply> {
+        let shard = self.same_shard_multikey_string_target_shard(frame)?;
+
+        let keys_for_cluster_check: Vec<&[u8]> = match frame.name.as_str() {
+            "MGET" => frame.args.iter().map(Vec::as_slice).collect(),
+            "MSET" | "MSETNX" => frame
+                .args
+                .chunks_exact(2)
+                .map(|pair| pair[0].as_slice())
+                .collect(),
+            _ => return None,
+        };
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(keys_for_cluster_check)
+        {
+            return Some(error_reply);
+        }
+        if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+
+        let sequence = match self.submit_runtime_envelope_with_sequence(shard, db, frame, true) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                return Some(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+            }
+        };
+        if let Err(error) = self.runtime.wait_until_processed_sequence(shard, sequence) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+        match self.runtime.take_processed_reply(shard, sequence) {
+            Ok(Some(reply)) => Some(reply),
+            Ok(None) => Some(CommandReply::Error(
+                "runtime dispatch failed: missing worker reply".to_owned(),
+            )),
+            Err(error) => Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            ))),
         }
     }
 
@@ -508,6 +562,10 @@ impl ServerApp {
             return None;
         }
 
+        if let Some(reply) = self.execute_same_shard_multikey_count_via_runtime(db, frame) {
+            return Some(reply);
+        }
+
         let mut total = 0_i64;
         for key in &frame.args {
             let single_key_frame = CommandFrame::new(frame.name.as_str(), vec![key.clone()]);
@@ -528,6 +586,48 @@ impl ServerApp {
             }
         }
         Some(CommandReply::Integer(total))
+    }
+
+    fn execute_same_shard_multikey_count_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> Option<CommandReply> {
+        let shard = self.same_shard_multikey_count_target_shard(frame)?;
+
+        if let Some(error_reply) =
+            self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
+        {
+            return Some(error_reply);
+        }
+        if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+
+        let sequence = match self.submit_runtime_envelope_with_sequence(shard, db, frame, true) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                return Some(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+            }
+        };
+        if let Err(error) = self.runtime.wait_until_processed_sequence(shard, sequence) {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+        match self.runtime.take_processed_reply(shard, sequence) {
+            Ok(Some(reply)) => Some(reply),
+            Ok(None) => Some(CommandReply::Error(
+                "runtime dispatch failed: missing worker reply".to_owned(),
+            )),
+            Err(error) => Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            ))),
+        }
     }
 
     pub(super) fn execute_single_shard_command_via_runtime(
