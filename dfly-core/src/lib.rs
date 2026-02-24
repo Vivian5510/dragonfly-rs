@@ -355,6 +355,7 @@ impl CoreModule {
     /// Supported worker command classes:
     /// - single-key commands (`GET`, `SET`, `DEL`, ...)
     /// - same-shard two-key copy/rename family (`COPY`, `RENAME`, `RENAMENX`)
+    /// - same-shard multi-key counting family (`DEL`, `UNLINK`, `EXISTS`, `TOUCH`)
     #[must_use]
     pub fn execute_on_shard_in_db(
         &self,
@@ -398,6 +399,24 @@ impl CoreModule {
         }
 
         if matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") && frame.args.len() < 2 {
+            let Some(mut target_state) = self.lock_shard(shard) else {
+                return CommandReply::Error(format!("invalid target shard {shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, &mut target_state);
+        }
+
+        if matches!(frame.name.as_str(), "DEL" | "UNLINK" | "EXISTS" | "TOUCH") {
+            if let Some(mismatch_key) = frame
+                .args
+                .iter()
+                .find(|key| self.resolve_shard_for_key(key) != shard)
+            {
+                return CommandReply::Error(format!(
+                    "runtime worker shard mismatch: envelope={shard}, key={}",
+                    self.resolve_shard_for_key(mismatch_key.as_slice()),
+                ));
+            }
+
             let Some(mut target_state) = self.lock_shard(shard) else {
                 return CommandReply::Error(format!("invalid target shard {shard}"));
             };
@@ -1156,6 +1175,78 @@ mod tests {
             copy_error.contains("runtime worker shard mismatch"),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_runs_same_shard_multikey_count_command() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let first_key = b"runtime:multi:same:1".to_vec();
+        let shard = core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"runtime:multi:same:2".to_vec();
+        let mut second_shard = core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard != shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("runtime:multi:same:2:{suffix}").into_bytes();
+            second_shard = core.resolve_shard_for_key(&second_key);
+        }
+
+        let _ = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+        );
+        let _ = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        );
+
+        let exists = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("EXISTS", vec![first_key.clone(), second_key.clone()]),
+        );
+        assert_that!(&exists, eq(&CommandReply::Integer(2)));
+
+        let deleted = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("DEL", vec![first_key.clone(), second_key.clone()]),
+        );
+        assert_that!(&deleted, eq(&CommandReply::Integer(2)));
+
+        let verify = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("EXISTS", vec![first_key, second_key]),
+        );
+        assert_that!(&verify, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_rejects_cross_shard_multikey_count_command() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let first_key = b"runtime:multi:cross:1".to_vec();
+        let first_shard = core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"runtime:multi:cross:2".to_vec();
+        let mut second_shard = core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("runtime:multi:cross:2:{suffix}").into_bytes();
+            second_shard = core.resolve_shard_for_key(&second_key);
+        }
+
+        let reply = core.execute_on_shard_in_db(
+            first_shard,
+            0,
+            &CommandFrame::new("DEL", vec![first_key, second_key]),
+        );
+        let CommandReply::Error(error) = reply else {
+            panic!("cross-shard multikey count must fail");
+        };
+        assert_that!(error.contains("runtime worker shard mismatch"), eq(true));
     }
 
     #[rstest]

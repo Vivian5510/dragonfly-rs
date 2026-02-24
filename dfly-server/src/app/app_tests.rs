@@ -1974,6 +1974,69 @@ fn exec_plan_global_same_shard_copy_executes_on_worker_fiber() {
 }
 
 #[rstest]
+fn exec_plan_global_same_shard_multikey_count_executes_on_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"plan:rt:global:del:1".to_vec();
+    let shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"plan:rt:global:del:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("plan:rt:global:del:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+        None,
+    );
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        None,
+    );
+    for shard_id in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard_id)
+            .expect("drain should succeed");
+    }
+
+    let queued = vec![CommandFrame::new(
+        "DEL",
+        vec![first_key.clone(), second_key.clone()],
+    )];
+    let plan = app.build_exec_plan(&queued);
+    assert_that!(plan.mode, eq(TransactionMode::Global));
+    assert_that!(&plan.touched_shards, eq(&vec![shard]));
+
+    let replies = app.execute_transaction_plan(0, &plan);
+    assert_that!(&replies, eq(&vec![CommandReply::Integer(2)]));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&queued[0]));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let verify = app.core.execute_in_db(
+        0,
+        &CommandFrame::new("EXISTS", vec![first_key.clone(), second_key.clone()]),
+    );
+    assert_that!(&verify, eq(&CommandReply::Integer(0)));
+}
+
+#[rstest]
 fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let queued = vec![CommandFrame::new("PING", Vec::new())];

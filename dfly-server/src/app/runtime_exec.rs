@@ -182,14 +182,18 @@ impl ServerApp {
             return true;
         }
 
-        // Keep cluster redirection/CROSSSLOT handling on the coordinator path for
-        // copy/rename family in transaction mode. Worker execution is enabled only
-        // for standalone mode where those checks are not required.
+        // Keep cluster redirection/CROSSSLOT handling on the coordinator path in
+        // transaction mode. Worker execution for non-single-key commands is enabled
+        // only in standalone mode where coordinator-side cluster checks are not
+        // required.
         if self.cluster.mode != ClusterMode::Disabled {
             return false;
         }
 
-        let Some(same_shard) = self.same_shard_copy_rename_target_shard(command) else {
+        let same_shard = self
+            .same_shard_copy_rename_target_shard(command)
+            .or_else(|| self.same_shard_multikey_count_target_shard(command));
+        let Some(same_shard) = same_shard else {
             return false;
         };
         target_shards.len() == 1 && target_shards.first().copied() == Some(same_shard)
@@ -356,6 +360,21 @@ impl ServerApp {
         let source_shard = self.core.resolve_shard_for_key(&frame.args[0]);
         let destination_shard = self.core.resolve_shard_for_key(&frame.args[1]);
         (source_shard == destination_shard).then_some(source_shard)
+    }
+
+    fn same_shard_multikey_count_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
+        if !matches!(frame.name.as_str(), "DEL" | "UNLINK" | "EXISTS" | "TOUCH")
+            || frame.args.len() < 2
+        {
+            return None;
+        }
+
+        let mut keys = frame.args.iter();
+        let first_shard = self.core.resolve_shard_for_key(keys.next()?);
+        if keys.any(|key| self.core.resolve_shard_for_key(key) != first_shard) {
+            return None;
+        }
+        Some(first_shard)
     }
 
     pub(super) fn execute_multikey_string_commands_via_runtime(
