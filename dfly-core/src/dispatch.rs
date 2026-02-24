@@ -210,6 +210,16 @@ impl CommandRegistry {
             handler: handle_get,
         });
         registry.register(CommandSpec {
+            name: "GETSET",
+            arity: CommandArity::Exact(2),
+            handler: handle_getset,
+        });
+        registry.register(CommandSpec {
+            name: "GETDEL",
+            arity: CommandArity::Exact(1),
+            handler: handle_getdel,
+        });
+        registry.register(CommandSpec {
             name: "DEL",
             arity: CommandArity::AtLeast(1),
             handler: handle_del,
@@ -361,6 +371,40 @@ fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         Some(value) => CommandReply::BulkString(value.value.clone()),
         None => CommandReply::Null,
     }
+}
+
+fn handle_getset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let next_value = frame.args[1].clone();
+    state.purge_expired_key(db, &key);
+
+    let previous = state
+        .db_map(db)
+        .and_then(|map| map.get(&key))
+        .map(|entry| entry.value.clone());
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value: next_value,
+            expire_at_unix_secs: None,
+        },
+    );
+    state.bump_key_version(db, &key);
+
+    previous.map_or(CommandReply::Null, CommandReply::BulkString)
+}
+
+fn handle_getdel(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let removed = state.db_map_mut(db).remove(key);
+    if let Some(entry) = removed {
+        state.bump_key_version(db, key);
+        return CommandReply::BulkString(entry.value);
+    }
+    CommandReply::Null
 }
 
 fn handle_del(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -615,6 +659,58 @@ mod tests {
             &mut state,
         );
         assert_that!(&value, eq(&CommandReply::BulkString(b"v1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_getset_returns_previous_value_and_overwrites_key() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new("GETSET", vec![b"k".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::Null));
+
+        let second = registry.dispatch(
+            0,
+            &CommandFrame::new("GETSET", vec![b"k".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&second, eq(&CommandReply::BulkString(b"v1".to_vec())));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"v2".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_getdel_returns_value_and_removes_key() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+            &mut state,
+        );
+        let removed = registry.dispatch(
+            0,
+            &CommandFrame::new("GETDEL", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&removed, eq(&CommandReply::BulkString(b"v".to_vec())));
+
+        let missing = registry.dispatch(
+            0,
+            &CommandFrame::new("GETDEL", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&missing, eq(&CommandReply::Null));
     }
 
     #[rstest]

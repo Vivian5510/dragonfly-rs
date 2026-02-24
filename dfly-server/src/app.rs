@@ -600,8 +600,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
-            "GET" | "SET" | "EXPIRE" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY"
-            | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
+            "GET" | "SET" | "GETSET" | "GETDEL" | "EXPIRE" | "TTL" | "PERSIST" | "INCR"
+            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1583,7 +1583,9 @@ fn parse_flow_lsn_vector_for_flow(
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("SETNX" | "MSETNX", CommandReply::Integer(1)) => Some(JournalOp::Command),
+        ("SETNX" | "MSETNX", CommandReply::Integer(1))
+        | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
+        | ("GETDEL", CommandReply::BulkString(_)) => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -1990,6 +1992,46 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"only"]))
             .expect("GET should execute");
         assert_that!(&value, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_getset_returns_previous_value_and_replaces_key() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v1"]))
+            .expect("first GETSET should execute");
+        assert_that!(&first, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let second = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v2"]))
+            .expect("second GETSET should execute");
+        assert_that!(&second, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$2\r\nv2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_getdel_returns_value_and_deletes_key() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should execute");
+        let removed = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL should execute");
+        assert_that!(&removed, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
+
+        let missing = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL should execute");
+        assert_that!(&missing, eq(&vec![b"$-1\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2656,6 +2698,40 @@ mod tests {
         assert_that!(entries.len(), eq(1_usize));
         assert_that!(
             String::from_utf8_lossy(&entries[0].payload).contains("SETNX"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_getset_and_getdel_only_when_key_is_deleted() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v1"]))
+            .expect("first GETSET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v2"]))
+            .expect("second GETSET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL existing key should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL missing key should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("GETSET"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("GETSET"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[2].payload).contains("GETDEL"),
             eq(true)
         );
     }
