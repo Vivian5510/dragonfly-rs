@@ -224,6 +224,11 @@ impl CommandRegistry {
             arity: CommandArity::Exact(1),
             handler: handle_ttl,
         });
+        registry.register(CommandSpec {
+            name: "PERSIST",
+            arity: CommandArity::Exact(1),
+            handler: handle_persist,
+        });
         registry
     }
 
@@ -404,6 +409,25 @@ fn handle_ttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
     }
 }
 
+fn handle_persist(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let mut changed = false;
+    if let Some(entry) = state.db_map_mut(db).get_mut(key)
+        && entry.expire_at_unix_secs.is_some()
+    {
+        entry.expire_at_unix_secs = None;
+        changed = true;
+    }
+
+    if changed {
+        state.bump_key_version(db, key);
+        return CommandReply::Integer(1);
+    }
+    CommandReply::Integer(0)
+}
+
 fn parse_i64_arg(arg: &[u8], field_name: &str) -> Result<i64, String> {
     let text = str::from_utf8(arg).map_err(|_| format!("{field_name} must be valid UTF-8"))?;
     text.parse::<i64>()
@@ -557,6 +581,44 @@ mod tests {
             &mut state,
         );
         assert_that!(&ttl_after_expire, eq(&CommandReply::Integer(-2)));
+    }
+
+    #[rstest]
+    fn dispatch_persist_removes_expiry_without_deleting_key() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"temp".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRE", vec![b"temp".to_vec(), b"10".to_vec()]),
+            &mut state,
+        );
+
+        let persist = registry.dispatch(
+            0,
+            &CommandFrame::new("PERSIST", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&persist, eq(&CommandReply::Integer(1)));
+
+        let ttl = registry.dispatch(
+            0,
+            &CommandFrame::new("TTL", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&ttl, eq(&CommandReply::Integer(-1)));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
     }
 
     #[rstest]

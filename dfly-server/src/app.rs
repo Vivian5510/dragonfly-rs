@@ -592,7 +592,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "EXISTS" => self.execute_exists(db, frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
-            "GET" | "SET" | "EXPIRE" | "TTL" => self.execute_key_command(db, frame),
+            "GET" | "SET" | "EXPIRE" | "TTL" | "PERSIST" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1546,6 +1546,7 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
+        ("PERSIST", CommandReply::Integer(1)) => Some(JournalOp::Command),
         ("FLUSHDB", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("FLUSHALL", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("EXPIRE", CommandReply::Integer(1)) => {
@@ -1787,6 +1788,37 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
             .expect("EXISTS should execute");
         assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_persist_clears_expire_without_removing_key() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ttl:key", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"ttl:key", b"10"]),
+            )
+            .expect("EXPIRE should succeed");
+
+        let persist = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"ttl:key"]))
+            .expect("PERSIST should execute");
+        assert_that!(&persist, eq(&vec![b":1\r\n".to_vec()]));
+
+        let ttl = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
+            .expect("TTL should execute");
+        assert_that!(&ttl, eq(&vec![b":-1\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"ttl:key"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2348,6 +2380,32 @@ mod tests {
         assert_that!(entries.len(), eq(2_usize));
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_persist_only_when_it_changes_expiry() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"k"]))
+            .expect("PERSIST without expiry should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRE", b"k", b"10"]))
+            .expect("EXPIRE should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"k"]))
+            .expect("PERSIST should clear expiry");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[2].payload).contains("PERSIST"),
             eq(true)
         );
     }
