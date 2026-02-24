@@ -1340,16 +1340,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             None
         };
 
-        let sync_type = requested_offset
+        let (sync_type, flow_start_offset) = requested_offset
             .filter(|offset| self.replication.can_partial_sync_from_offset(*offset))
-            .map_or(FlowSyncType::Full, |_| FlowSyncType::Partial);
+            .map_or((FlowSyncType::Full, None), |offset| {
+                (FlowSyncType::Partial, Some(offset))
+            });
 
         let eof_token = self.replication.allocate_flow_eof_token();
         if let Err(error) = self.replication.register_sync_flow(
             sync_id,
             flow_id,
             sync_type,
-            requested_offset,
+            flow_start_offset,
             eof_token.clone(),
         ) {
             return sync_session_error_reply(error);
@@ -6055,6 +6057,52 @@ mod tests {
             .expect("DFLY FLOW should succeed");
         let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
         assert_that!(sync_type.as_str(), eq("FULL"));
+    }
+
+    #[rstest]
+    fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        app.replication.journal = InMemoryJournal::with_backlog(1);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id_text = extract_sync_id_from_capa_reply(&handshake[0]);
+        let sync_id = sync_id_text.as_bytes().to_vec();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"flow:stale:key", b"v1"]),
+            )
+            .expect("first SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"flow:stale:key", b"v2"]),
+            )
+            .expect("second SET should succeed");
+
+        let flow_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
+            )
+            .expect("DFLY FLOW should succeed");
+        let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
+        assert_that!(sync_type.as_str(), eq("FULL"));
+
+        let flow = app
+            .replication
+            .state
+            .sync_flow(&sync_id_text, 0)
+            .expect("flow must be registered");
+        assert_that!(flow.start_offset.is_none(), eq(true));
     }
 
     #[rstest]
