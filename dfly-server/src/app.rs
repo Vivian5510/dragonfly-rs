@@ -284,10 +284,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if frame.name != "SELECT" {
             return None;
         }
+        let in_multi = connection.transaction.in_multi();
         if frame.args.len() != 1 {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return Some(wrong_arity("SELECT"));
         }
-        if connection.transaction.in_multi() {
+        if in_multi {
+            connection.transaction.mark_queued_error();
             return Some(
                 CommandReply::Error("SELECT is not allowed in MULTI".to_owned()).to_resp_bytes(),
             );
@@ -320,12 +325,17 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_multi(connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        let in_multi = connection.transaction.in_multi();
         if !frame.args.is_empty() {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return wrong_arity("MULTI");
         }
         if connection.transaction.begin_multi() {
             return CommandReply::SimpleString("OK".to_owned()).to_resp_bytes();
         }
+        connection.transaction.mark_queued_error();
         CommandReply::Error("MULTI calls can not be nested".to_owned()).to_resp_bytes()
     }
 
@@ -391,10 +401,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_watch(&mut self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        let in_multi = connection.transaction.in_multi();
         if frame.args.is_empty() {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return wrong_arity("WATCH");
         }
-        if connection.transaction.in_multi() {
+        if in_multi {
+            connection.transaction.mark_queued_error();
             return CommandReply::Error("WATCH inside MULTI is not allowed".to_owned())
                 .to_resp_bytes();
         }
@@ -408,10 +423,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_unwatch(connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        let in_multi = connection.transaction.in_multi();
         if !frame.args.is_empty() {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return wrong_arity("UNWATCH");
         }
-        if connection.transaction.in_multi() {
+        if in_multi {
+            connection.transaction.mark_queued_error();
             return CommandReply::Error("UNWATCH inside MULTI is not allowed".to_owned())
                 .to_resp_bytes();
         }
@@ -1977,6 +1997,57 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_execaborts_after_watch_or_unwatch_error_inside_multi() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let watch_error = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"k"]))
+            .expect("WATCH should parse");
+        assert_that!(
+            &watch_error,
+            eq(&vec![
+                b"-ERR WATCH inside MULTI is not allowed\r\n".to_vec()
+            ])
+        );
+        let exec_after_watch_error = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec_after_watch_error,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+
+        let mut unwatch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let _ = app
+            .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let unwatch_error = app
+            .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"UNWATCH"]))
+            .expect("UNWATCH should parse");
+        assert_that!(
+            &unwatch_error,
+            eq(&vec![
+                b"-ERR UNWATCH inside MULTI is not allowed\r\n".to_vec()
+            ])
+        );
+        let exec_after_unwatch_error = app
+            .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec_after_unwatch_error,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
     fn resp_watch_exec_succeeds_when_key_unchanged() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -2197,6 +2268,33 @@ mod tests {
         assert_that!(
             &select,
             eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_select_error_inside_multi() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let select = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT should parse");
+        assert_that!(
+            &select,
+            eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
+        );
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
         );
     }
 
