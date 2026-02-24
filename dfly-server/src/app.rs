@@ -938,6 +938,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         match subcommand.to_ascii_uppercase().as_str() {
+            "HELP" => Self::execute_cluster_help(frame),
             "INFO" => self.execute_cluster_info(frame),
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
             "MYID" => self.execute_cluster_myid(frame),
@@ -955,6 +956,33 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
         CommandReply::Integer(i64::from(key_slot(&frame.args[1])))
+    }
+
+    fn execute_cluster_help(frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER HELP' command".to_owned(),
+            );
+        }
+        let lines = [
+            "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "SLOTS",
+            "   Return information about slots range mappings. Each range is made of:",
+            "   start, end, master and replicas IP addresses, ports and ids.",
+            "NODES",
+            "   Return cluster configuration seen by node. Output format:",
+            "   <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+            "INFO",
+            "  Return information about the cluster",
+            "HELP",
+            "    Prints this help.",
+        ];
+        CommandReply::Array(
+            lines
+                .into_iter()
+                .map(|line| CommandReply::BulkString(line.as_bytes().to_vec()))
+                .collect(),
+        )
     }
 
     fn execute_cluster_slots(&self, frame: &CommandFrame) -> CommandReply {
@@ -2715,6 +2743,27 @@ mod tests {
                 b"-ERR Cluster is disabled. Use --cluster_mode=yes to enable.\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn resp_cluster_help_returns_help_entries() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"HELP"]))
+            .expect("CLUSTER HELP should execute");
+        assert_that!(reply.len(), eq(1_usize));
+        let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
+        assert_that!(payload.starts_with("*11\r\n"), eq(true));
+        assert_that!(payload.contains("$5\r\nSLOTS\r\n"), eq(true));
+        assert_that!(payload.contains("$5\r\nNODES\r\n"), eq(true));
+        assert_that!(payload.contains("$4\r\nINFO\r\n"), eq(true));
+        assert_that!(payload.contains("$4\r\nHELP\r\n"), eq(true));
     }
 
     #[rstest]
