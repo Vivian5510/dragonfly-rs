@@ -1,12 +1,9 @@
 //! Runtime envelopes for coordinator-to-shard dispatch.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
@@ -21,6 +18,18 @@ pub struct RuntimeEnvelope {
     pub target_shard: ShardId,
     /// Wire-equivalent command data.
     pub command: CommandFrame,
+}
+
+#[derive(Debug, Default)]
+struct ShardExecutionInner {
+    processed: Vec<RuntimeEnvelope>,
+    processed_sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct ShardExecutionState {
+    inner: Mutex<ShardExecutionInner>,
+    changed: Condvar,
 }
 
 /// Abstract runtime backend that receives coordinator work.
@@ -46,9 +55,8 @@ pub trait ShardRuntime: Send + Sync {
 pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
     senders: Vec<mpsc::Sender<RuntimeEnvelope>>,
-    executed_per_shard: Arc<Vec<Mutex<Vec<RuntimeEnvelope>>>>,
+    execution_per_shard: Arc<Vec<ShardExecutionState>>,
     submitted_sequence_per_shard: Vec<Mutex<u64>>,
-    processed_sequence_per_shard: Arc<Vec<AtomicU64>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -57,19 +65,14 @@ impl InMemoryShardRuntime {
     #[must_use]
     pub fn new(shard_count: ShardCount) -> Self {
         let shard_len = usize::from(shard_count.get());
-        let executed_per_shard = Arc::new(
+        let execution_per_shard = Arc::new(
             (0..shard_len)
-                .map(|_| Mutex::new(Vec::new()))
+                .map(|_| ShardExecutionState::default())
                 .collect::<Vec<_>>(),
         );
         let submitted_sequence_per_shard = (0..shard_len)
             .map(|_| Mutex::new(0_u64))
             .collect::<Vec<_>>();
-        let processed_sequence_per_shard = Arc::new(
-            (0..shard_len)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>(),
-        );
 
         let mut senders = Vec::with_capacity(shard_len);
         let mut workers = Vec::with_capacity(shard_len);
@@ -77,19 +80,16 @@ impl InMemoryShardRuntime {
             let (sender, receiver) = mpsc::channel::<RuntimeEnvelope>();
             senders.push(sender);
 
-            let executed = Arc::clone(&executed_per_shard);
-            let processed = Arc::clone(&processed_sequence_per_shard);
-            let handle =
-                thread::spawn(move || shard_worker_loop(shard, receiver, &executed, &processed));
+            let execution = Arc::clone(&execution_per_shard);
+            let handle = thread::spawn(move || shard_worker_loop(shard, receiver, &execution));
             workers.push(handle);
         }
 
         Self {
             shard_count,
             senders,
-            executed_per_shard,
+            execution_per_shard,
             submitted_sequence_per_shard,
-            processed_sequence_per_shard,
             workers,
         }
     }
@@ -101,14 +101,15 @@ impl InMemoryShardRuntime {
     /// Returns `DflyError::InvalidState` when shard id is out of range or when
     /// the shard log mutex is poisoned.
     pub fn drain_processed_for_shard(&self, shard: ShardId) -> DflyResult<Vec<RuntimeEnvelope>> {
-        let Some(bucket) = self.executed_per_shard.get(usize::from(shard)) else {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
-        let mut guard = bucket
+        let mut guard = state
+            .inner
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(std::mem::take(&mut *guard))
+        Ok(std::mem::take(&mut guard.processed))
     }
 
     /// Returns current number of processed envelopes for one shard.
@@ -118,14 +119,15 @@ impl InMemoryShardRuntime {
     /// Returns `DflyError::InvalidState` when shard id is out of range or when
     /// the shard log mutex is poisoned.
     pub fn processed_count(&self, shard: ShardId) -> DflyResult<usize> {
-        let Some(bucket) = self.executed_per_shard.get(usize::from(shard)) else {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
-        let guard = bucket
+        let guard = state
+            .inner
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(guard.len())
+        Ok(guard.processed.len())
     }
 
     /// Waits until one shard has processed at least `minimum` envelopes.
@@ -140,25 +142,19 @@ impl InMemoryShardRuntime {
         minimum: usize,
         timeout: Duration,
     ) -> DflyResult<bool> {
-        let Some(bucket) = self.executed_per_shard.get(usize::from(shard)) else {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
-        let deadline = Instant::now() + timeout;
-        loop {
-            let reached = bucket
-                .lock()
-                .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?
-                .len()
-                >= minimum;
-            if reached {
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        let guard = state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        let (guard, _) = state
+            .changed
+            .wait_timeout_while(guard, timeout, |inner| inner.processed.len() < minimum)
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(guard.processed.len() >= minimum)
     }
 
     /// Submits one envelope and returns per-shard submission sequence.
@@ -203,21 +199,19 @@ impl InMemoryShardRuntime {
         sequence: u64,
         timeout: Duration,
     ) -> DflyResult<bool> {
-        let Some(processed_counter) = self.processed_sequence_per_shard.get(usize::from(shard))
-        else {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
-        let deadline = Instant::now() + timeout;
-        loop {
-            if processed_counter.load(Ordering::Acquire) >= sequence {
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        let guard = state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        let (guard, _) = state
+            .changed
+            .wait_timeout_while(guard, timeout, |inner| inner.processed_sequence < sequence)
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(guard.processed_sequence >= sequence)
     }
 }
 
@@ -247,8 +241,7 @@ impl Drop for InMemoryShardRuntime {
 fn shard_worker_loop(
     shard: usize,
     receiver: mpsc::Receiver<RuntimeEnvelope>,
-    executed_per_shard: &[Mutex<Vec<RuntimeEnvelope>>],
-    processed_sequence_per_shard: &[AtomicU64],
+    execution_per_shard: &[ShardExecutionState],
 ) {
     for envelope in receiver {
         // Keep one explicit shard check so the queue ownership contract is visible
@@ -256,13 +249,12 @@ fn shard_worker_loop(
         if usize::from(envelope.target_shard) != shard {
             continue;
         }
-        if let Some(bucket) = executed_per_shard.get(shard)
-            && let Ok(mut guard) = bucket.lock()
+        if let Some(state) = execution_per_shard.get(shard)
+            && let Ok(mut guard) = state.inner.lock()
         {
-            guard.push(envelope);
-        }
-        if let Some(processed_counter) = processed_sequence_per_shard.get(shard) {
-            let _ = processed_counter.fetch_add(1, Ordering::Release);
+            guard.processed.push(envelope);
+            guard.processed_sequence = guard.processed_sequence.saturating_add(1);
+            state.changed.notify_all();
         }
     }
 }
