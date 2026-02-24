@@ -6172,11 +6172,13 @@ fn journal_replay_dispatches_runtime_for_single_key_command() {
         op: JournalOp::Command,
         payload,
     });
+    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
 
     let applied = app
         .recover_from_replication_journal()
         .expect("journal replay should succeed");
     assert_that!(applied, eq(1_usize));
+    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
     assert_that!(
         app.runtime
             .wait_for_processed_count(shard, 1, Duration::from_millis(200))
@@ -6189,6 +6191,7 @@ fn journal_replay_dispatches_runtime_for_single_key_command() {
         .expect("drain should succeed");
     assert_that!(runtime.len(), eq(1_usize));
     assert_that!(&runtime[0].command.name, eq(&"SET".to_owned()));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
 }
 
 #[rstest]

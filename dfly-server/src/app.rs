@@ -1818,15 +1818,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
 
             let frame = parse_journal_command_frame(&entry.payload)?;
-            // Journal replay should follow the same shard-ingress ordering contract as direct
-            // command execution, so restored state observes runtime barrier semantics.
-            if let Err(error) = self.dispatch_replay_command_runtime(entry.db, &frame) {
-                return Err(DflyError::Protocol(format!(
-                    "journal replay runtime dispatch failed for txid {}: {error}",
-                    entry.txid
-                )));
-            }
-            let reply = self.execute_command_without_side_effects(entry.db, &frame);
+            let reply = self.execute_replay_command_without_journal(entry.db, &frame);
             if let CommandReply::Error(message) = reply {
                 return Err(DflyError::Protocol(format!(
                     "journal replay failed for txid {}: {message}",

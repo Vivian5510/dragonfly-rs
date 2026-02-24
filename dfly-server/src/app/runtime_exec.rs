@@ -635,6 +635,15 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
     ) -> CommandReply {
+        self.execute_single_shard_command_via_runtime_internal(db, frame, true)
+    }
+
+    fn execute_single_shard_command_via_runtime_internal(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> CommandReply {
         let Some(key) = frame.args.first() else {
             return self.execute_command_without_side_effects(db, frame);
         };
@@ -643,7 +652,9 @@ impl ServerApp {
         }
 
         let shard = self.core.resolve_target_shard(frame);
-        if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
+        if enforce_scheduler_barrier
+            && let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard])
+        {
             return CommandReply::Error(format!("runtime dispatch failed: {error}"));
         }
 
@@ -663,6 +674,25 @@ impl ServerApp {
             }
             Err(error) => CommandReply::Error(format!("runtime dispatch failed: {error}")),
         }
+    }
+
+    pub(super) fn execute_replay_command_without_journal(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> CommandReply {
+        if matches!(
+            self.core.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return self.execute_single_shard_command_via_runtime_internal(db, frame, false);
+        }
+
+        if let Err(error) = self.dispatch_replay_command_runtime(db, frame) {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+        }
+
+        self.execute_command_without_side_effects(db, frame)
     }
 
     pub(super) fn dispatch_direct_command_runtime(
