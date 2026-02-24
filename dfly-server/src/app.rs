@@ -456,7 +456,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("wrong number of arguments for 'ROLE' command".to_owned());
         }
 
-        let replicas = Vec::with_capacity(self.replication.connected_replicas());
+        let replicas = self
+            .replication
+            .replica_role_rows()
+            .into_iter()
+            .map(|(address, listening_port, state)| {
+                CommandReply::Array(vec![
+                    CommandReply::BulkString(address.into_bytes()),
+                    CommandReply::BulkString(listening_port.to_string().into_bytes()),
+                    CommandReply::BulkString(state.as_bytes().to_vec()),
+                ])
+            })
+            .collect::<Vec<_>>();
         // Dragonfly reports master mode as:
         // ["master", [[replica_ip, replica_port, replica_state], ...]]
         CommandReply::Array(vec![
@@ -482,6 +493,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             ]);
         }
 
+        let mut announced_port: Option<u16> = None;
+        let mut announced_ip: Option<String> = None;
+        let mut saw_ack = false;
+
         for pair in frame.args.chunks_exact(2) {
             let option = pair[0].as_slice();
             let value = pair[1].as_slice();
@@ -497,11 +512,33 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     );
                 };
                 self.replication.record_replica_ack(ack_lsn);
+                saw_ack = true;
                 continue;
             }
-            if option.eq_ignore_ascii_case(b"LISTENING-PORT")
-                || option.eq_ignore_ascii_case(b"IP-ADDRESS")
-                || option.eq_ignore_ascii_case(b"CAPA")
+            if option.eq_ignore_ascii_case(b"LISTENING-PORT") {
+                let Ok(text) = std::str::from_utf8(value) else {
+                    return CommandReply::Error(
+                        "REPLCONF LISTENING-PORT must be valid UTF-8".to_owned(),
+                    );
+                };
+                let Ok(port) = text.parse::<u16>() else {
+                    return CommandReply::Error(
+                        "value is not an integer or out of range".to_owned(),
+                    );
+                };
+                announced_port = Some(port);
+                continue;
+            }
+            if option.eq_ignore_ascii_case(b"IP-ADDRESS") {
+                let Ok(text) = std::str::from_utf8(value) else {
+                    return CommandReply::Error(
+                        "REPLCONF IP-ADDRESS must be valid UTF-8".to_owned(),
+                    );
+                };
+                announced_ip = Some(text.to_owned());
+                continue;
+            }
+            if option.eq_ignore_ascii_case(b"CAPA")
                 || option.eq_ignore_ascii_case(b"CLIENT-ID")
                 || option.eq_ignore_ascii_case(b"CLIENT-VERSION")
             {
@@ -510,10 +547,20 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("syntax error".to_owned());
         }
 
+        if let Some(port) = announced_port {
+            self.replication.register_replica_endpoint(
+                announced_ip.unwrap_or_else(|| "127.0.0.1".to_owned()),
+                port,
+            );
+        }
+        if saw_ack {
+            self.replication.mark_replicas_stable_sync();
+        }
+
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_psync(&self, frame: &CommandFrame) -> CommandReply {
+    fn execute_psync(&mut self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error("wrong number of arguments for 'PSYNC' command".to_owned());
         }
@@ -528,16 +575,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("PSYNC offset must be a valid integer".to_owned());
         };
 
-        let master_replid = self.replication.master_replid();
+        let master_replid = self.replication.master_replid().to_owned();
         let master_offset = self.replication.replication_offset();
         let requested_offset_u64 = u64::try_from(requested_offset).ok();
         if requested_replid == master_replid
             && requested_offset_u64
                 .is_some_and(|offset| self.replication.can_partial_sync_from_offset(offset))
         {
+            self.replication.mark_replicas_stable_sync();
             return CommandReply::SimpleString("CONTINUE".to_owned());
         }
 
+        self.replication.mark_replicas_full_sync();
         CommandReply::SimpleString(format!("FULLRESYNC {master_replid} {master_offset}"))
     }
 
@@ -1466,6 +1515,61 @@ mod tests {
         assert_that!(payload.contains("\r\n$5\r\nSYNC1\r\n"), eq(true));
         let shard_and_version = format!(":{}\r\n:1\r\n", app.config.shard_count.get());
         assert_that!(payload.contains(&shard_and_version), eq(true));
+    }
+
+    #[rstest]
+    fn resp_replconf_registration_and_psync_update_role_replica_state() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let register = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[
+                    b"REPLCONF",
+                    b"LISTENING-PORT",
+                    b"7001",
+                    b"IP-ADDRESS",
+                    b"10.0.0.2",
+                ]),
+            )
+            .expect("REPLCONF LISTENING-PORT/IP-ADDRESS should succeed");
+        assert_that!(&register, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let role_after_register = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed");
+        let role_payload = std::str::from_utf8(&role_after_register[0]).expect("ROLE is UTF-8");
+        assert_that!(role_payload.contains("10.0.0.2"), eq(true));
+        assert_that!(role_payload.contains("7001"), eq(true));
+        assert_that!(role_payload.contains("preparation"), eq(true));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", b"?", b"-1"]))
+            .expect("PSYNC should succeed");
+
+        let role_after_fullsync = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed after PSYNC");
+        let role_payload = std::str::from_utf8(&role_after_fullsync[0]).expect("ROLE is UTF-8");
+        assert_that!(role_payload.contains("full_sync"), eq(true));
+
+        let ack_reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK", b"0"]))
+            .expect("REPLCONF ACK should parse");
+        assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
+
+        let role_after_ack = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed after ACK");
+        let role_payload = std::str::from_utf8(&role_after_ack[0]).expect("ROLE is UTF-8");
+        assert_that!(role_payload.contains("stable_sync"), eq(true));
+
+        let info = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
     }
 
     #[rstest]

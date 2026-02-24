@@ -4,7 +4,7 @@ pub mod journal;
 pub mod state;
 
 use journal::{InMemoryJournal, JournalEntry};
-use state::ReplicationState;
+use state::{ReplicaSyncState, ReplicationState};
 
 /// Replication subsystem bootstrap module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,40 @@ impl ReplicationModule {
     #[must_use]
     pub fn connected_replicas(&self) -> usize {
         self.state.connected_replicas
+    }
+
+    /// Registers one replica endpoint from `REPLCONF` metadata.
+    pub fn register_replica_endpoint(&mut self, address: String, listening_port: u16) {
+        self.state
+            .register_replica_endpoint(address, listening_port);
+    }
+
+    /// Marks all registered replicas as being in full sync.
+    pub fn mark_replicas_full_sync(&mut self) {
+        self.state
+            .set_all_replica_states(ReplicaSyncState::FullSync);
+    }
+
+    /// Marks all registered replicas as being in stable sync.
+    pub fn mark_replicas_stable_sync(&mut self) {
+        self.state
+            .set_all_replica_states(ReplicaSyncState::StableSync);
+    }
+
+    /// Returns role-compatible replica rows: `(address, port, state)`.
+    #[must_use]
+    pub fn replica_role_rows(&self) -> Vec<(String, u16, &'static str)> {
+        self.state
+            .replicas
+            .iter()
+            .map(|replica| {
+                (
+                    replica.address.clone(),
+                    replica.listening_port,
+                    replica.state.as_role_state(),
+                )
+            })
+            .collect()
     }
 
     /// Returns whether partial sync can continue from one replica offset.

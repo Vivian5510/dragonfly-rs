@@ -23,6 +23,42 @@ pub struct ReplicationState {
     pub last_acked_lsn: u64,
     /// Number of connected replicas from master's perspective.
     pub connected_replicas: usize,
+    /// Registered replica endpoints known by control plane.
+    pub replicas: Vec<ReplicaEndpoint>,
+}
+
+/// One replica endpoint tracked by master-side control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaEndpoint {
+    /// Replica IP/address announced by `REPLCONF`.
+    pub address: String,
+    /// Replica listening port announced by `REPLCONF`.
+    pub listening_port: u16,
+    /// High-level sync stage used by `ROLE` output.
+    pub state: ReplicaSyncState,
+}
+
+/// Replica state labels aligned with Dragonfly's role reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaSyncState {
+    /// Replica has connected but has not started stream sync yet.
+    Preparation,
+    /// Replica is performing full sync.
+    FullSync,
+    /// Replica has entered stable incremental sync.
+    StableSync,
+}
+
+impl ReplicaSyncState {
+    /// Returns role-compatible textual state.
+    #[must_use]
+    pub const fn as_role_state(self) -> &'static str {
+        match self {
+            Self::Preparation => "preparation",
+            Self::FullSync => "full_sync",
+            Self::StableSync => "stable_sync",
+        }
+    }
 }
 
 impl Default for ReplicationState {
@@ -42,6 +78,7 @@ impl ReplicationState {
             last_lsn: 0,
             last_acked_lsn: 0,
             connected_replicas: 0,
+            replicas: Vec::new(),
         }
     }
 
@@ -59,6 +96,34 @@ impl ReplicationState {
             self.last_acked_lsn = clamped;
         }
     }
+
+    /// Registers one replica endpoint.
+    ///
+    /// Existing endpoint registration is refreshed in-place and moved back to
+    /// `preparation` state, matching a new handshake attempt.
+    pub fn register_replica_endpoint(&mut self, address: String, listening_port: u16) {
+        if let Some(existing) = self
+            .replicas
+            .iter_mut()
+            .find(|entry| entry.address == address && entry.listening_port == listening_port)
+        {
+            existing.state = ReplicaSyncState::Preparation;
+        } else {
+            self.replicas.push(ReplicaEndpoint {
+                address,
+                listening_port,
+                state: ReplicaSyncState::Preparation,
+            });
+        }
+        self.connected_replicas = self.replicas.len();
+    }
+
+    /// Sets sync state on all registered replica endpoints.
+    pub fn set_all_replica_states(&mut self, state: ReplicaSyncState) {
+        for replica in &mut self.replicas {
+            replica.state = state;
+        }
+    }
 }
 
 /// Generates one pseudo-random looking replication id.
@@ -72,7 +137,7 @@ fn generate_master_replid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplicationState;
+    use super::{ReplicaSyncState, ReplicationState};
     use googletest::prelude::*;
     use rstest::rstest;
 
@@ -112,5 +177,21 @@ mod tests {
 
         state.record_ack_lsn(999);
         assert_that!(state.last_acked_lsn, eq(5_u64));
+    }
+
+    #[rstest]
+    fn replica_registration_and_state_transition_are_tracked() {
+        let mut state = ReplicationState::default();
+        state.register_replica_endpoint("127.0.0.1".to_owned(), 6380);
+
+        assert_that!(state.connected_replicas, eq(1_usize));
+        assert_that!(state.replicas.len(), eq(1_usize));
+        assert_that!(state.replicas[0].state, eq(ReplicaSyncState::Preparation));
+
+        state.set_all_replica_states(ReplicaSyncState::FullSync);
+        assert_that!(state.replicas[0].state, eq(ReplicaSyncState::FullSync));
+
+        state.set_all_replica_states(ReplicaSyncState::StableSync);
+        assert_that!(state.replicas[0].state, eq(ReplicaSyncState::StableSync));
     }
 }
