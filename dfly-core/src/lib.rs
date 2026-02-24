@@ -1,10 +1,12 @@
 //! Core runtime abstractions shared by transaction, storage, and facade layers.
 
 pub mod command;
+pub mod dispatch;
 pub mod runtime;
 pub mod sharding;
 
 use dfly_common::ids::ShardCount;
+use dispatch::CommandRegistry;
 use sharding::HashTagShardResolver;
 
 /// Core module bootstrap object.
@@ -15,6 +17,8 @@ use sharding::HashTagShardResolver;
 pub struct CoreModule {
     /// Resolver used to map keys into owning shards.
     pub resolver: HashTagShardResolver,
+    /// Command table used by coordinator/runtime execution path.
+    pub command_registry: CommandRegistry,
 }
 
 impl CoreModule {
@@ -23,6 +27,7 @@ impl CoreModule {
     pub fn new(shard_count: ShardCount) -> Self {
         Self {
             resolver: HashTagShardResolver::new(shard_count),
+            command_registry: CommandRegistry::with_builtin_commands(),
         }
     }
 }

@@ -19,3 +19,50 @@ impl CommandFrame {
         }
     }
 }
+
+/// Canonical command reply representation.
+///
+/// The reply enum is kept protocol-neutral. Encoding to RESP (or other protocols) happens
+/// at the facade boundary, so coordinator/runtime logic can stay independent from wire format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandReply {
+    /// `+OK` style replies.
+    SimpleString(String),
+    /// `$<len> ...` style binary-safe payload.
+    BulkString(Vec<u8>),
+    /// RESP null bulk string (`$-1`).
+    Null,
+    /// `-ERR ...` style error.
+    Error(String),
+}
+
+impl CommandReply {
+    /// Encodes the reply into RESP bytes for Redis-compatible clients.
+    #[must_use]
+    pub fn to_resp_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::SimpleString(value) => {
+                let mut output = Vec::with_capacity(value.len() + 3);
+                output.extend_from_slice(b"+");
+                output.extend_from_slice(value.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                output
+            }
+            Self::BulkString(value) => {
+                let mut output = Vec::new();
+                output.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+                output.extend_from_slice(value);
+                output.extend_from_slice(b"\r\n");
+                output
+            }
+            Self::Null => b"$-1\r\n".to_vec(),
+            Self::Error(message) => {
+                let mut output = Vec::with_capacity(message.len() + 6);
+                output.extend_from_slice(b"-ERR ");
+                output.extend_from_slice(message.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                output
+            }
+        }
+    }
+}
