@@ -591,16 +591,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             ));
         };
         if let Some(endpoint) = connection.replica_endpoint.as_ref() {
-            let applied = self.replication.record_replica_ack_for_endpoint(
+            let _ = self.replication.record_replica_ack_for_endpoint(
                 &endpoint.address,
                 endpoint.listening_port,
                 ack_lsn,
             );
-            if !applied {
-                self.replication.record_replica_ack(ack_lsn);
-            }
-        } else {
-            self.replication.record_replica_ack(ack_lsn);
         }
         Ok(())
     }
@@ -1816,6 +1811,12 @@ mod tests {
         let _ = app
             .feed_connection_bytes(
                 &mut connection,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
                 &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
             )
             .expect("SET should succeed");
@@ -1834,6 +1835,28 @@ mod tests {
             .expect("INFO REPLICATION should succeed");
         let body = decode_resp_bulk_payload(&info[0]);
         assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_replconf_ack_without_registered_endpoint_is_ignored_silently() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
+            )
+            .expect("SET should succeed");
+
+        let ack_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
+            )
+            .expect("REPLCONF ACK should parse");
+        assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
+        assert_that!(app.replication.last_acked_lsn(), eq(0_u64));
     }
 
     #[rstest]
