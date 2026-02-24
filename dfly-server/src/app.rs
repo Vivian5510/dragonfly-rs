@@ -21,6 +21,7 @@ use dfly_transaction::TransactionModule;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use dfly_transaction::session::TransactionSession;
+use std::collections::HashSet;
 
 /// Unit 0 composition container.
 ///
@@ -391,6 +392,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Some(queued_commands) = connection.transaction.take_queued_for_exec() else {
             return CommandReply::Error("EXEC without MULTI".to_owned()).to_resp_bytes();
         };
+        if queued_commands.is_empty() {
+            return CommandReply::Array(Vec::new()).to_resp_bytes();
+        }
 
         let plan = self.build_exec_plan(&queued_commands);
         if let Err(error) = self.transaction.scheduler.schedule(&plan) {
@@ -398,13 +402,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 .to_resp_bytes();
         }
 
-        let replies = queued_commands
-            .into_iter()
-            .map(|queued| {
-                let db = connection.parser.context.db_index;
-                self.execute_user_command(db, &queued, Some(plan.txid))
-            })
-            .collect::<Vec<_>>();
+        let db = connection.parser.context.db_index;
+        let replies = self.execute_transaction_plan(db, &plan);
         CommandReply::Array(replies).to_resp_bytes()
     }
 
@@ -502,21 +501,46 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
         let txid = self.allocate_txid();
 
-        // This learning-path plan keeps one command per hop to make scheduling boundaries
-        // explicit. Later units can merge compatible commands into fewer coordinator hops.
-        let hops = queued_commands
-            .iter()
-            .cloned()
-            .map(|command| TransactionHop {
-                per_shard: vec![(self.core.resolve_target_shard(&command), command)],
-            })
-            .collect::<Vec<_>>();
+        // A hop represents one "parallelizable wave": at most one command per shard.
+        // When the next queued command targets a shard already present in the current hop,
+        // we close that hop and start a new one, preserving original command order.
+        let mut hops = Vec::new();
+        let mut current_hop = TransactionHop {
+            per_shard: Vec::new(),
+        };
+        let mut occupied_shards = HashSet::new();
+
+        for command in queued_commands.iter().cloned() {
+            let shard = self.core.resolve_target_shard(&command);
+            if occupied_shards.contains(&shard) {
+                hops.push(current_hop);
+                current_hop = TransactionHop {
+                    per_shard: Vec::new(),
+                };
+                occupied_shards.clear();
+            }
+            current_hop.per_shard.push((shard, command));
+            let _ = occupied_shards.insert(shard);
+        }
+        if !current_hop.per_shard.is_empty() {
+            hops.push(current_hop);
+        }
 
         TransactionPlan {
             txid,
             mode: TransactionMode::Global,
             hops,
         }
+    }
+
+    fn execute_transaction_plan(&mut self, db: u16, plan: &TransactionPlan) -> Vec<CommandReply> {
+        let mut replies = Vec::new();
+        for hop in &plan.hops {
+            for (_, command) in &hop.per_shard {
+                replies.push(self.execute_user_command(db, command, Some(plan.txid)));
+            }
+        }
+        replies
     }
 
     fn execute_user_command(
@@ -1877,6 +1901,7 @@ mod tests {
     use dfly_cluster::slot::{SlotRange, key_slot};
     use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
+    use dfly_core::command::CommandFrame;
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
     use googletest::prelude::*;
@@ -3436,6 +3461,60 @@ mod tests {
             .expect("EXEC should execute queued commands");
         let expected_exec = vec![b"*2\r\n+OK\r\n$3\r\nbar\r\n".to_vec()];
         assert_that!(&exec, eq(&expected_exec));
+    }
+
+    #[rstest]
+    fn resp_exec_with_empty_queue_returns_empty_array() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let multi = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        assert_that!(&multi, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should succeed");
+        assert_that!(&exec, eq(&vec![b"*0\r\n".to_vec()]));
+        assert_that!(app.replication.journal_entries().is_empty(), eq(true));
+    }
+
+    #[rstest]
+    fn exec_plan_groups_commands_without_duplicate_shards_per_hop() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+
+        let first_key = b"plan:key:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"plan:key:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("plan:key:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let queued = vec![
+            CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+            CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+            CommandFrame::new("GET", vec![first_key.clone()]),
+        ];
+        let plan = app.build_exec_plan(&queued);
+
+        assert_that!(plan.hops.len(), eq(2_usize));
+        assert_that!(plan.hops[0].per_shard.len(), eq(2_usize));
+        assert_that!(plan.hops[1].per_shard.len(), eq(1_usize));
+        assert_that!(plan.hops[0].per_shard[0].0, eq(first_shard));
+        assert_that!(plan.hops[0].per_shard[1].0, eq(second_shard));
+        assert_that!(plan.hops[1].per_shard[0].0, eq(first_shard));
+
+        let flattened = plan
+            .hops
+            .iter()
+            .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
+            .collect::<Vec<_>>();
+        assert_that!(&flattened, eq(&queued));
     }
 
     #[rstest]
