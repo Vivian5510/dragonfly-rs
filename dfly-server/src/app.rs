@@ -720,16 +720,32 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         hop: &TransactionHop,
     ) -> Vec<CommandReply> {
         let mut per_command_error = vec![None; hop.per_shard.len()];
+        let (target_shards_by_command, execute_on_worker_by_command) =
+            self.prepare_runtime_hop_dispatch(hop, &mut per_command_error);
+        if per_command_error.iter().any(std::option::Option::is_some) {
+            return Self::runtime_error_replies_for_hop(hop, &per_command_error, &HashMap::new());
+        }
+
+        let mut worker_sequence_by_command = vec![None; hop.per_shard.len()];
         let mut target_sequence_by_shard = HashMap::<u16, u64>::new();
 
-        for (index, (shard_hint, command)) in hop.per_shard.iter().enumerate() {
-            let target_shards =
-                self.runtime_target_shards_for_scheduled_command(*shard_hint, command);
-            for target_shard in target_shards {
-                match self.submit_runtime_envelope_with_sequence(target_shard, db, command, false) {
+        for (index, (_, command)) in hop.per_shard.iter().enumerate() {
+            let execute_on_worker = execute_on_worker_by_command[index];
+            for target_shard in &target_shards_by_command[index] {
+                let should_execute_on_worker =
+                    execute_on_worker && worker_sequence_by_command[index].is_none();
+                match self.submit_runtime_envelope_with_sequence(
+                    *target_shard,
+                    db,
+                    command,
+                    should_execute_on_worker,
+                ) {
                     Ok(sequence) => {
+                        if should_execute_on_worker {
+                            worker_sequence_by_command[index] = Some((*target_shard, sequence));
+                        }
                         target_sequence_by_shard
-                            .entry(target_shard)
+                            .entry(*target_shard)
                             .and_modify(|current| {
                                 *current = (*current).max(sequence);
                             })
@@ -744,7 +760,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 }
             }
         }
-
         let mut shard_wait_error = HashMap::<u16, String>::new();
         for (shard, target_sequence) in target_sequence_by_shard {
             match self.runtime.wait_for_processed_sequence(
@@ -765,28 +780,104 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let hop_has_runtime_error = per_command_error.iter().any(std::option::Option::is_some)
             || !shard_wait_error.is_empty();
         if hop_has_runtime_error {
-            let fallback = "runtime dispatch failed: hop barrier aborted".to_owned();
-            return hop
-                .per_shard
-                .iter()
-                .enumerate()
-                .map(|(index, (shard, _))| {
-                    if let Some(error) = &per_command_error[index] {
-                        return CommandReply::Error(error.clone());
-                    }
-                    if let Some(error) = shard_wait_error.get(shard) {
-                        return CommandReply::Error(error.clone());
-                    }
-                    CommandReply::Error(fallback.clone())
-                })
-                .collect::<Vec<_>>();
+            return Self::runtime_error_replies_for_hop(hop, &per_command_error, &shard_wait_error);
+        }
+
+        let worker_replies_by_command =
+            self.collect_worker_hop_replies(&worker_sequence_by_command, &mut per_command_error);
+
+        if per_command_error.iter().any(std::option::Option::is_some) {
+            return Self::runtime_error_replies_for_hop(hop, &per_command_error, &shard_wait_error);
         }
 
         let mut replies = Vec::with_capacity(hop.per_shard.len());
-        for (_, command) in &hop.per_shard {
-            replies.push(self.execute_user_command(db, command, Some(txid)));
+        for (index, (_, command)) in hop.per_shard.iter().enumerate() {
+            let reply = if let Some(worker_reply) = worker_replies_by_command[index].clone() {
+                worker_reply
+            } else {
+                self.execute_user_command(db, command, Some(txid))
+            };
+            self.maybe_append_journal_for_command(Some(txid), db, command, &reply);
+            replies.push(reply);
         }
         replies
+    }
+
+    fn prepare_runtime_hop_dispatch(
+        &self,
+        hop: &TransactionHop,
+        per_command_error: &mut [Option<String>],
+    ) -> (Vec<Vec<u16>>, Vec<bool>) {
+        let mut target_shards_by_command = Vec::with_capacity(hop.per_shard.len());
+        let mut execute_on_worker_by_command = Vec::with_capacity(hop.per_shard.len());
+        let out_of_range_error = format!(
+            "runtime dispatch failed: {}",
+            DflyError::InvalidState("target shard is out of range")
+        );
+        for (index, (shard_hint, command)) in hop.per_shard.iter().enumerate() {
+            let target_shards =
+                self.runtime_target_shards_for_scheduled_command(*shard_hint, command);
+            if target_shards
+                .iter()
+                .any(|shard| usize::from(*shard) >= usize::from(self.config.shard_count.get()))
+            {
+                per_command_error[index] = Some(out_of_range_error.clone());
+            }
+            target_shards_by_command.push(target_shards);
+            execute_on_worker_by_command.push(matches!(
+                self.core.command_routing(command),
+                CommandRouting::SingleKey { .. }
+            ));
+        }
+        (target_shards_by_command, execute_on_worker_by_command)
+    }
+
+    fn collect_worker_hop_replies(
+        &self,
+        worker_sequence_by_command: &[Option<(u16, u64)>],
+        per_command_error: &mut [Option<String>],
+    ) -> Vec<Option<CommandReply>> {
+        let mut worker_replies_by_command = vec![None; worker_sequence_by_command.len()];
+        for (index, worker_sequence) in worker_sequence_by_command.iter().copied().enumerate() {
+            let Some((worker_shard, worker_sequence)) = worker_sequence else {
+                continue;
+            };
+            match self
+                .runtime
+                .take_processed_reply(worker_shard, worker_sequence)
+            {
+                Ok(Some(reply)) => worker_replies_by_command[index] = Some(reply),
+                Ok(None) => {
+                    per_command_error[index] =
+                        Some("runtime dispatch failed: missing worker reply".to_owned());
+                }
+                Err(error) => {
+                    per_command_error[index] = Some(format!("runtime dispatch failed: {error}"));
+                }
+            }
+        }
+        worker_replies_by_command
+    }
+
+    fn runtime_error_replies_for_hop(
+        hop: &TransactionHop,
+        per_command_error: &[Option<String>],
+        shard_wait_error: &HashMap<u16, String>,
+    ) -> Vec<CommandReply> {
+        let fallback = "runtime dispatch failed: hop barrier aborted".to_owned();
+        hop.per_shard
+            .iter()
+            .enumerate()
+            .map(|(index, (shard, _))| {
+                if let Some(error) = &per_command_error[index] {
+                    return CommandReply::Error(error.clone());
+                }
+                if let Some(error) = shard_wait_error.get(shard) {
+                    return CommandReply::Error(error.clone());
+                }
+                CommandReply::Error(fallback.clone())
+            })
+            .collect::<Vec<_>>()
     }
 
     fn submit_runtime_envelope_with_sequence(
@@ -4238,6 +4329,38 @@ mod tests {
         assert_that!(second_runtime.len(), eq(1_usize));
         assert_that!(&first_runtime[0].command, eq(&queued[0]));
         assert_that!(&second_runtime[0].command, eq(&queued[1]));
+        assert_that!(first_runtime[0].execute_on_worker, eq(true));
+        assert_that!(second_runtime[0].execute_on_worker, eq(true));
+    }
+
+    #[rstest]
+    fn exec_plan_lockahead_single_key_runs_once_in_worker() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"plan:rt:worker:single:incr".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 77,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(shard, CommandFrame::new("INCR", vec![key.clone()]))],
+            }],
+            touched_shards: vec![shard],
+        };
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(&replies, eq(&vec![CommandReply::Integer(1)]));
+
+        let value = app
+            .core
+            .execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
+        assert_that!(&value, eq(&CommandReply::BulkString(b"1".to_vec())));
+
+        let runtime = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+        assert_that!(runtime.len(), eq(1_usize));
+        assert_that!(runtime[0].execute_on_worker, eq(true));
     }
 
     #[rstest]
