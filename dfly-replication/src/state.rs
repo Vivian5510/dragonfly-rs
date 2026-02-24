@@ -30,7 +30,7 @@ pub struct ReplicationState {
     /// Monotonic seed for 40-hex EOF token generation.
     pub next_eof_token_seed: u64,
     /// Active sync sessions accepted by `DFLY FLOW/SYNC/STARTSTABLE`.
-    pub active_sync_sessions: Vec<String>,
+    pub sync_sessions: Vec<SyncSession>,
 }
 
 /// One replica endpoint tracked by master-side control plane.
@@ -67,6 +67,61 @@ impl ReplicaSyncState {
     }
 }
 
+/// Session-level replication state used by Dragonfly's `DFLY` sync commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSessionState {
+    /// Replica is still registering flow sockets.
+    Preparation,
+    /// Full sync phase has started.
+    FullSync,
+    /// Session transitioned into stable incremental sync.
+    StableSync,
+}
+
+/// One flow sync mode negotiated by `DFLY FLOW`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSyncType {
+    /// Full sync is required for this flow.
+    Full,
+    /// Partial sync can resume from backlog.
+    Partial,
+}
+
+/// One negotiated flow descriptor stored under one sync session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncFlow {
+    /// Negotiated flow mode.
+    pub sync_type: FlowSyncType,
+    /// Requested starting offset for partial sync when present.
+    pub start_offset: Option<u64>,
+    /// Generated EOF token returned by `DFLY FLOW`.
+    pub eof_token: String,
+}
+
+/// One active sync session with per-flow registration slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSession {
+    /// Session id (`SYNC<n>`).
+    pub id: String,
+    /// Session phase.
+    pub state: SyncSessionState,
+    /// Per-flow registration map by flow id.
+    pub flows: Vec<Option<SyncFlow>>,
+}
+
+/// Session transition errors produced by `DFLY` command lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSessionError {
+    /// Referenced sync session does not exist.
+    SyncIdNotFound,
+    /// Command is invalid for current session phase.
+    InvalidState,
+    /// Requested flow id is outside session flow count.
+    FlowOutOfRange,
+    /// Transition requires all flows to be registered first.
+    IncompleteFlows,
+}
+
 impl Default for ReplicationState {
     fn default() -> Self {
         Self::new()
@@ -87,7 +142,7 @@ impl ReplicationState {
             replicas: Vec::new(),
             next_sync_session_id: 1,
             next_eof_token_seed: 1,
-            active_sync_sessions: Vec::new(),
+            sync_sessions: Vec::new(),
         }
     }
 
@@ -135,19 +190,123 @@ impl ReplicationState {
     }
 
     /// Allocates one new sync session id (`SYNC<n>`) and registers it as active.
-    pub fn create_sync_session(&mut self) -> String {
+    pub fn create_sync_session(&mut self, flow_count: usize) -> String {
+        let flow_count = flow_count.max(1);
         let session = format!("SYNC{}", self.next_sync_session_id);
         self.next_sync_session_id = self.next_sync_session_id.saturating_add(1);
-        self.active_sync_sessions.push(session.clone());
+        self.sync_sessions.push(SyncSession {
+            id: session.clone(),
+            state: SyncSessionState::Preparation,
+            flows: vec![None; flow_count],
+        });
         session
     }
 
     /// Returns whether one sync session id is currently known.
     #[must_use]
     pub fn is_known_sync_session(&self, sync_id: &str) -> bool {
-        self.active_sync_sessions
+        self.sync_sessions.iter().any(|entry| entry.id == sync_id)
+    }
+
+    /// Returns current state for one sync session when present.
+    #[must_use]
+    pub fn sync_session_state(&self, sync_id: &str) -> Option<SyncSessionState> {
+        self.sync_sessions
             .iter()
-            .any(|entry| entry == sync_id)
+            .find(|session| session.id == sync_id)
+            .map(|session| session.state)
+    }
+
+    /// Registers one flow under one sync session.
+    ///
+    /// This command is only valid while the session is in `Preparation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError::SyncIdNotFound` when the session id is unknown,
+    /// `SyncSessionError::InvalidState` when the session is no longer in preparation,
+    /// and `SyncSessionError::FlowOutOfRange` when flow id is outside session range.
+    pub fn register_sync_flow(
+        &mut self,
+        sync_id: &str,
+        flow_id: usize,
+        sync_type: FlowSyncType,
+        start_offset: Option<u64>,
+        eof_token: String,
+    ) -> Result<(), SyncSessionError> {
+        let session = self
+            .sync_sessions
+            .iter_mut()
+            .find(|session| session.id == sync_id)
+            .ok_or(SyncSessionError::SyncIdNotFound)?;
+
+        if session.state != SyncSessionState::Preparation {
+            return Err(SyncSessionError::InvalidState);
+        }
+        if flow_id >= session.flows.len() {
+            return Err(SyncSessionError::FlowOutOfRange);
+        }
+
+        session.flows[flow_id] = Some(SyncFlow {
+            sync_type,
+            start_offset,
+            eof_token,
+        });
+        Ok(())
+    }
+
+    /// Transitions one sync session into full-sync phase.
+    ///
+    /// Session must be in `Preparation`, and all flows must be registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError::SyncIdNotFound` when the session id is unknown,
+    /// `SyncSessionError::InvalidState` when the session is not in preparation,
+    /// and `SyncSessionError::IncompleteFlows` when one or more flows are still missing.
+    pub fn mark_sync_session_full_sync(&mut self, sync_id: &str) -> Result<(), SyncSessionError> {
+        let session = self
+            .sync_sessions
+            .iter_mut()
+            .find(|session| session.id == sync_id)
+            .ok_or(SyncSessionError::SyncIdNotFound)?;
+
+        if session.state != SyncSessionState::Preparation {
+            return Err(SyncSessionError::InvalidState);
+        }
+        if session.flows.iter().any(Option::is_none) {
+            return Err(SyncSessionError::IncompleteFlows);
+        }
+
+        session.state = SyncSessionState::FullSync;
+        self.full_sync_in_progress = true;
+        self.full_sync_done = false;
+        Ok(())
+    }
+
+    /// Transitions one sync session into stable sync phase.
+    ///
+    /// Dragonfly accepts this transition from both `Preparation` and `FullSync`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError::SyncIdNotFound` when the session id is unknown,
+    /// and `SyncSessionError::InvalidState` when the session is already stable.
+    pub fn mark_sync_session_stable_sync(&mut self, sync_id: &str) -> Result<(), SyncSessionError> {
+        let session = self
+            .sync_sessions
+            .iter_mut()
+            .find(|session| session.id == sync_id)
+            .ok_or(SyncSessionError::SyncIdNotFound)?;
+
+        if session.state == SyncSessionState::StableSync {
+            return Err(SyncSessionError::InvalidState);
+        }
+
+        session.state = SyncSessionState::StableSync;
+        self.full_sync_in_progress = false;
+        self.full_sync_done = true;
+        Ok(())
     }
 
     /// Allocates one 40-hex EOF token for `DFLY FLOW` handshake.
@@ -169,7 +328,9 @@ fn generate_master_replid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplicaSyncState, ReplicationState};
+    use super::{
+        FlowSyncType, ReplicaSyncState, ReplicationState, SyncSessionError, SyncSessionState,
+    };
     use googletest::prelude::*;
     use rstest::rstest;
 
@@ -230,8 +391,8 @@ mod tests {
     #[rstest]
     fn sync_session_ids_and_flow_tokens_are_monotonic() {
         let mut state = ReplicationState::default();
-        let sync_1 = state.create_sync_session();
-        let sync_2 = state.create_sync_session();
+        let sync_1 = state.create_sync_session(2);
+        let sync_2 = state.create_sync_session(2);
 
         assert_that!(sync_1.as_str(), eq("SYNC1"));
         assert_that!(sync_2.as_str(), eq("SYNC2"));
@@ -243,5 +404,53 @@ mod tests {
         assert_that!(token_1.len(), eq(40_usize));
         assert_that!(token_2.len(), eq(40_usize));
         assert_that!(token_1 == token_2, eq(false));
+    }
+
+    #[rstest]
+    fn sync_session_state_machine_requires_complete_flow_registration() {
+        let mut state = ReplicationState::default();
+        let sync = state.create_sync_session(2);
+
+        assert_that!(
+            state.mark_sync_session_full_sync(&sync),
+            eq(Err(SyncSessionError::IncompleteFlows))
+        );
+
+        let token_0 = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync, 0, FlowSyncType::Partial, Some(9), token_0),
+            eq(Ok(()))
+        );
+        assert_that!(
+            state.mark_sync_session_full_sync(&sync),
+            eq(Err(SyncSessionError::IncompleteFlows))
+        );
+
+        let token_1 = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync, 1, FlowSyncType::Full, None, token_1),
+            eq(Ok(()))
+        );
+        assert_that!(state.mark_sync_session_full_sync(&sync), eq(Ok(())));
+        assert_that!(
+            state.sync_session_state(&sync),
+            eq(Some(SyncSessionState::FullSync))
+        );
+
+        let late_token = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync, 0, FlowSyncType::Full, None, late_token),
+            eq(Err(SyncSessionError::InvalidState))
+        );
+
+        assert_that!(state.mark_sync_session_stable_sync(&sync), eq(Ok(())));
+        assert_that!(
+            state.sync_session_state(&sync),
+            eq(Some(SyncSessionState::StableSync))
+        );
+        assert_that!(
+            state.mark_sync_session_stable_sync(&sync),
+            eq(Err(SyncSessionError::InvalidState))
+        );
     }
 }

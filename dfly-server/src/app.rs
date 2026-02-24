@@ -13,6 +13,7 @@ use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
+use dfly_replication::state::{FlowSyncType, SyncSessionError};
 use dfly_search::SearchModule;
 use dfly_storage::StorageModule;
 use dfly_tiering::TieringModule;
@@ -485,7 +486,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             && frame.args[0].eq_ignore_ascii_case(b"CAPA")
             && frame.args[1].eq_ignore_ascii_case(b"dragonfly")
         {
-            let sync_id = self.replication.create_sync_session();
+            let sync_id = self
+                .replication
+                .create_sync_session(usize::from(self.config.shard_count.get()));
             return CommandReply::Array(vec![
                 CommandReply::BulkString(self.replication.master_replid().as_bytes().to_vec()),
                 CommandReply::BulkString(sync_id.into_bytes()),
@@ -592,7 +595,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_dfly_flow(&mut self, frame: &CommandFrame) -> CommandReply {
-        if !(frame.args.len() == 4 || frame.args.len() == 5) {
+        if !(frame.args.len() == 4 || frame.args.len() == 5 || frame.args.len() == 6) {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY FLOW' command".to_owned(),
             );
@@ -622,22 +625,57 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         }
 
-        let mut sync_type = "FULL";
-        if let Some(lsn_arg) = frame.args.get(4) {
+        let requested_offset = if frame.args.len() == 6 {
+            let Ok(lsn_vec_text) = std::str::from_utf8(&frame.args[5]) else {
+                return CommandReply::Error("DFLY FLOW lsn vector must be valid UTF-8".to_owned());
+            };
+            match parse_flow_lsn_vector_for_flow(
+                lsn_vec_text,
+                flow_id,
+                usize::from(self.config.shard_count.get()),
+            ) {
+                Ok(lsn) => Some(lsn),
+                Err(FlowLsnParseError::Syntax) => {
+                    return CommandReply::Error("syntax error".to_owned());
+                }
+                Err(FlowLsnParseError::InvalidInt) => {
+                    return CommandReply::Error(
+                        "value is not an integer or out of range".to_owned(),
+                    );
+                }
+            }
+        } else if let Some(lsn_arg) = frame.args.get(4) {
             let Ok(lsn_text) = std::str::from_utf8(lsn_arg) else {
                 return CommandReply::Error("DFLY FLOW lsn must be valid UTF-8".to_owned());
             };
             let Ok(lsn) = lsn_text.parse::<u64>() else {
                 return CommandReply::Error("value is not an integer or out of range".to_owned());
             };
-            if self.replication.can_partial_sync_from_offset(lsn) {
-                sync_type = "PARTIAL";
-            }
-        }
+            Some(lsn)
+        } else {
+            None
+        };
+
+        let sync_type = requested_offset
+            .filter(|offset| self.replication.can_partial_sync_from_offset(*offset))
+            .map_or(FlowSyncType::Full, |_| FlowSyncType::Partial);
 
         let eof_token = self.replication.allocate_flow_eof_token();
+        if let Err(error) = self.replication.register_sync_flow(
+            sync_id,
+            flow_id,
+            sync_type,
+            requested_offset,
+            eof_token.clone(),
+        ) {
+            return sync_session_error_reply(error);
+        }
+
         CommandReply::Array(vec![
-            CommandReply::SimpleString(sync_type.to_owned()),
+            CommandReply::SimpleString(match sync_type {
+                FlowSyncType::Full => "FULL".to_owned(),
+                FlowSyncType::Partial => "PARTIAL".to_owned(),
+            }),
             CommandReply::SimpleString(eof_token),
         ])
     }
@@ -651,8 +689,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY SYNC sync id must be valid UTF-8".to_owned());
         };
-        if !self.replication.is_known_sync_session(sync_id) {
-            return CommandReply::Error("syncid not found".to_owned());
+        if let Err(error) = self.replication.mark_sync_session_full_sync(sync_id) {
+            return sync_session_error_reply(error);
         }
 
         self.replication.mark_replicas_full_sync();
@@ -668,8 +706,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY STARTSTABLE sync id must be valid UTF-8".to_owned());
         };
-        if !self.replication.is_known_sync_session(sync_id) {
-            return CommandReply::Error("syncid not found".to_owned());
+        if let Err(error) = self.replication.mark_sync_session_stable_sync(sync_id) {
+            return sync_session_error_reply(error);
         }
 
         self.replication.mark_replicas_stable_sync();
@@ -933,6 +971,41 @@ fn wrong_arity(command_name: &str) -> Vec<u8> {
 /// Returns whether one command is `REPLCONF ACK <offset>`.
 fn is_replconf_ack_command(frame: &CommandFrame) -> bool {
     frame.name == "REPLCONF" && frame.args.len() == 2 && frame.args[0].eq_ignore_ascii_case(b"ACK")
+}
+
+fn sync_session_error_reply(error: SyncSessionError) -> CommandReply {
+    match error {
+        SyncSessionError::SyncIdNotFound => CommandReply::Error("syncid not found".to_owned()),
+        SyncSessionError::InvalidState | SyncSessionError::IncompleteFlows => {
+            CommandReply::Error("invalid state".to_owned())
+        }
+        SyncSessionError::FlowOutOfRange => {
+            CommandReply::Error("value is not an integer or out of range".to_owned())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowLsnParseError {
+    Syntax,
+    InvalidInt,
+}
+
+fn parse_flow_lsn_vector_for_flow(
+    lsn_vec_text: &str,
+    flow_id: usize,
+    shard_count: usize,
+) -> Result<u64, FlowLsnParseError> {
+    let entries = lsn_vec_text.split('-').collect::<Vec<_>>();
+    if entries.len() != shard_count {
+        return Err(FlowLsnParseError::Syntax);
+    }
+    let Some(flow_lsn_text) = entries.get(flow_id) else {
+        return Err(FlowLsnParseError::Syntax);
+    };
+    flow_lsn_text
+        .parse::<u64>()
+        .map_err(|_| FlowLsnParseError::InvalidInt)
 }
 
 /// Returns journal op kind when the command mutated keyspace state.
@@ -1719,6 +1792,19 @@ mod tests {
             )
             .expect("REPLCONF CAPA dragonfly should succeed");
         let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+        for flow_id in 0..usize::from(app.config.shard_count.get()) {
+            let flow_id_text = flow_id.to_string().into_bytes();
+            let flow_reply = app
+                .feed_connection_bytes(
+                    &mut connection,
+                    &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
+                )
+                .expect("DFLY FLOW should succeed");
+            let (sync_type, eof_token) = extract_dfly_flow_reply(&flow_reply[0]);
+            assert_that!(sync_type.as_str(), eq("FULL"));
+            assert_that!(eof_token.len(), eq(40_usize));
+        }
 
         let sync_reply = app
             .feed_connection_bytes(
@@ -1747,6 +1833,119 @@ mod tests {
             .expect("ROLE should succeed");
         let role_payload = std::str::from_utf8(&role_after_stable[0]).expect("ROLE is UTF-8");
         assert_that!(role_payload.contains("stable_sync"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_dfly_sync_requires_all_flows_registered() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+
+        let flow_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+            )
+            .expect("first DFLY FLOW should succeed");
+        let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
+        assert_that!(sync_type.as_str(), eq("FULL"));
+
+        let sync_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
+            )
+            .expect("DFLY SYNC should parse");
+        assert_that!(&sync_reply, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_dfly_flow_rejects_after_session_leaves_preparation() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+
+        for flow_id in 0..usize::from(app.config.shard_count.get()) {
+            let flow_id_text = flow_id.to_string().into_bytes();
+            let _ = app
+                .feed_connection_bytes(
+                    &mut connection,
+                    &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
+                )
+                .expect("DFLY FLOW should succeed");
+        }
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
+            )
+            .expect("DFLY SYNC should succeed");
+
+        let replay_flow = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+            )
+            .expect("DFLY FLOW should parse");
+        assert_that!(&replay_flow, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_dfly_flow_accepts_master_lsn_vector_argument() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"vector:key", b"vector:value"]),
+            )
+            .expect("SET should succeed");
+
+        let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
+            .join("-")
+            .into_bytes();
+        let flow_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[
+                    b"DFLY",
+                    b"FLOW",
+                    &master_id,
+                    &sync_id,
+                    b"1",
+                    b"LASTMASTER",
+                    &lsn_vec,
+                ]),
+            )
+            .expect("DFLY FLOW should succeed");
+        let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
+        assert_that!(sync_type.as_str(), eq("PARTIAL"));
     }
 
     #[rstest]

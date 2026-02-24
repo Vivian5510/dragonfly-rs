@@ -4,7 +4,7 @@ pub mod journal;
 pub mod state;
 
 use journal::{InMemoryJournal, JournalEntry};
-use state::{ReplicaSyncState, ReplicationState};
+use state::{FlowSyncType, ReplicaSyncState, ReplicationState, SyncSessionError};
 
 /// Replication subsystem bootstrap module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,14 +125,51 @@ impl ReplicationModule {
     }
 
     /// Creates one sync session id used by `DFLY` replication commands.
-    pub fn create_sync_session(&mut self) -> String {
-        self.state.create_sync_session()
+    pub fn create_sync_session(&mut self, flow_count: usize) -> String {
+        self.state.create_sync_session(flow_count)
     }
 
     /// Returns whether one sync session id is currently known.
     #[must_use]
     pub fn is_known_sync_session(&self, sync_id: &str) -> bool {
         self.state.is_known_sync_session(sync_id)
+    }
+
+    /// Registers one flow under one existing sync session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError` when session id is unknown, flow id is out of range,
+    /// or session state does not allow additional flow registration.
+    pub fn register_sync_flow(
+        &mut self,
+        sync_id: &str,
+        flow_id: usize,
+        sync_type: FlowSyncType,
+        start_offset: Option<u64>,
+        eof_token: String,
+    ) -> Result<(), SyncSessionError> {
+        self.state
+            .register_sync_flow(sync_id, flow_id, sync_type, start_offset, eof_token)
+    }
+
+    /// Marks one sync session as full-sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError` when the session is unknown, not in preparation,
+    /// or still missing one or more registered flows.
+    pub fn mark_sync_session_full_sync(&mut self, sync_id: &str) -> Result<(), SyncSessionError> {
+        self.state.mark_sync_session_full_sync(sync_id)
+    }
+
+    /// Marks one sync session as stable-sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncSessionError` when the session is unknown or already stable.
+    pub fn mark_sync_session_stable_sync(&mut self, sync_id: &str) -> Result<(), SyncSessionError> {
+        self.state.mark_sync_session_stable_sync(sync_id)
     }
 
     /// Allocates one flow EOF token for `DFLY FLOW` response.
