@@ -1914,6 +1914,66 @@ fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
 }
 
 #[rstest]
+fn exec_plan_global_same_shard_copy_executes_on_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let source_key = b"plan:rt:global:copy:source".to_vec();
+    let shard = app.core.resolve_shard_for_key(&source_key);
+    let mut destination_key = b"plan:rt:global:copy:destination".to_vec();
+    let mut destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    let mut suffix = 0_u32;
+    while destination_shard != shard {
+        suffix = suffix.saturating_add(1);
+        destination_key = format!("plan:rt:global:copy:destination:{suffix}").into_bytes();
+        destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    }
+
+    let set = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        None,
+    );
+    assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+    for shard_id in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard_id)
+            .expect("drain should succeed");
+    }
+
+    let queued = vec![CommandFrame::new(
+        "COPY",
+        vec![source_key.clone(), destination_key.clone()],
+    )];
+    let plan = app.build_exec_plan(&queued);
+    assert_that!(plan.mode, eq(TransactionMode::Global));
+
+    let replies = app.execute_transaction_plan(0, &plan);
+    assert_that!(&replies, eq(&vec![CommandReply::Integer(1)]));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&queued[0]));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let destination_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+    assert_that!(
+        &destination_value,
+        eq(&CommandReply::BulkString(b"value".to_vec()))
+    );
+}
+
+#[rstest]
 fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let queued = vec![CommandFrame::new("PING", Vec::new())];

@@ -1,6 +1,7 @@
 //! Runtime dispatch/execution path for transactions and direct command ingress.
 
 use super::{ServerApp, is_runtime_dispatch_error};
+use dfly_common::config::ClusterMode;
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
@@ -162,13 +163,36 @@ impl ServerApp {
             {
                 per_command_error[index] = Some(out_of_range_error.clone());
             }
+            let execute_on_worker = self.command_should_execute_on_worker(command, &target_shards);
             target_shards_by_command.push(target_shards);
-            execute_on_worker_by_command.push(matches!(
-                self.core.command_routing(command),
-                CommandRouting::SingleKey { .. }
-            ));
+            execute_on_worker_by_command.push(execute_on_worker);
         }
         (target_shards_by_command, execute_on_worker_by_command)
+    }
+
+    fn command_should_execute_on_worker(
+        &self,
+        command: &CommandFrame,
+        target_shards: &[u16],
+    ) -> bool {
+        if matches!(
+            self.core.command_routing(command),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return true;
+        }
+
+        // Keep cluster redirection/CROSSSLOT handling on the coordinator path for
+        // copy/rename family in transaction mode. Worker execution is enabled only
+        // for standalone mode where those checks are not required.
+        if self.cluster.mode != ClusterMode::Disabled {
+            return false;
+        }
+
+        let Some(same_shard) = self.same_shard_copy_rename_target_shard(command) else {
+            return false;
+        };
+        target_shards.len() == 1 && target_shards.first().copied() == Some(same_shard)
     }
 
     pub(super) fn collect_worker_hop_replies(
@@ -284,12 +308,7 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
-        if !matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") {
-            return None;
-        }
-        if frame.args.len() < 2 {
-            return None;
-        }
+        let shard = self.same_shard_copy_rename_target_shard(frame)?;
 
         let keys_for_cluster_check: Vec<&[u8]> = match frame.name.as_str() {
             "COPY" => frame.args.iter().take(2).map(Vec::as_slice).collect(),
@@ -299,13 +318,6 @@ impl ServerApp {
         {
             return Some(error_reply);
         }
-
-        let source_shard = self.core.resolve_shard_for_key(&frame.args[0]);
-        let destination_shard = self.core.resolve_shard_for_key(&frame.args[1]);
-        if source_shard != destination_shard {
-            return None;
-        }
-        let shard = source_shard;
         if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
             return Some(CommandReply::Error(format!(
                 "runtime dispatch failed: {error}"
@@ -334,6 +346,16 @@ impl ServerApp {
                 "runtime dispatch failed: {error}"
             ))),
         }
+    }
+
+    fn same_shard_copy_rename_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
+        if !matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") || frame.args.len() < 2 {
+            return None;
+        }
+
+        let source_shard = self.core.resolve_shard_for_key(&frame.args[0]);
+        let destination_shard = self.core.resolve_shard_for_key(&frame.args[1]);
+        (source_shard == destination_shard).then_some(source_shard)
     }
 
     pub(super) fn execute_multikey_string_commands_via_runtime(
