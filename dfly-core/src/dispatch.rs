@@ -293,6 +293,11 @@ impl CommandRegistry {
             handler: handle_pexpire,
         });
         self.register(CommandSpec {
+            name: "PEXPIREAT",
+            arity: CommandArity::Exact(2),
+            handler: handle_pexpireat,
+        });
+        self.register(CommandSpec {
             name: "EXPIREAT",
             arity: CommandArity::Exact(2),
             handler: handle_expireat,
@@ -712,6 +717,39 @@ fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
     let expire_at_millis = now_millis.saturating_add(expire_delta_millis);
     let expire_at_secs = expire_at_millis.saturating_add(999) / 1000;
 
+    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
+        entry.expire_at_unix_secs = Some(expire_at_secs);
+        state.bump_key_version(db, key);
+        return CommandReply::Integer(1);
+    }
+    CommandReply::Integer(0)
+}
+
+fn handle_pexpireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let timestamp_millis = match parse_i64_arg(&frame.args[1], "PEXPIREAT timestamp") {
+        Ok(timestamp) => timestamp,
+        Err(error) => return CommandReply::Error(error),
+    };
+    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+        return CommandReply::Integer(0);
+    }
+
+    let now_millis = i64::try_from(DispatchState::now_unix_millis()).unwrap_or(i64::MAX);
+    if timestamp_millis <= now_millis {
+        if state.db_map_mut(db).remove(key).is_some() {
+            state.bump_key_version(db, key);
+            return CommandReply::Integer(1);
+        }
+        return CommandReply::Integer(0);
+    }
+
+    let Ok(timestamp_millis) = u64::try_from(timestamp_millis) else {
+        return CommandReply::Error("PEXPIREAT timestamp is out of range".to_owned());
+    };
+    let expire_at_secs = timestamp_millis.saturating_add(999) / 1000;
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
         entry.expire_at_unix_secs = Some(expire_at_secs);
         state.bump_key_version(db, key);
@@ -1714,6 +1752,47 @@ mod tests {
         let past = registry.dispatch(
             0,
             &CommandFrame::new("EXPIREAT", vec![b"past".to_vec(), b"1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&past, eq(&CommandReply::Integer(1)));
+
+        let removed = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"past".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&removed, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn dispatch_pexpireat_sets_future_or_removes_past_keys() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"future".to_vec(), b"v".to_vec()]),
+            &mut state,
+        );
+        let future_timestamp = DispatchState::now_unix_millis()
+            .saturating_add(120_000)
+            .to_string()
+            .into_bytes();
+        let future = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIREAT", vec![b"future".to_vec(), future_timestamp]),
+            &mut state,
+        );
+        assert_that!(&future, eq(&CommandReply::Integer(1)));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"past".to_vec(), b"v".to_vec()]),
+            &mut state,
+        );
+        let past = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIREAT", vec![b"past".to_vec(), b"1".to_vec()]),
             &mut state,
         );
         assert_that!(&past, eq(&CommandReply::Integer(1)));

@@ -601,9 +601,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN"
-            | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "TTL" | "PTTL"
-            | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
-            | "SETNX" => self.execute_key_command(db, frame),
+            | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "TTL"
+            | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR" | "DECR" | "INCRBY"
+            | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1602,6 +1602,13 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
                 Some(JournalOp::Command)
             }
         }
+        ("PEXPIREAT", CommandReply::Integer(1)) => {
+            if pexpireat_is_delete(frame) {
+                Some(JournalOp::Expired)
+            } else {
+                Some(JournalOp::Command)
+            }
+        }
         ("PEXPIRE", CommandReply::Integer(1)) => {
             if pexpire_is_delete(frame) {
                 Some(JournalOp::Expired)
@@ -1643,6 +1650,20 @@ fn expireat_is_delete(frame: &CommandFrame) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        });
+    frame
+        .args
+        .get(1)
+        .and_then(|timestamp| std::str::from_utf8(timestamp).ok())
+        .and_then(|timestamp| timestamp.parse::<i64>().ok())
+        .is_some_and(|timestamp| timestamp <= now)
+}
+
+fn pexpireat_is_delete(frame: &CommandFrame) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         });
     frame
         .args
@@ -2356,6 +2377,52 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_pexpireat_sets_future_expire_and_deletes_past_keys() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"future", b"v"]))
+            .expect("SET future should execute");
+        let future_timestamp = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_millis()
+            + 120_000)
+            .to_string()
+            .into_bytes();
+        let pexpireat_future = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIREAT", b"future", &future_timestamp]),
+            )
+            .expect("PEXPIREAT future should execute");
+        assert_that!(&pexpireat_future, eq(&vec![b":1\r\n".to_vec()]));
+
+        let pttl_future = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"future"]))
+            .expect("PTTL should execute");
+        let pttl_value = parse_resp_integer(&pttl_future[0]);
+        assert_that!(pttl_value > 0, eq(true));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"past", b"v"]))
+            .expect("SET past should execute");
+        let pexpireat_past = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIREAT", b"past", b"1"]),
+            )
+            .expect("PEXPIREAT past should execute");
+        assert_that!(&pexpireat_past, eq(&vec![b":1\r\n".to_vec()]));
+
+        let removed = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"past"]))
+            .expect("GET should execute");
+        assert_that!(&removed, eq(&vec![b"$-1\r\n".to_vec()]));
+    }
+
+    #[rstest]
     fn resp_mget_preserves_key_order_across_shards() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -2920,6 +2987,40 @@ mod tests {
         let _ = app
             .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"k", b"0"]))
             .expect("PEXPIRE with zero timeout should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(4_usize));
+        assert_that!(entries[1].op, eq(JournalOp::Command));
+        assert_that!(entries[3].op, eq(JournalOp::Expired));
+    }
+
+    #[rstest]
+    fn journal_records_pexpireat_as_command_or_expired_by_timestamp() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let future_timestamp = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_millis()
+            + 120_000)
+            .to_string()
+            .into_bytes();
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIREAT", b"k", &future_timestamp]),
+            )
+            .expect("PEXPIREAT future should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should recreate key");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIREAT", b"k", b"1"]))
+            .expect("PEXPIREAT past should succeed");
 
         let entries = app.replication.journal_entries();
         assert_that!(entries.len(), eq(4_usize));
