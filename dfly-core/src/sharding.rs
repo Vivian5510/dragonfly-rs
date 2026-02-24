@@ -1,8 +1,6 @@
 //! Shard routing abstractions.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
+use dfly_cluster::slot::key_slot;
 use dfly_common::ids::{ShardCount, ShardId};
 
 /// Resolves key ownership to a shard id.
@@ -11,11 +9,10 @@ pub trait ShardResolver {
     fn shard_for_key(&self, key: &[u8]) -> ShardId;
 }
 
-/// Hash-tag aware shard resolver placeholder.
+/// Hash-tag aware shard resolver.
 ///
-/// Dragonfly's C++ code supports both cluster-slot and lock-tag based sharding behavior.
-/// Unit 0 only installs a deterministic hash-based resolver. Unit 2+ extends this with
-/// lock-tag extraction and cluster-slot modes.
+/// Dragonfly routes keys by Redis hash-slot semantics (`{...}` hashtag extraction + CRC16).
+/// We mirror that contract and then map slot ownership to shard threads by modulo shard count.
 #[derive(Debug, Clone)]
 pub struct HashTagShardResolver {
     shard_count: ShardCount,
@@ -27,16 +24,21 @@ impl HashTagShardResolver {
     pub fn new(shard_count: ShardCount) -> Self {
         Self { shard_count }
     }
+
+    /// Returns configured shard count.
+    #[must_use]
+    pub fn shard_count(&self) -> ShardCount {
+        self.shard_count
+    }
 }
 
 impl ShardResolver for HashTagShardResolver {
     fn shard_for_key(&self, key: &[u8]) -> ShardId {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let shard = hasher.finish() % u64::from(self.shard_count.get());
+        let slot = key_slot(key);
+        let shard = u32::from(slot) % u32::from(self.shard_count.get());
         match ShardId::try_from(shard) {
             Ok(shard_id) => shard_id,
-            Err(_) => unreachable!("modulo shard_count ensures shard id fits into u16"),
+            Err(_) => unreachable!("slot modulo shard_count always fits into u16"),
         }
     }
 }
@@ -44,6 +46,7 @@ impl ShardResolver for HashTagShardResolver {
 #[cfg(test)]
 mod tests {
     use super::{HashTagShardResolver, ShardResolver};
+    use dfly_cluster::slot::key_slot;
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -67,5 +70,28 @@ mod tests {
         let first = resolver.shard_for_key(key);
         let second = resolver.shard_for_key(key);
         assert_that!(first, eq(second));
+    }
+
+    #[rstest]
+    fn resolver_uses_hashtag_semantics_for_shard_routing() {
+        let resolver = HashTagShardResolver::new(ShardCount::new(8).expect("literal is valid"));
+
+        let first = resolver.shard_for_key(b"user:{42}:name");
+        let second = resolver.shard_for_key(b"user:{42}:email");
+        assert_that!(first, eq(second));
+
+        let third = resolver.shard_for_key(b"user:{84}:name");
+        assert_that!(first, not(eq(third)));
+    }
+
+    #[rstest]
+    fn resolver_matches_slot_modulo_shard_count_contract() {
+        let resolver = HashTagShardResolver::new(ShardCount::new(16).expect("literal is valid"));
+        let key = b"dragonfly:{alpha}:key";
+        let slot = key_slot(key);
+        let expected = slot % 16;
+
+        let shard = resolver.shard_for_key(key);
+        assert_that!(shard, eq(expected));
     }
 }

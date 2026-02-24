@@ -213,7 +213,6 @@ pub fn classify_single_key_access(frame: &CommandFrame) -> Option<SingleKeyAcces
             "GET"
                 | "TYPE"
                 | "STRLEN"
-                | "GETRANGE"
                 | "TTL"
                 | "PTTL"
                 | "EXPIRETIME"
@@ -222,6 +221,10 @@ pub fn classify_single_key_access(frame: &CommandFrame) -> Option<SingleKeyAcces
                 | "TOUCH"
         )
     {
+        return Some(SingleKeyAccess::Read);
+    }
+
+    if has_primary_key && matches!(name, "GETRANGE") {
         return Some(SingleKeyAccess::Read);
     }
 
@@ -599,6 +602,14 @@ impl CoreModule {
         self.resolver.shard_for_key(key)
     }
 
+    /// Resolves owner shard for one Redis hash slot.
+    ///
+    /// Routing contract mirrors `HashTagShardResolver`: `owner = slot % shard_count`.
+    #[must_use]
+    pub fn resolve_shard_for_slot(&self, slot: u16) -> u16 {
+        slot % self.resolver.shard_count().get()
+    }
+
     /// Returns current mutation version for one key in selected logical DB.
     #[must_use]
     pub fn key_version(&self, db: DbIndex, key: &[u8]) -> u64 {
@@ -739,37 +750,34 @@ impl CoreModule {
 
     /// Returns live keys in selected logical DB that belong to one cluster slot.
     ///
-    /// Dragonfly slot migration and cluster introspection operate over slot-scoped
-    /// key sets. We aggregate each shard-local `slot_keys` index and apply the
-    /// same expiration visibility rules as read commands.
+    /// Dragonfly slot migration and cluster introspection operate over slot-scoped key sets.
+    /// Because slot ownership maps deterministically to one shard thread, this lookup goes
+    /// directly to the owner shard instead of scanning every shard-local table.
     #[must_use]
     pub fn keys_in_slot(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
-        let mut keys = Vec::new();
+        let owner = usize::from(self.resolve_shard_for_slot(slot));
+        let Some(state) = self.shard_states.get(owner) else {
+            return Vec::new();
+        };
 
-        for state in &self.shard_states {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            keys.extend(state.slot_keys_live(db, slot));
-        }
-
-        keys.sort_unstable();
-        keys.dedup();
-        keys
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slot_keys_live(db, slot)
     }
 
     /// Returns live key count in selected logical DB for one cluster slot.
     #[must_use]
     pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
-        self.shard_states
-            .iter()
-            .map(|state| {
-                state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .count_live_keys_in_slot(db, slot)
-            })
-            .sum()
+        let owner = usize::from(self.resolve_shard_for_slot(slot));
+        let Some(state) = self.shard_states.get(owner) else {
+            return 0;
+        };
+
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .count_live_keys_in_slot(db, slot)
     }
 
     /// Runs one active-expiration pass on each shard state.
@@ -1079,6 +1087,17 @@ mod tests {
 
         let rename = CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]);
         assert_that!(classify_single_key_access(&rename), eq(None));
+    }
+
+    #[rstest]
+    fn core_resolve_shard_for_slot_matches_key_owner() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let key = b"profile:{42}:name".to_vec();
+        let slot = key_slot(&key);
+
+        let owner_from_key = core.resolve_shard_for_key(&key);
+        let owner_from_slot = core.resolve_shard_for_slot(slot);
+        assert_that!(owner_from_key, eq(owner_from_slot));
     }
 
     #[rstest]

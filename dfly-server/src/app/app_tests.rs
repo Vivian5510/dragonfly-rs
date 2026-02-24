@@ -1879,7 +1879,9 @@ fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
     )];
     let plan = app.build_exec_plan(&queued);
     assert_that!(plan.mode, eq(TransactionMode::Global));
-    assert_that!(&plan.touched_shards, eq(&vec![first_shard, second_shard]));
+    assert_that!(plan.touched_shards.len(), eq(2_usize));
+    assert_that!(plan.touched_shards.contains(&first_shard), eq(true));
+    assert_that!(plan.touched_shards.contains(&second_shard), eq(true));
 
     let replies = app.execute_transaction_plan(0, &plan);
     assert_that!(
