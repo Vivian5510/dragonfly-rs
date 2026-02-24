@@ -14,6 +14,18 @@ use dispatch::{
 use sharding::{HashTagShardResolver, ShardResolver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Coordinator-facing routing class used by transaction planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRouting {
+    /// Command targets one primary key routed by argument #1.
+    SingleKey {
+        /// Whether command mutates keyspace/value state.
+        is_write: bool,
+    },
+    /// Command has no single-key affinity.
+    NonKey,
+}
+
 /// Core module bootstrap object.
 ///
 /// In Unit 0 this struct only wires shard resolver policy. Later units add process-wide registries
@@ -352,17 +364,36 @@ impl CoreModule {
     /// - keyless commands run on shard 0
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
-        match frame.name.as_str() {
-            "GET" | "SET" | "TYPE" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "DEL"
-            | "UNLINK" | "EXISTS" | "TOUCH" | "MOVE" | "COPY" | "RENAME" | "RENAMENX"
-            | "GETRANGE" | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
-            | "PEXPIREAT" | "TTL" | "PTTL" | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME" | "INCR"
-            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => frame
+        match self.command_routing(frame) {
+            CommandRouting::SingleKey { .. } => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),
-            _ => 0,
+            CommandRouting::NonKey => 0,
         }
+    }
+
+    /// Returns transaction-planning routing class for one command frame.
+    #[must_use]
+    pub fn command_routing(&self, frame: &CommandFrame) -> CommandRouting {
+        match frame.name.as_str() {
+            "GET" | "TYPE" | "STRLEN" | "EXISTS" | "TOUCH" | "GETRANGE" | "TTL" | "PTTL"
+            | "EXPIRETIME" | "PEXPIRETIME" => CommandRouting::SingleKey { is_write: false },
+            "SET" | "GETSET" | "GETDEL" | "APPEND" | "DEL" | "UNLINK" | "MOVE" | "COPY"
+            | "RENAME" | "RENAMENX" | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE"
+            | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
+            | "SETNX" => CommandRouting::SingleKey { is_write: true },
+            _ => CommandRouting::NonKey,
+        }
+    }
+
+    /// Returns whether command can participate in single-key lock-ahead planning.
+    #[must_use]
+    pub fn is_single_key_command(&self, frame: &CommandFrame) -> bool {
+        matches!(
+            self.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        )
     }
 }
 
@@ -493,7 +524,7 @@ fn parse_class_atom(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::CoreModule;
+    use super::{CommandRouting, CoreModule};
     use crate::command::{CommandFrame, CommandReply};
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
@@ -514,6 +545,29 @@ mod tests {
             &get_reply,
             eq(&CommandReply::BulkString(b"active".to_vec()))
         );
+    }
+
+    #[rstest]
+    fn core_classifies_single_key_and_non_key_routing() {
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+
+        let set = CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]);
+        assert_that!(core.is_single_key_command(&set), eq(true));
+        assert_that!(
+            core.command_routing(&set),
+            eq(CommandRouting::SingleKey { is_write: true })
+        );
+
+        let get = CommandFrame::new("GET", vec![b"k".to_vec()]);
+        assert_that!(core.is_single_key_command(&get), eq(true));
+        assert_that!(
+            core.command_routing(&get),
+            eq(CommandRouting::SingleKey { is_write: false })
+        );
+
+        let ping = CommandFrame::new("PING", Vec::new());
+        assert_that!(core.is_single_key_command(&ping), eq(false));
+        assert_that!(core.command_routing(&ping), eq(CommandRouting::NonKey));
     }
 
     #[rstest]

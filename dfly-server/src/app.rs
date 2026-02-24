@@ -500,32 +500,49 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
         let txid = self.allocate_txid();
+        if queued_commands
+            .iter()
+            .all(|command| self.core.is_single_key_command(command))
+        {
+            // Lock-ahead path: one hop models one wave that can be executed with disjoint shard
+            // ownership. We keep at most one command per shard inside a hop.
+            let mut hops = Vec::new();
+            let mut current_hop = TransactionHop {
+                per_shard: Vec::new(),
+            };
+            let mut occupied_shards = HashSet::new();
 
-        // A hop represents one "parallelizable wave": at most one command per shard.
-        // When the next queued command targets a shard already present in the current hop,
-        // we close that hop and start a new one, preserving original command order.
-        let mut hops = Vec::new();
-        let mut current_hop = TransactionHop {
-            per_shard: Vec::new(),
-        };
-        let mut occupied_shards = HashSet::new();
-
-        for command in queued_commands.iter().cloned() {
-            let shard = self.core.resolve_target_shard(&command);
-            if occupied_shards.contains(&shard) {
-                hops.push(current_hop);
-                current_hop = TransactionHop {
-                    per_shard: Vec::new(),
-                };
-                occupied_shards.clear();
+            for command in queued_commands.iter().cloned() {
+                let shard = self.core.resolve_target_shard(&command);
+                if occupied_shards.contains(&shard) {
+                    hops.push(current_hop);
+                    current_hop = TransactionHop {
+                        per_shard: Vec::new(),
+                    };
+                    occupied_shards.clear();
+                }
+                current_hop.per_shard.push((shard, command));
+                let _ = occupied_shards.insert(shard);
             }
-            current_hop.per_shard.push((shard, command));
-            let _ = occupied_shards.insert(shard);
-        }
-        if !current_hop.per_shard.is_empty() {
-            hops.push(current_hop);
+            if !current_hop.per_shard.is_empty() {
+                hops.push(current_hop);
+            }
+
+            return TransactionPlan {
+                txid,
+                mode: TransactionMode::LockAhead,
+                hops,
+            };
         }
 
+        // Global fallback keeps strict one-command-per-hop sequencing for mixed workloads.
+        let hops = queued_commands
+            .iter()
+            .cloned()
+            .map(|command| TransactionHop {
+                per_shard: vec![(self.core.resolve_target_shard(&command), command)],
+            })
+            .collect::<Vec<_>>();
         TransactionPlan {
             txid,
             mode: TransactionMode::Global,
@@ -1904,6 +1921,7 @@ mod tests {
     use dfly_core::command::CommandFrame;
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
+    use dfly_transaction::plan::TransactionMode;
     use googletest::prelude::*;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -3502,12 +3520,38 @@ mod tests {
         ];
         let plan = app.build_exec_plan(&queued);
 
+        assert_that!(plan.mode, eq(TransactionMode::LockAhead));
         assert_that!(plan.hops.len(), eq(2_usize));
         assert_that!(plan.hops[0].per_shard.len(), eq(2_usize));
         assert_that!(plan.hops[1].per_shard.len(), eq(1_usize));
         assert_that!(plan.hops[0].per_shard[0].0, eq(first_shard));
         assert_that!(plan.hops[0].per_shard[1].0, eq(second_shard));
         assert_that!(plan.hops[1].per_shard[0].0, eq(first_shard));
+
+        let flattened = plan
+            .hops
+            .iter()
+            .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
+            .collect::<Vec<_>>();
+        assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
+    fn exec_plan_falls_back_to_global_mode_for_non_key_commands() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let queued = vec![
+            CommandFrame::new("PING", Vec::new()),
+            CommandFrame::new("SET", vec![b"plan:key".to_vec(), b"value".to_vec()]),
+            CommandFrame::new("TIME", Vec::new()),
+        ];
+
+        let plan = app.build_exec_plan(&queued);
+        assert_that!(plan.mode, eq(TransactionMode::Global));
+        assert_that!(plan.hops.len(), eq(3_usize));
+        assert_that!(
+            plan.hops.iter().all(|hop| hop.per_shard.len() == 1),
+            eq(true)
+        );
 
         let flattened = plan
             .hops
