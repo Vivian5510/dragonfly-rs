@@ -467,6 +467,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "INFO" => (frame.args.len() <= 1)
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message("INFO")),
+            "KEYS" => (frame.args.len() == 1)
+                .then_some(())
+                .ok_or_else(|| wrong_arity_message("KEYS")),
             "TIME" | "ROLE" | "READONLY" | "READWRITE" | "DBSIZE" | "RANDOMKEY" => frame
                 .args
                 .is_empty()
@@ -539,6 +542,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "READONLY" => Self::execute_readonly(frame),
             "READWRITE" => self.execute_readwrite(frame),
             "DBSIZE" => self.execute_dbsize(db, frame),
+            "KEYS" => self.execute_keys(db, frame),
             "RANDOMKEY" => self.execute_randomkey(db, frame),
             "FLUSHDB" => self.execute_flushdb(db, frame),
             "FLUSHALL" => self.execute_flushall(frame),
@@ -672,6 +676,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.core
             .random_key(db)
             .map_or(CommandReply::Null, CommandReply::BulkString)
+    }
+
+    fn execute_keys(&self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error("wrong number of arguments for 'KEYS' command".to_owned());
+        }
+
+        let keys = self.core.keys_matching(db, &frame.args[0]);
+        let replies = keys
+            .into_iter()
+            .map(CommandReply::BulkString)
+            .collect::<Vec<_>>();
+        CommandReply::Array(replies)
     }
 
     fn execute_flushall(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1985,6 +2002,70 @@ mod tests {
             &reply,
             eq(&vec![
                 b"-ERR wrong number of arguments for 'RANDOMKEY' command\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_keys_filters_matching_keys_in_selected_database() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:1", b"v1"]))
+            .expect("SET user:1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:2", b"v2"]))
+            .expect("SET user:2 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"admin:1", b"v3"]))
+            .expect("SET admin:1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:db1", b"x"]))
+            .expect("SET db1 key should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should execute");
+
+        let user_keys = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"user:*"]))
+            .expect("KEYS user:* should execute");
+        assert_that!(
+            &user_keys,
+            eq(&vec![b"*2\r\n$6\r\nuser:1\r\n$6\r\nuser:2\r\n".to_vec()])
+        );
+
+        let no_match = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"missing:*"]))
+            .expect("KEYS missing:* should execute");
+        assert_that!(&no_match, eq(&vec![b"*0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_keys_rejects_wrong_arity() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let too_few = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS"]))
+            .expect("KEYS should parse");
+        assert_that!(
+            &too_few,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'KEYS' command\r\n".to_vec()
+            ])
+        );
+
+        let too_many = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"a*", b"extra"]))
+            .expect("KEYS should parse");
+        assert_that!(
+            &too_many,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'KEYS' command\r\n".to_vec()
             ])
         );
     }

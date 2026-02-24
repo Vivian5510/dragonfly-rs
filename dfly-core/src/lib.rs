@@ -308,6 +308,43 @@ impl CoreModule {
         Some(candidates.swap_remove(index))
     }
 
+    /// Returns keys in selected logical DB that match one glob-style pattern.
+    ///
+    /// Pattern semantics follow Redis-style glob matching:
+    /// - `*` matches any byte sequence
+    /// - `?` matches one byte
+    /// - `[a-z]` and `[^a-z]` define character classes
+    /// - `\` escapes the next byte
+    ///
+    /// Returned keys are sorted lexicographically to keep test assertions deterministic.
+    #[must_use]
+    pub fn keys_matching(&self, db: DbIndex, pattern: &[u8]) -> Vec<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let mut matched = Vec::new();
+
+        for state in &self.shard_states {
+            let Some(keyspace) = state.db_kv.get(&db) else {
+                continue;
+            };
+            for (key, value) in keyspace {
+                if value
+                    .expire_at_unix_secs
+                    .is_some_and(|expire_at| expire_at <= now)
+                {
+                    continue;
+                }
+                if redis_glob_match(pattern, key) {
+                    matched.push(key.clone());
+                }
+            }
+        }
+
+        matched.sort_unstable();
+        matched
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -349,6 +386,109 @@ fn shard_pair_mut(
     let destination = left.get_mut(destination_shard)?;
     let source = right.get_mut(0)?;
     Some((source, destination))
+}
+
+fn redis_glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+
+    match pattern[0] {
+        b'*' => {
+            let mut suffix = &pattern[1..];
+            while suffix.first().is_some_and(|byte| *byte == b'*') {
+                suffix = &suffix[1..];
+            }
+            if suffix.is_empty() {
+                return true;
+            }
+            for index in 0..=text.len() {
+                if redis_glob_match(suffix, &text[index..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        b'?' => text
+            .split_first()
+            .is_some_and(|(_, rest)| redis_glob_match(&pattern[1..], rest)),
+        b'[' => {
+            let Some((class_match, consumed)) = glob_match_class(pattern, text.first().copied())
+            else {
+                return text.split_first().is_some_and(|(first, rest)| {
+                    *first == b'[' && redis_glob_match(&pattern[1..], rest)
+                });
+            };
+            class_match && redis_glob_match(&pattern[consumed..], &text[1..])
+        }
+        b'\\' => match (pattern.get(1), text.first()) {
+            (Some(escaped), Some(first)) if escaped == first => {
+                redis_glob_match(&pattern[2..], &text[1..])
+            }
+            (None, Some(first)) if *first == b'\\' => redis_glob_match(&pattern[1..], &text[1..]),
+            _ => false,
+        },
+        literal => text.split_first().is_some_and(|(first, rest)| {
+            *first == literal && redis_glob_match(&pattern[1..], rest)
+        }),
+    }
+}
+
+fn glob_match_class(pattern: &[u8], candidate: Option<u8>) -> Option<(bool, usize)> {
+    let candidate = candidate?;
+    if pattern.first().copied() != Some(b'[') {
+        return None;
+    }
+
+    let mut index = 1_usize;
+    let mut negated = false;
+    if pattern
+        .get(index)
+        .is_some_and(|byte| *byte == b'^' || *byte == b'!')
+    {
+        negated = true;
+        index += 1;
+    }
+
+    let mut matched = false;
+    while index < pattern.len() {
+        if pattern[index] == b']' {
+            let class_match = if negated { !matched } else { matched };
+            return Some((class_match, index + 1));
+        }
+
+        let (start, next_index) = parse_class_atom(pattern, index)?;
+        index = next_index;
+
+        if index + 1 < pattern.len() && pattern[index] == b'-' && pattern[index + 1] != b']' {
+            let (end, range_end_index) = parse_class_atom(pattern, index + 1)?;
+            index = range_end_index;
+
+            let (range_start, range_end) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            if (range_start..=range_end).contains(&candidate) {
+                matched = true;
+            }
+        } else if candidate == start {
+            matched = true;
+        }
+    }
+
+    None
+}
+
+fn parse_class_atom(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
+    let byte = *pattern.get(index)?;
+    if byte == b'\\' {
+        return pattern
+            .get(index + 1)
+            .copied()
+            .map(|escaped| (escaped, index + 2));
+    }
+    Some((byte, index + 1))
 }
 
 #[cfg(test)]
@@ -691,5 +831,60 @@ mod tests {
         assert_that!(selected.is_some(), eq(true));
         let selected = selected.unwrap_or_default();
         assert_that!(selected == key_one || selected == key_two, eq(true));
+    }
+
+    #[rstest]
+    fn core_keys_matching_filters_by_pattern_and_database() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"user:1".to_vec(), b"a".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"user:2".to_vec(), b"b".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"admin:1".to_vec(), b"c".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            1,
+            &CommandFrame::new("SET", vec![b"user:db1".to_vec(), b"x".to_vec()]),
+        );
+
+        let user_keys = core.keys_matching(0, b"user:*");
+        assert_that!(
+            &user_keys,
+            eq(&vec![b"user:1".to_vec(), b"user:2".to_vec()])
+        );
+
+        let two_char_keys = core.keys_matching(0, b"?????:1");
+        assert_that!(&two_char_keys, eq(&vec![b"admin:1".to_vec()]));
+    }
+
+    #[rstest]
+    fn core_keys_matching_supports_character_classes_and_escaping() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![br"k[1]".to_vec(), b"v1".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![br"kx1".to_vec(), b"v2".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![br"ky2".to_vec(), b"v3".to_vec()]),
+        );
+
+        let range = core.keys_matching(0, b"k[xy][12]");
+        assert_that!(&range, eq(&vec![b"kx1".to_vec(), b"ky2".to_vec()]));
+
+        let escaped = core.keys_matching(0, br"k\[1\]");
+        assert_that!(&escaped, eq(&vec![br"k[1]".to_vec()]));
     }
 }
