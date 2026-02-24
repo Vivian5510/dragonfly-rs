@@ -802,6 +802,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     frame.args[0].as_slice(),
                     frame.args[1].as_slice(),
                 ]),
+            // Global keyspace commands must observe a full-shard barrier.
+            "FLUSHDB" | "FLUSHALL" | "DBSIZE" | "KEYS" | "RANDOMKEY" => self.all_runtime_shards(),
             _ => Vec::new(),
         }
     }
@@ -815,6 +817,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let _ = shards.insert(self.core.resolve_shard_for_key(key));
         }
         shards.into_iter().collect()
+    }
+
+    fn all_runtime_shards(&self) -> Vec<u16> {
+        (0_u16..self.config.shard_count.get()).collect()
     }
 
     fn execute_command_without_side_effects(
@@ -4106,6 +4112,45 @@ mod tests {
                 "wrong number of arguments for 'MSET' command".to_owned()
             ))
         );
+        for shard in 0_u16..app.config.shard_count.get() {
+            let runtime = app
+                .runtime
+                .drain_processed_for_shard(shard)
+                .expect("drain should succeed");
+            assert_that!(runtime.is_empty(), eq(true));
+        }
+    }
+
+    #[rstest]
+    fn direct_flushall_dispatches_runtime_to_all_shards() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let frame = CommandFrame::new("FLUSHALL", Vec::new());
+
+        let reply = app.execute_user_command(0, &frame, None);
+        assert_that!(&reply, eq(&CommandReply::SimpleString("OK".to_owned())));
+        for shard in 0_u16..app.config.shard_count.get() {
+            assert_that!(
+                app.runtime
+                    .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+                    .expect("wait should succeed"),
+                eq(true)
+            );
+            let runtime = app
+                .runtime
+                .drain_processed_for_shard(shard)
+                .expect("drain should succeed");
+            assert_that!(runtime.len(), eq(1_usize));
+            assert_that!(&runtime[0].command, eq(&frame));
+        }
+    }
+
+    #[rstest]
+    fn direct_ping_does_not_dispatch_runtime() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let frame = CommandFrame::new("PING", Vec::new());
+
+        let reply = app.execute_user_command(0, &frame, None);
+        assert_that!(&reply, eq(&CommandReply::SimpleString("PONG".to_owned())));
         for shard in 0_u16..app.config.shard_count.get() {
             let runtime = app
                 .runtime
