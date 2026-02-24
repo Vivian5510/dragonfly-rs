@@ -10,6 +10,7 @@ use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::ClientProtocol;
 use dfly_replication::ReplicationModule;
+use dfly_replication::journal::{JournalEntry, JournalOp};
 use dfly_search::SearchModule;
 use dfly_storage::StorageModule;
 use dfly_tiering::TieringModule;
@@ -54,7 +55,7 @@ impl ServerApp {
         let core = CoreModule::new(config.shard_count);
         let transaction = TransactionModule::new();
         let storage = StorageModule::new();
-        let replication = ReplicationModule::new(false);
+        let replication = ReplicationModule::new(true);
         let cluster = ClusterModule::new(config.cluster_mode);
         let search = SearchModule::new(true);
         let tiering = TieringModule::new(true);
@@ -159,6 +160,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
 
             let reply = self.core.execute(&frame);
+            self.maybe_append_journal_for_command(None, &frame, &reply);
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
@@ -222,14 +224,17 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let replies = queued_commands
             .into_iter()
-            .map(|queued| self.core.execute(&queued))
+            .map(|queued| {
+                let reply = self.core.execute(&queued);
+                self.maybe_append_journal_for_command(Some(plan.txid), &queued, &reply);
+                reply
+            })
             .collect::<Vec<_>>();
         encode_resp_array(&replies)
     }
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
-        let txid = self.next_txid;
-        self.next_txid = self.next_txid.saturating_add(1);
+        let txid = self.allocate_txid();
 
         // This learning-path plan keeps one command per hop to make scheduling boundaries
         // explicit. Later units can merge compatible commands into fewer coordinator hops.
@@ -247,6 +252,37 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             hops,
         }
     }
+
+    fn allocate_txid(&mut self) -> TxId {
+        let txid = self.next_txid;
+        self.next_txid = self.next_txid.saturating_add(1);
+        txid
+    }
+
+    fn maybe_append_journal_for_command(
+        &mut self,
+        txid: Option<TxId>,
+        frame: &CommandFrame,
+        reply: &CommandReply,
+    ) {
+        let Some(op) = journal_op_for_command(frame, reply) else {
+            return;
+        };
+
+        let txid = txid.unwrap_or_else(|| self.allocate_txid());
+        let payload = serialize_command_frame(frame);
+        self.replication.append_journal(JournalEntry {
+            txid,
+            db: connection_db_index(),
+            op,
+            payload,
+        });
+    }
+}
+
+fn connection_db_index() -> u16 {
+    // Unit 1 keeps only DB 0 active. Future units wire `SELECT` state into journal records.
+    0
 }
 
 /// Per-client state stored by the server.
@@ -264,6 +300,46 @@ fn wrong_arity(command_name: &str) -> Vec<u8> {
         "wrong number of arguments for '{command_name}' command"
     ))
     .to_resp_bytes()
+}
+
+/// Returns journal op kind when the command mutated keyspace state.
+fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
+    match (frame.name.as_str(), reply) {
+        ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("EXPIRE", CommandReply::Integer(1)) => {
+            if expire_is_delete(frame) {
+                Some(JournalOp::Expired)
+            } else {
+                Some(JournalOp::Command)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn expire_is_delete(frame: &CommandFrame) -> bool {
+    frame
+        .args
+        .get(1)
+        .and_then(|seconds| std::str::from_utf8(seconds).ok())
+        .and_then(|seconds| seconds.parse::<i64>().ok())
+        .is_some_and(|seconds| seconds <= 0)
+}
+
+/// Serializes one command frame as RESP array payload for journal replay.
+fn serialize_command_frame(frame: &CommandFrame) -> Vec<u8> {
+    let mut output = format!("*{}\r\n", frame.args.len() + 1).into_bytes();
+    append_resp_bulk(&mut output, frame.name.as_bytes());
+    for arg in &frame.args {
+        append_resp_bulk(&mut output, arg);
+    }
+    output
+}
+
+fn append_resp_bulk(output: &mut Vec<u8>, payload: &[u8]) {
+    output.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+    output.extend_from_slice(payload);
+    output.extend_from_slice(b"\r\n");
 }
 
 /// Encodes a canonical reply according to the target client protocol.
@@ -339,6 +415,7 @@ mod tests {
     use super::ServerApp;
     use dfly_common::config::RuntimeConfig;
     use dfly_facade::protocol::ClientProtocol;
+    use dfly_replication::journal::JournalOp;
     use googletest::prelude::*;
     use rstest::rstest;
 
@@ -479,5 +556,57 @@ mod tests {
             .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
             .expect("EXEC command should parse");
         assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn journal_records_only_successful_write_commands() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+            )
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .expect("GET should succeed");
+
+        assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+        assert_that!(
+            app.replication.journal_entries()[0].op,
+            eq(JournalOp::Command),
+        );
+    }
+
+    #[rstest]
+    fn journal_uses_same_txid_for_exec_batch_entries() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+            )
+            .expect("SET should queue");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$1\r\n0\r\n",
+            )
+            .expect("EXPIRE should queue");
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+            .expect("EXEC should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(entries[0].txid, eq(entries[1].txid));
+        assert_that!(entries[1].op, eq(JournalOp::Expired));
     }
 }
