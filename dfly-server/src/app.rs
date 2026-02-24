@@ -866,7 +866,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         use std::fmt::Write as _;
 
         let mut include_replication = frame.args.is_empty();
-        let mut include_persistence = false;
+        let mut include_persistence = frame.args.is_empty();
         for raw in &frame.args {
             let Ok(section_raw) = std::str::from_utf8(raw) else {
                 return CommandReply::Error("INFO section must be valid UTF-8".to_owned());
@@ -5725,6 +5725,20 @@ mod tests {
         assert_that!(body.contains("master_replid:"), eq(true));
         assert_that!(body.contains("master_repl_offset:1\r\n"), eq(true));
         assert_that!(body.contains("last_ack_lsn:0\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_info_default_sections_include_replication_and_persistence() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO"]))
+            .expect("INFO should succeed");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("# Replication\r\n"), eq(true));
+        assert_that!(body.contains("# Persistence\r\n"), eq(true));
     }
 
     #[rstest]
