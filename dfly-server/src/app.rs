@@ -428,8 +428,83 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         match frame.name.as_str() {
-            "INFO" | "ROLE" | "PSYNC" | "WAIT" | "CLUSTER" | "DFLY" | "MGET" | "MSET"
-            | "REPLCONF" | "READONLY" | "READWRITE" | "SELECT" => Ok(()),
+            "INFO" => {
+                if frame.args.len() <= 1 {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("INFO"))
+                }
+            }
+            "ROLE" => {
+                if frame.args.is_empty() {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("ROLE"))
+                }
+            }
+            "PSYNC" => {
+                if frame.args.len() == 2 {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("PSYNC"))
+                }
+            }
+            "WAIT" => {
+                if frame.args.len() == 2 {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("WAIT"))
+                }
+            }
+            "CLUSTER" => {
+                if frame.args.is_empty() {
+                    Err(wrong_arity_message("CLUSTER"))
+                } else {
+                    Ok(())
+                }
+            }
+            "DFLY" => {
+                if frame.args.is_empty() {
+                    Err(wrong_arity_message("DFLY"))
+                } else {
+                    Ok(())
+                }
+            }
+            "MGET" => {
+                if frame.args.is_empty() {
+                    Err(wrong_arity_message("MGET"))
+                } else {
+                    Ok(())
+                }
+            }
+            "MSET" => {
+                if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+                    Err(wrong_arity_message("MSET"))
+                } else {
+                    Ok(())
+                }
+            }
+            "REPLCONF" => {
+                if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+                    Err("syntax error".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+            "READONLY" => {
+                if frame.args.is_empty() {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("READONLY"))
+                }
+            }
+            "READWRITE" => {
+                if frame.args.is_empty() {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("READWRITE"))
+                }
+            }
             _ => Err(format!("unknown command '{}'", frame.name)),
         }
     }
@@ -1325,10 +1400,11 @@ pub struct ReplicaEndpointIdentity {
 
 /// Builds standard wrong-arity RESP error for one command.
 fn wrong_arity(command_name: &str) -> Vec<u8> {
-    CommandReply::Error(format!(
-        "wrong number of arguments for '{command_name}' command"
-    ))
-    .to_resp_bytes()
+    CommandReply::Error(wrong_arity_message(command_name)).to_resp_bytes()
+}
+
+fn wrong_arity_message(command_name: &str) -> String {
+    format!("wrong number of arguments for '{command_name}' command")
 }
 
 /// Returns whether one command is `REPLCONF ACK <offset>`.
@@ -1793,6 +1869,59 @@ mod tests {
                 b"-ERR wrong number of arguments for 'GET' command\r\n".to_vec()
             ])
         );
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_server_command_arity_error_during_multi_queueing() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let queue_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1"]))
+            .expect("invalid WAIT arity should parse");
+        assert_that!(
+            &queue_error,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'WAIT' command\r\n".to_vec()
+            ])
+        );
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_replconf_syntax_error_during_multi_queueing() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let queue_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK"]))
+            .expect("invalid REPLCONF shape should parse");
+        assert_that!(&queue_error, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 
         let exec = app
             .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
