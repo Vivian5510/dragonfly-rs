@@ -678,32 +678,17 @@ impl CoreModule {
     /// Returns live key count in selected logical DB for one cluster slot.
     #[must_use]
     pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0_u64, |duration| duration.as_secs());
-        let mut total = 0_usize;
-
-        for state in &self.shard_states {
-            let Some(table) = state.db_tables.get(&db) else {
-                continue;
-            };
-            let Some(slot_keys) = table.slot_keys.get(&slot) else {
-                continue;
-            };
-            total = total.saturating_add(
-                slot_keys
-                    .iter()
-                    .filter(|key| {
-                        table.prime.get(*key).is_some_and(|value| {
-                            value
-                                .expire_at_unix_secs
-                                .is_none_or(|expire_at| expire_at > now)
-                        })
-                    })
-                    .count(),
-            );
-        }
-        total
+        self.shard_states
+            .iter()
+            .map(|state| {
+                state
+                    .db_tables
+                    .get(&db)
+                    .and_then(|table| table.slot_stats.get(&slot))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     /// Runs one active-expiration pass on each shard state.
