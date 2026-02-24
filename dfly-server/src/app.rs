@@ -9,7 +9,7 @@ use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
 use dfly_core::CoreModule;
 use dfly_core::command::{CommandFrame, CommandReply};
-use dfly_core::runtime::{InMemoryShardRuntime, RuntimeEnvelope, ShardRuntime};
+use dfly_core::runtime::{InMemoryShardRuntime, RuntimeEnvelope};
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
@@ -617,41 +617,31 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         hop: &TransactionHop,
     ) -> Vec<CommandReply> {
         let mut per_command_error = vec![None; hop.per_shard.len()];
-        let mut baseline_by_shard = HashMap::<u16, usize>::new();
-        let mut submitted_by_shard = HashMap::<u16, usize>::new();
+        let mut target_sequence_by_shard = HashMap::<u16, u64>::new();
 
         for (index, (shard, command)) in hop.per_shard.iter().enumerate() {
-            if !baseline_by_shard.contains_key(shard) {
-                match self.runtime.processed_count(*shard) {
-                    Ok(count) => {
-                        baseline_by_shard.insert(*shard, count);
-                    }
-                    Err(error) => {
-                        per_command_error[index] =
-                            Some(format!("runtime dispatch failed: {error}"));
-                        continue;
-                    }
+            match self.submit_runtime_envelope_with_sequence(*shard, command) {
+                Ok(sequence) => {
+                    target_sequence_by_shard
+                        .entry(*shard)
+                        .and_modify(|current| {
+                            *current = (*current).max(sequence);
+                        })
+                        .or_insert(sequence);
+                }
+                Err(error) => {
+                    per_command_error[index] = Some(format!("runtime dispatch failed: {error}"));
                 }
             }
-
-            if let Err(error) = self.submit_runtime_envelope(*shard, command) {
-                per_command_error[index] = Some(format!("runtime dispatch failed: {error}"));
-                continue;
-            }
-            let submitted = submitted_by_shard.entry(*shard).or_insert(0);
-            *submitted = submitted.saturating_add(1);
         }
 
         let mut shard_wait_error = HashMap::<u16, String>::new();
-        for (shard, submitted_count) in submitted_by_shard {
-            let Some(baseline_count) = baseline_by_shard.get(&shard) else {
-                continue;
-            };
-            let target = baseline_count.saturating_add(submitted_count);
-            match self
-                .runtime
-                .wait_for_processed_count(shard, target, Duration::from_millis(200))
-            {
+        for (shard, target_sequence) in target_sequence_by_shard {
+            match self.runtime.wait_for_processed_sequence(
+                shard,
+                target_sequence,
+                Duration::from_millis(200),
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     shard_wait_error.insert(shard, "runtime dispatch timed out".to_owned());
@@ -677,10 +667,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         replies
     }
 
-    fn submit_runtime_envelope(&self, shard: u16, command: &CommandFrame) -> DflyResult<()> {
+    fn submit_runtime_envelope_with_sequence(
+        &self,
+        shard: u16,
+        command: &CommandFrame,
+    ) -> DflyResult<u64> {
         // Dragonfly routes each hop command to its owner shard queue before execution.
         // This learning path keeps execution local for now, while still modeling queue ingress.
-        self.runtime.submit(RuntimeEnvelope {
+        self.runtime.submit_with_sequence(RuntimeEnvelope {
             target_shard: shard,
             command: command.clone(),
         })

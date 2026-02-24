@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -46,6 +47,8 @@ pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
     senders: Vec<mpsc::Sender<RuntimeEnvelope>>,
     executed_per_shard: Arc<Vec<Mutex<Vec<RuntimeEnvelope>>>>,
+    submitted_sequence_per_shard: Vec<AtomicU64>,
+    processed_sequence_per_shard: Arc<Vec<AtomicU64>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -59,6 +62,14 @@ impl InMemoryShardRuntime {
                 .map(|_| Mutex::new(Vec::new()))
                 .collect::<Vec<_>>(),
         );
+        let submitted_sequence_per_shard = (0..shard_len)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>();
+        let processed_sequence_per_shard = Arc::new(
+            (0..shard_len)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>(),
+        );
 
         let mut senders = Vec::with_capacity(shard_len);
         let mut workers = Vec::with_capacity(shard_len);
@@ -67,7 +78,9 @@ impl InMemoryShardRuntime {
             senders.push(sender);
 
             let executed = Arc::clone(&executed_per_shard);
-            let handle = thread::spawn(move || shard_worker_loop(shard, receiver, &executed));
+            let processed = Arc::clone(&processed_sequence_per_shard);
+            let handle =
+                thread::spawn(move || shard_worker_loop(shard, receiver, &executed, &processed));
             workers.push(handle);
         }
 
@@ -75,6 +88,8 @@ impl InMemoryShardRuntime {
             shard_count,
             senders,
             executed_per_shard,
+            submitted_sequence_per_shard,
+            processed_sequence_per_shard,
             workers,
         }
     }
@@ -145,6 +160,61 @@ impl InMemoryShardRuntime {
             thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// Submits one envelope and returns per-shard submission sequence.
+    ///
+    /// The returned sequence can be used with `wait_for_processed_sequence`
+    /// to build precise hop barriers that are independent from unrelated traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when target shard is out of range
+    /// or when the target queue is closed.
+    pub fn submit_with_sequence(&self, envelope: RuntimeEnvelope) -> DflyResult<u64> {
+        let shard = usize::from(envelope.target_shard);
+        let Some(sender) = self.senders.get(shard) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        let Some(sequence_counter) = self.submitted_sequence_per_shard.get(shard) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let sequence = sequence_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        sender
+            .send(envelope)
+            .map_err(|_| DflyError::InvalidState("shard queue is closed"))?;
+        Ok(sequence)
+    }
+
+    /// Waits until one shard has processed one specific submission sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn wait_for_processed_sequence(
+        &self,
+        shard: ShardId,
+        sequence: u64,
+        timeout: Duration,
+    ) -> DflyResult<bool> {
+        let Some(processed_counter) = self.processed_sequence_per_shard.get(usize::from(shard))
+        else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if processed_counter.load(Ordering::Acquire) >= sequence {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl ShardRuntime for InMemoryShardRuntime {
@@ -153,14 +223,8 @@ impl ShardRuntime for InMemoryShardRuntime {
     }
 
     fn submit(&self, envelope: RuntimeEnvelope) -> DflyResult<()> {
-        let shard = usize::from(envelope.target_shard);
-        let Some(sender) = self.senders.get(shard) else {
-            return Err(DflyError::InvalidState("target shard is out of range"));
-        };
-
-        sender
-            .send(envelope)
-            .map_err(|_| DflyError::InvalidState("shard queue is closed"))
+        let _ = self.submit_with_sequence(envelope)?;
+        Ok(())
     }
 }
 
@@ -180,6 +244,7 @@ fn shard_worker_loop(
     shard: usize,
     receiver: mpsc::Receiver<RuntimeEnvelope>,
     executed_per_shard: &[Mutex<Vec<RuntimeEnvelope>>],
+    processed_sequence_per_shard: &[AtomicU64],
 ) {
     for envelope in receiver {
         // Keep one explicit shard check so the queue ownership contract is visible
@@ -191,6 +256,9 @@ fn shard_worker_loop(
             && let Ok(mut guard) = bucket.lock()
         {
             guard.push(envelope);
+        }
+        if let Some(processed_counter) = processed_sequence_per_shard.get(shard) {
+            let _ = processed_counter.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -299,6 +367,39 @@ mod tests {
         assert_that!(
             runtime.processed_count(0).expect("count should succeed"),
             eq(2)
+        );
+    }
+
+    #[rstest]
+    fn runtime_waits_for_specific_submission_sequence() {
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
+
+        let first = RuntimeEnvelope {
+            target_shard: 0,
+            command: CommandFrame::new("GET", vec![b"a".to_vec()]),
+        };
+        let second = RuntimeEnvelope {
+            target_shard: 0,
+            command: CommandFrame::new("GET", vec![b"b".to_vec()]),
+        };
+
+        let first_sequence = runtime
+            .submit_with_sequence(first)
+            .expect("submission should succeed");
+        let second_sequence = runtime
+            .submit_with_sequence(second)
+            .expect("submission should succeed");
+        assert_that!(first_sequence < second_sequence, eq(true));
+
+        assert_that!(
+            runtime
+                .wait_for_processed_sequence(0, second_sequence, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            runtime.processed_count(0).expect("count should succeed") >= 2,
+            eq(true)
         );
     }
 }
