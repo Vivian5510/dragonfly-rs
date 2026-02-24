@@ -1099,6 +1099,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let option = pair[0].as_slice();
             let value = pair[1].as_slice();
             if option.eq_ignore_ascii_case(b"ACK") {
+                if frame.args.len() != 2 {
+                    return CommandReply::Error("syntax error".to_owned());
+                }
                 if let Err(error_reply) = self.handle_replconf_ack(connection, value) {
                     return error_reply;
                 }
@@ -5767,6 +5770,26 @@ mod tests {
             .expect("REPLCONF ACK should parse");
         assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
         assert_that!(app.replication.last_acked_lsn(), eq(0_u64));
+    }
+
+    #[rstest]
+    fn resp_replconf_ack_requires_standalone_pair() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"ACK", b"1", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("invalid REPLCONF ACK shape should parse");
+        assert_that!(&reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
+
+        let info = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:0\r\n"), eq(true));
     }
 
     #[rstest]
