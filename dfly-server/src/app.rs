@@ -122,7 +122,41 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Returns `DflyError::Protocol` when a journal payload is not a valid single RESP command
     /// or when command execution returns an error reply.
     pub fn recover_from_replication_journal(&mut self) -> DflyResult<usize> {
-        let entries = self.replication.journal_entries().to_vec();
+        let entries = self.replication.journal_entries();
+        self.replay_journal_entries(&entries)
+    }
+
+    /// Replays journal entries from one specific starting LSN (inclusive).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when starting LSN is stale (already evicted from backlog),
+    /// when payload parsing fails, or when replayed command execution fails.
+    pub fn recover_from_replication_journal_from_lsn(
+        &mut self,
+        start_lsn: u64,
+    ) -> DflyResult<usize> {
+        let current_lsn = self.replication.journal_lsn();
+        if start_lsn == current_lsn {
+            return Ok(0);
+        }
+        if !self.replication.journal_contains_lsn(start_lsn) {
+            return Err(DflyError::Protocol(format!(
+                "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
+            )));
+        }
+
+        let mut entries = Vec::new();
+        let mut lsn = start_lsn;
+        while lsn < current_lsn {
+            let Some(entry) = self.replication.journal_entry_at_lsn(lsn) else {
+                return Err(DflyError::Protocol(format!(
+                    "journal LSN {lsn} disappeared from backlog during replay"
+                )));
+            };
+            entries.push(entry);
+            lsn = lsn.saturating_add(1);
+        }
         self.replay_journal_entries(&entries)
     }
 
@@ -766,6 +800,7 @@ pub fn run() -> DflyResult<()> {
     let snapshot = app.create_snapshot_bytes()?;
     app.load_snapshot_bytes(&snapshot)?;
     let _ = app.recover_from_replication_journal()?;
+    let _ = app.recover_from_replication_journal_from_lsn(app.replication.journal_lsn())?;
 
     println!("{}", app.startup_summary());
     Ok(())
@@ -778,7 +813,7 @@ mod tests {
     use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
     use dfly_facade::protocol::ClientProtocol;
-    use dfly_replication::journal::{JournalEntry, JournalOp};
+    use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
     use googletest::prelude::*;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -1455,7 +1490,7 @@ mod tests {
             )
             .expect("SET should succeed");
 
-        let entries = source.replication.journal_entries().to_vec();
+        let entries = source.replication.journal_entries();
 
         let mut restored = ServerApp::new(RuntimeConfig::default());
         for entry in entries {
@@ -1479,6 +1514,69 @@ mod tests {
             .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
             .expect("GET in db1 should succeed");
         assert_that!(&db1, eq(&vec![b"$3\r\nbaz\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn journal_replay_from_lsn_applies_only_suffix() {
+        let mut source = ServerApp::new(RuntimeConfig::default());
+        let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
+            )
+            .expect("first SET should succeed");
+        let start_lsn = source.replication.journal_lsn();
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n",
+            )
+            .expect("second SET should succeed");
+
+        let entries = source.replication.journal_entries();
+        let mut restored = ServerApp::new(RuntimeConfig::default());
+        for entry in entries {
+            restored.replication.append_journal(entry);
+        }
+
+        let applied = restored
+            .recover_from_replication_journal_from_lsn(start_lsn)
+            .expect("journal suffix replay should succeed");
+        assert_that!(applied, eq(1_usize));
+
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let get_reply = restored
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .expect("GET should succeed");
+        assert_that!(&get_reply, eq(&vec![b"$3\r\nnew\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn journal_replay_from_lsn_rejects_stale_cursor() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        app.replication.journal = InMemoryJournal::with_backlog(1);
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", b"a", b"1"]),
+        });
+        app.replication.append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", b"a", b"2"]),
+        });
+
+        let error = app
+            .recover_from_replication_journal_from_lsn(1)
+            .expect_err("stale backlog cursor must fail");
+        let DflyError::Protocol(message) = error else {
+            panic!("expected protocol error");
+        };
+        assert_that!(message.contains("not available"), eq(true));
     }
 
     #[rstest]
