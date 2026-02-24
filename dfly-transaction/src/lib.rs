@@ -2,6 +2,7 @@
 
 pub mod plan;
 pub mod scheduler;
+pub mod session;
 
 use scheduler::NoopTransactionScheduler;
 

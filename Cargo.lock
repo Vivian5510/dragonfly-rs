@@ -113,6 +113,8 @@ version = "0.1.0"
 dependencies = [
  "dfly-common",
  "dfly-core",
+ "googletest",
+ "rstest",
 ]
 
 [[package]]

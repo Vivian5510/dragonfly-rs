@@ -41,7 +41,7 @@ impl CoreModule {
     /// Executes one command frame on its selected target shard.
     #[must_use]
     pub fn execute(&mut self, frame: &CommandFrame) -> CommandReply {
-        let target_shard = self.target_shard_for_command(frame);
+        let target_shard = self.resolve_target_shard(frame);
         let target_index = usize::from(target_shard);
         let Some(target_state) = self.shard_states.get_mut(target_index) else {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
@@ -61,7 +61,7 @@ impl CoreModule {
     /// - key-based commands route by first key argument
     /// - keyless commands run on shard 0
     #[must_use]
-    fn target_shard_for_command(&self, frame: &CommandFrame) -> u16 {
+    pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
         match frame.name.as_str() {
             "GET" | "SET" => frame
                 .args
