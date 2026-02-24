@@ -6,5 +6,9 @@ edition.workspace = true
 [dependencies]
 dfly-common = { path = "../dfly-common" }
 
+[dev-dependencies]
+googletest = { workspace = true }
+rstest = { workspace = true }
+
 [lints]
 workspace = true

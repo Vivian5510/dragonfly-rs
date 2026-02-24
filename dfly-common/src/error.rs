@@ -19,6 +19,10 @@ pub enum DflyError {
     #[error("invalid runtime state: {0}")]
     InvalidState(&'static str),
 
+    /// Client protocol payload is malformed or semantically invalid.
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
     /// Placeholder for not-yet-implemented feature paths.
     #[error("feature is not implemented yet: {0}")]
     NotImplemented(&'static str),
