@@ -79,6 +79,7 @@ pub struct InMemoryShardRuntime {
 }
 
 type RuntimeExecutor = dyn Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync;
+const SHARD_WORKER_YIELD_INTERVAL: usize = 64;
 
 impl std::fmt::Debug for InMemoryShardRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -315,7 +316,7 @@ impl Drop for InMemoryShardRuntime {
 
 fn shard_worker_thread_main(
     shard: usize,
-    mut receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
+    receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
     executor: Arc<RuntimeExecutor>,
 ) {
@@ -326,16 +327,41 @@ fn shard_worker_thread_main(
     };
     let local_set = LocalSet::new();
     runtime.block_on(local_set.run_until(async move {
-        shard_worker_loop_async(shard, &mut receiver, &execution_per_shard, &executor).await;
+        // Dragonfly uses multiple fibers per shard thread (queueing + execution).
+        // We mirror that shape with one ingress fiber and one execution fiber.
+        let (execution_sender, execution_receiver) = mpsc::unbounded_channel::<QueuedEnvelope>();
+
+        let ingress_fiber =
+            tokio::task::spawn_local(shard_ingress_fiber(receiver, execution_sender));
+        let execution_fiber = tokio::task::spawn_local(shard_execution_fiber(
+            shard,
+            execution_receiver,
+            execution_per_shard,
+            executor,
+        ));
+        let _ = ingress_fiber.await;
+        let _ = execution_fiber.await;
     }));
 }
 
-async fn shard_worker_loop_async(
-    shard: usize,
-    receiver: &mut mpsc::UnboundedReceiver<QueuedEnvelope>,
-    execution_per_shard: &[ShardExecutionState],
-    executor: &Arc<RuntimeExecutor>,
+async fn shard_ingress_fiber(
+    mut receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
+    execution_sender: mpsc::UnboundedSender<QueuedEnvelope>,
 ) {
+    while let Some(queued) = receiver.recv().await {
+        if execution_sender.send(queued).is_err() {
+            break;
+        }
+    }
+}
+
+async fn shard_execution_fiber(
+    shard: usize,
+    mut receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
+    execution_per_shard: Arc<Vec<ShardExecutionState>>,
+    executor: Arc<RuntimeExecutor>,
+) {
+    let mut processed_since_yield = 0_usize;
     while let Some(queued) = receiver.recv().await {
         let envelope = queued.envelope;
         // Keep one explicit shard check so the queue ownership contract is visible
@@ -348,14 +374,7 @@ async fn shard_worker_loop_async(
         // on shard-owned threads. Spawning a local task here keeps that boundary:
         // queue consumer coroutine -> command coroutine within same shard thread.
         let reply = if envelope.execute_on_worker {
-            let envelope_for_fiber = envelope.clone();
-            let executor_for_fiber = Arc::clone(executor);
-            match tokio::task::spawn_local(async move { executor_for_fiber(&envelope_for_fiber) })
-                .await
-            {
-                Ok(reply) => reply,
-                Err(_join_error) => CommandReply::Error("runtime worker fiber failed".to_owned()),
-            }
+            execute_envelope_in_worker_fiber(&executor, &envelope).await
         } else {
             CommandReply::SimpleString("QUEUED".to_owned())
         };
@@ -367,12 +386,32 @@ async fn shard_worker_loop_async(
             let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
             state.changed.notify_all();
         }
+
+        processed_since_yield = processed_since_yield.saturating_add(1);
+        // Cooperative yielding matches Dragonfly's explicit ThisFiber::Yield points
+        // that prevent one hot queue from starving other shard-local fibers.
+        if processed_since_yield >= SHARD_WORKER_YIELD_INTERVAL {
+            processed_since_yield = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+async fn execute_envelope_in_worker_fiber(
+    executor: &Arc<RuntimeExecutor>,
+    envelope: &RuntimeEnvelope,
+) -> CommandReply {
+    let envelope_for_fiber = envelope.clone();
+    let executor_for_fiber = Arc::clone(executor);
+    match tokio::task::spawn_local(async move { executor_for_fiber(&envelope_for_fiber) }).await {
+        Ok(reply) => reply,
+        Err(_join_error) => CommandReply::Error("runtime worker fiber failed".to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryShardRuntime, RuntimeEnvelope, ShardRuntime};
+    use super::{InMemoryShardRuntime, RuntimeEnvelope, SHARD_WORKER_YIELD_INTERVAL, ShardRuntime};
     use crate::command::{CommandFrame, CommandReply};
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
@@ -631,6 +670,32 @@ mod tests {
             eq(&Some(CommandReply::Error(
                 "runtime worker fiber failed".to_owned()
             )))
+        );
+    }
+
+    #[rstest]
+    fn runtime_execution_fiber_yields_without_losing_sequence_order() {
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(1).expect("count should be valid"));
+        let batch = SHARD_WORKER_YIELD_INTERVAL.saturating_add(8);
+        for index in 0..batch {
+            let submitted = runtime.submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: false,
+                command: CommandFrame::new("GET", vec![format!("k{index}").into_bytes()]),
+            });
+            assert_that!(submitted.is_ok(), eq(true));
+        }
+
+        assert_that!(
+            runtime
+                .wait_for_processed_count(0, batch, Duration::from_millis(500))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            runtime.processed_count(0).expect("count should succeed"),
+            eq(batch)
         );
     }
 }
