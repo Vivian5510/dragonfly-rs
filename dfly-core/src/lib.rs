@@ -78,6 +78,15 @@ impl CoreModule {
         self.command_registry.dispatch(db, frame, target_state)
     }
 
+    /// Validates a command against core command-table arity/existence rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns user-facing error text when command does not exist or argument count is invalid.
+    pub fn validate_command(&self, frame: &CommandFrame) -> Result<(), String> {
+        self.command_registry.validate_frame(frame)
+    }
+
     /// Exports current in-memory state as a snapshot payload.
     #[must_use]
     pub fn export_snapshot(&self) -> CoreSnapshot {

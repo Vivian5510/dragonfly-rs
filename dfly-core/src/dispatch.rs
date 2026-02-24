@@ -176,6 +176,30 @@ impl CommandRegistry {
         self.entries.insert(spec.name.to_owned(), spec);
     }
 
+    /// Validates command existence and arity without executing handler logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns user-facing error text for unknown command names or invalid argument count.
+    pub fn validate_frame(&self, frame: &CommandFrame) -> Result<(), String> {
+        let command_name = frame.name.to_ascii_uppercase();
+        let Some(spec) = self.entries.get(&command_name) else {
+            return Err(format!("unknown command '{command_name}'"));
+        };
+
+        match spec.arity {
+            CommandArity::Exact(expected) if frame.args.len() != expected => Err(format!(
+                "wrong number of arguments for '{}' command",
+                spec.name
+            )),
+            CommandArity::AtLeast(minimum) if frame.args.len() < minimum => Err(format!(
+                "wrong number of arguments for '{}' command",
+                spec.name
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Dispatches one canonical command frame to its registered handler.
     #[must_use]
     pub fn dispatch(
@@ -184,27 +208,14 @@ impl CommandRegistry {
         frame: &CommandFrame,
         state: &mut DispatchState,
     ) -> CommandReply {
+        if let Err(message) = self.validate_frame(frame) {
+            return CommandReply::Error(message);
+        }
+
         let command_name = frame.name.to_ascii_uppercase();
         let Some(spec) = self.entries.get(&command_name) else {
             return CommandReply::Error(format!("unknown command '{command_name}'"));
         };
-
-        match spec.arity {
-            CommandArity::Exact(expected) if frame.args.len() != expected => {
-                return CommandReply::Error(format!(
-                    "wrong number of arguments for '{}' command",
-                    spec.name
-                ));
-            }
-            CommandArity::AtLeast(minimum) if frame.args.len() < minimum => {
-                return CommandReply::Error(format!(
-                    "wrong number of arguments for '{}' command",
-                    spec.name
-                ));
-            }
-            _ => {}
-        }
-
         (spec.handler)(db, frame, state)
     }
 }

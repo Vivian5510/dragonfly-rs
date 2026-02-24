@@ -221,15 +221,26 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 }
 
                 if connection.transaction.in_multi() {
-                    let queued = connection.transaction.queue_command(frame);
-                    if queued {
-                        responses
-                            .push(CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes());
-                    } else {
-                        responses.push(
-                            CommandReply::Error("transaction queue is unavailable".to_owned())
-                                .to_resp_bytes(),
-                        );
+                    match self.validate_queued_command(&frame) {
+                        Ok(()) => {
+                            let queued = connection.transaction.queue_command(frame);
+                            if queued {
+                                responses.push(
+                                    CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes(),
+                                );
+                            } else {
+                                responses.push(
+                                    CommandReply::Error(
+                                        "transaction queue is unavailable".to_owned(),
+                                    )
+                                    .to_resp_bytes(),
+                                );
+                            }
+                        }
+                        Err(message) => {
+                            connection.transaction.mark_queued_error();
+                            responses.push(CommandReply::Error(message).to_resp_bytes());
+                        }
                     }
                     continue;
                 }
@@ -335,6 +346,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if !connection.transaction.in_multi() {
             return CommandReply::Error("EXEC without MULTI".to_owned()).to_resp_bytes();
         }
+        if connection.transaction.has_queued_error() {
+            let _ = connection.transaction.discard();
+            return CommandReply::Error(
+                "EXECABORT Transaction discarded because of previous errors".to_owned(),
+            )
+            .to_resp_bytes();
+        }
         if connection
             .transaction
             .watching_other_dbs(connection.parser.context.db_index)
@@ -400,6 +418,20 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         connection.transaction.unwatch();
         CommandReply::SimpleString("OK".to_owned()).to_resp_bytes()
+    }
+
+    fn validate_queued_command(&self, frame: &CommandFrame) -> Result<(), String> {
+        match self.core.validate_command(frame) {
+            Ok(()) => return Ok(()),
+            Err(message) if !message.starts_with("unknown command ") => return Err(message),
+            Err(_) => {}
+        }
+
+        match frame.name.as_str() {
+            "INFO" | "ROLE" | "PSYNC" | "WAIT" | "CLUSTER" | "DFLY" | "MGET" | "MSET"
+            | "REPLCONF" | "READONLY" | "READWRITE" | "SELECT" => Ok(()),
+            _ => Err(format!("unknown command '{}'", frame.name)),
+        }
     }
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
@@ -1715,6 +1747,62 @@ mod tests {
             .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
             .expect("EXEC should parse");
         assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_unknown_command_during_multi_queueing() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let queue_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"NOPE"]))
+            .expect("unknown command should parse");
+        assert_that!(
+            &queue_error,
+            eq(&vec![b"-ERR unknown command 'NOPE'\r\n".to_vec()])
+        );
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_core_arity_error_during_multi_queueing() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let queue_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET"]))
+            .expect("invalid GET arity should parse");
+        assert_that!(
+            &queue_error,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'GET' command\r\n".to_vec()
+            ])
+        );
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]

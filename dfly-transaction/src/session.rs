@@ -21,6 +21,7 @@ pub struct WatchedKey {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransactionSession {
     in_multi: bool,
+    has_queued_error: bool,
     queued_commands: Vec<CommandFrame>,
     watched_keys: Vec<WatchedKey>,
 }
@@ -35,6 +36,7 @@ impl TransactionSession {
             return false;
         }
         self.in_multi = true;
+        self.has_queued_error = false;
         self.queued_commands.clear();
         true
     }
@@ -60,6 +62,7 @@ impl TransactionSession {
             return false;
         }
         self.in_multi = false;
+        self.has_queued_error = false;
         self.queued_commands.clear();
         self.watched_keys.clear();
         true
@@ -73,6 +76,7 @@ impl TransactionSession {
             return None;
         }
         self.in_multi = false;
+        self.has_queued_error = false;
         self.watched_keys.clear();
         Some(std::mem::take(&mut self.queued_commands))
     }
@@ -81,6 +85,19 @@ impl TransactionSession {
     #[must_use]
     pub fn in_multi(&self) -> bool {
         self.in_multi
+    }
+
+    /// Marks the current multi-queue as containing one pre-execution command error.
+    pub fn mark_queued_error(&mut self) {
+        if self.in_multi {
+            self.has_queued_error = true;
+        }
+    }
+
+    /// Returns whether queue collection phase has already observed one command error.
+    #[must_use]
+    pub fn has_queued_error(&self) -> bool {
+        self.has_queued_error
     }
 
     /// Adds or refreshes a watched key when outside of `MULTI`.
@@ -195,5 +212,23 @@ mod tests {
 
         assert_that!(session.watch_key(2, b"other-db".to_vec(), 1), eq(true));
         assert_that!(session.watching_other_dbs(0), eq(true));
+    }
+
+    #[rstest]
+    fn queued_error_flag_lifecycle_follows_multi_scope() {
+        let mut session = TransactionSession::default();
+        assert_that!(session.has_queued_error(), eq(false));
+
+        let _ = session.begin_multi();
+        session.mark_queued_error();
+        assert_that!(session.has_queued_error(), eq(true));
+
+        let _ = session.discard();
+        assert_that!(session.has_queued_error(), eq(false));
+
+        let _ = session.begin_multi();
+        session.mark_queued_error();
+        let _ = session.take_queued_for_exec();
+        assert_that!(session.has_queued_error(), eq(false));
     }
 }
