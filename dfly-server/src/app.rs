@@ -551,7 +551,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "APPEND"
-            | "STRLEN" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+            | "STRLEN" | "MOVE" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
             | "PEXPIREAT" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR"
             | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
@@ -1564,7 +1564,7 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         ("SETEX" | "PSETEX", CommandReply::SimpleString(ok)) if ok == "OK" => {
             Some(JournalOp::Command)
         }
-        ("SETNX" | "MSETNX", CommandReply::Integer(1))
+        ("SETNX" | "MSETNX" | "MOVE", CommandReply::Integer(1))
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
         | ("GETDEL", CommandReply::BulkString(_))
         | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
@@ -2028,6 +2028,65 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
             .expect("EXISTS should execute");
         assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_move_transfers_key_between_databases() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"move:key", b"v"]))
+            .expect("SET should execute");
+        let moved = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"MOVE", b"move:key", b"1"]),
+            )
+            .expect("MOVE should execute");
+        assert_that!(&moved, eq(&vec![b":1\r\n".to_vec()]));
+
+        let source = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"move:key"]))
+            .expect("GET source should execute");
+        assert_that!(&source, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should execute");
+        let target = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"move:key"]))
+            .expect("GET target should execute");
+        assert_that!(&target, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_move_returns_zero_when_target_contains_key() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dup", b"db0"]))
+            .expect("SET db0 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dup", b"db1"]))
+            .expect("SET db1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should execute");
+
+        let moved = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"dup", b"1"]))
+            .expect("MOVE should execute");
+        assert_that!(&moved, eq(&vec![b":0\r\n".to_vec()]));
+
+        let source = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dup"]))
+            .expect("GET source should execute");
+        assert_that!(&source, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -3218,6 +3277,29 @@ mod tests {
         assert_that!(entries.len(), eq(2_usize));
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_move_only_when_transfer_happens() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"missing", b"1"]))
+            .expect("MOVE missing should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"k", b"1"]))
+            .expect("MOVE existing should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("MOVE"),
             eq(true)
         );
     }

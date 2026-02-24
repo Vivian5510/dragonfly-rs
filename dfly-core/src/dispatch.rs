@@ -274,6 +274,11 @@ impl CommandRegistry {
             arity: CommandArity::AtLeast(1),
             handler: handle_exists,
         });
+        self.register(CommandSpec {
+            name: "MOVE",
+            arity: CommandArity::Exact(2),
+            handler: handle_move,
+        });
     }
 
     fn register_expiry_commands(&mut self) {
@@ -632,6 +637,37 @@ fn handle_exists(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     }
 
     CommandReply::Integer(existing)
+}
+
+fn handle_move(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    state.purge_expired_key(db, &key);
+
+    let Ok(target_db_i64) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let Ok(target_db) = u16::try_from(target_db_i64) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+
+    state.purge_expired_key(target_db, &key);
+    if !state.db_map(db).is_some_and(|map| map.contains_key(&key)) {
+        return CommandReply::Integer(0);
+    }
+    if state
+        .db_map(target_db)
+        .is_some_and(|map| map.contains_key(&key))
+    {
+        return CommandReply::Integer(0);
+    }
+
+    let Some(entry) = state.db_map_mut(db).remove(&key) else {
+        return CommandReply::Integer(0);
+    };
+    state.db_map_mut(target_db).insert(key.clone(), entry);
+    state.bump_key_version(db, &key);
+    state.bump_key_version(target_db, &key);
+    CommandReply::Integer(1)
 }
 
 fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -1380,6 +1416,81 @@ mod tests {
             &mut state,
         );
         assert_that!(&exists_after_delete, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_move_transfers_key_between_databases() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"move:key".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+
+        let moved = registry.dispatch(
+            0,
+            &CommandFrame::new("MOVE", vec![b"move:key".to_vec(), b"1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&moved, eq(&CommandReply::Integer(1)));
+
+        let source = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"move:key".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&source, eq(&CommandReply::Null));
+        let target = registry.dispatch(
+            1,
+            &CommandFrame::new("GET", vec![b"move:key".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&target, eq(&CommandReply::BulkString(b"value".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_move_returns_zero_when_source_missing_or_target_exists() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let missing = registry.dispatch(
+            0,
+            &CommandFrame::new("MOVE", vec![b"missing".to_vec(), b"1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&missing, eq(&CommandReply::Integer(0)));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"dup".to_vec(), b"db0".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            1,
+            &CommandFrame::new("SET", vec![b"dup".to_vec(), b"db1".to_vec()]),
+            &mut state,
+        );
+        let blocked = registry.dispatch(
+            0,
+            &CommandFrame::new("MOVE", vec![b"dup".to_vec(), b"1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&blocked, eq(&CommandReply::Integer(0)));
+
+        let source = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"dup".to_vec()]),
+            &mut state,
+        );
+        let target = registry.dispatch(
+            1,
+            &CommandFrame::new("GET", vec![b"dup".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&source, eq(&CommandReply::BulkString(b"db0".to_vec())));
+        assert_that!(&target, eq(&CommandReply::BulkString(b"db1".to_vec())));
     }
 
     #[rstest]
