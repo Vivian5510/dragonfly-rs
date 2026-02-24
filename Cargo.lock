@@ -55,6 +55,8 @@ name = "dfly-facade"
 version = "0.1.0"
 dependencies = [
  "dfly-common",
+ "googletest",
+ "rstest",
 ]
 
 [[package]]
@@ -85,6 +87,8 @@ dependencies = [
  "dfly-storage",
  "dfly-tiering",
  "dfly-transaction",
+ "googletest",
+ "rstest",
 ]
 
 [[package]]

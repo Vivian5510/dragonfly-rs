@@ -14,5 +14,9 @@ dfly-storage = { path = "../dfly-storage" }
 dfly-tiering = { path = "../dfly-tiering" }
 dfly-transaction = { path = "../dfly-transaction" }
 
+[dev-dependencies]
+googletest = { workspace = true }
+rstest = { workspace = true }
+
 [lints]
 workspace = true
