@@ -575,11 +575,20 @@ impl CoreModule {
         }
 
         for entry in &snapshot.entries {
-            let Some(state) = self.shard_states.get(usize::from(entry.shard)) else {
+            if self.shard_states.get(usize::from(entry.shard)).is_none() {
                 return Err(DflyError::Protocol(format!(
                     "snapshot entry targets unknown shard {}",
                     entry.shard
                 )));
+            }
+
+            // Keep loader deterministic with active routing policy: even if snapshot metadata
+            // advertises a different shard id, actual placement follows hash-slot ownership.
+            let owner_shard = self.resolve_shard_for_key(&entry.key);
+            let Some(state) = self.shard_states.get(usize::from(owner_shard)) else {
+                return Err(DflyError::InvalidState(
+                    "snapshot key resolved to unknown owner shard",
+                ));
             };
             let mut state = state
                 .lock()
@@ -989,6 +998,7 @@ mod tests {
     };
     use crate::command::{CommandFrame, CommandReply};
     use dfly_cluster::slot::key_slot;
+    use dfly_common::error::DflyError;
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -1084,6 +1094,15 @@ mod tests {
 
         let del_multi = CommandFrame::new("DEL", vec![b"k1".to_vec(), b"k2".to_vec()]);
         assert_that!(classify_single_key_access(&del_multi), eq(None));
+
+        let getrange = CommandFrame::new(
+            "GETRANGE",
+            vec![b"k".to_vec(), b"0".to_vec(), b"1".to_vec()],
+        );
+        assert_that!(
+            classify_single_key_access(&getrange),
+            eq(Some(SingleKeyAccess::Read))
+        );
 
         let rename = CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]);
         assert_that!(classify_single_key_access(&rename), eq(None));
@@ -1454,6 +1473,59 @@ mod tests {
             .expect("snapshot import should succeed");
 
         assert_that!(restored.key_version(0, &key), eq(1_u64));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_rehomes_entries_to_key_owner_shard() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let key = b"snapshot:{42}:key".to_vec();
+        let owner_shard = core.resolve_shard_for_key(&key);
+        let wrong_shard = (owner_shard + 1) % 8;
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![SnapshotEntry {
+                shard: wrong_shard,
+                db: 0,
+                key: key.clone(),
+                value: b"value".to_vec(),
+                expire_at_unix_secs: None,
+            }],
+        })
+        .expect("snapshot import should succeed");
+
+        let value = core.execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
+        assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
+
+        let owner_state = core.shard_states[usize::from(owner_shard)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wrong_state = core.shard_states[usize::from(wrong_shard)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_that!(owner_state.db_len(0), eq(1_usize));
+        assert_that!(wrong_state.db_len(0), eq(0_usize));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_rejects_out_of_range_shard_metadata() {
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let snapshot = CoreSnapshot {
+            entries: vec![SnapshotEntry {
+                shard: u16::MAX,
+                db: 0,
+                key: b"snapshot:invalid:shard".to_vec(),
+                value: b"value".to_vec(),
+                expire_at_unix_secs: None,
+            }],
+        };
+
+        let error = core
+            .import_snapshot(&snapshot)
+            .expect_err("out-of-range shard metadata must fail");
+        let DflyError::Protocol(message) = error else {
+            panic!("expected protocol error");
+        };
+        assert_that!(message.contains("unknown shard"), eq(true));
     }
 
     #[rstest]
