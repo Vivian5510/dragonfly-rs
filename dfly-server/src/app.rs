@@ -934,6 +934,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         match subcommand.to_ascii_uppercase().as_str() {
             "INFO" => self.execute_cluster_info(frame),
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
+            "MYID" => self.execute_cluster_myid(frame),
             "NODES" => self.execute_cluster_nodes(frame),
             "SLOTS" => self.execute_cluster_slots(frame),
             _ => CommandReply::Error(format!("unknown CLUSTER subcommand '{subcommand}'")),
@@ -973,6 +974,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             })
             .collect::<Vec<_>>();
         CommandReply::Array(slots)
+    }
+
+    fn execute_cluster_myid(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER MYID' command".to_owned(),
+            );
+        }
+        CommandReply::BulkString(self.cluster.node_id.as_bytes().to_vec())
     }
 
     fn execute_cluster_info(&self, frame: &CommandFrame) -> CommandReply {
@@ -2617,6 +2627,19 @@ mod tests {
             .expect("CLUSTER KEYSLOT should execute");
         let expected = vec![format!(":{}\r\n", key_slot(key)).into_bytes()];
         assert_that!(&reply, eq(&expected));
+    }
+
+    #[rstest]
+    fn resp_cluster_myid_returns_local_node_id() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"MYID"]))
+            .expect("CLUSTER MYID should execute");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.as_str(), eq(app.cluster.node_id.as_str()));
     }
 
     #[rstest]
