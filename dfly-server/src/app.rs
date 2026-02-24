@@ -552,6 +552,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
+            "RENAME" | "RENAMENX" => self.execute_rename(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "APPEND"
             | "STRLEN" | "MOVE" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
             | "PEXPIREAT" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR"
@@ -1415,6 +1416,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Integer(1)
     }
 
+    fn execute_rename(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if let Some(error_reply) =
+            self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
+        {
+            return error_reply;
+        }
+        self.core.execute_in_db(db, frame)
+    }
+
     fn ensure_cluster_multi_key_constraints<'a, I>(&self, keys: I) -> Option<CommandReply>
     where
         I: IntoIterator<Item = &'a [u8]>,
@@ -1574,7 +1584,12 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         ("SETEX" | "PSETEX", CommandReply::SimpleString(ok)) if ok == "OK" => {
             Some(JournalOp::Command)
         }
-        ("SETNX" | "MSETNX" | "MOVE", CommandReply::Integer(1))
+        ("RENAME", CommandReply::SimpleString(ok))
+            if ok == "OK" && frame.args.first() != frame.args.get(1) =>
+        {
+            Some(JournalOp::Command)
+        }
+        ("SETNX" | "MSETNX" | "MOVE" | "RENAMENX", CommandReply::Integer(1))
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
         | ("GETDEL", CommandReply::BulkString(_))
         | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
@@ -2144,6 +2159,96 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dup"]))
             .expect("GET source should execute");
         assert_that!(&source, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_rename_and_renamenx_follow_redis_style_outcomes() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let missing = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAME", b"missing", b"dst"]),
+            )
+            .expect("RENAME missing should parse");
+        assert_that!(&missing, eq(&vec![b"-ERR no such key\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v1"]))
+            .expect("SET src should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dst", b"v2"]))
+            .expect("SET dst should execute");
+
+        let blocked = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAMENX", b"src", b"dst"]),
+            )
+            .expect("RENAMENX should execute");
+        assert_that!(&blocked, eq(&vec![b":0\r\n".to_vec()]));
+
+        let renamed = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"src", b"dst"]))
+            .expect("RENAME should execute");
+        assert_that!(&renamed, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let src = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"src"]))
+            .expect("GET src should execute");
+        assert_that!(&src, eq(&vec![b"$-1\r\n".to_vec()]));
+        let dst = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dst"]))
+            .expect("GET dst should execute");
+        assert_that!(&dst, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+
+        let same = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"dst", b"dst"]))
+            .expect("RENAME same key should execute");
+        assert_that!(&same, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let same_nx = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
+            )
+            .expect("RENAMENX same key should execute");
+        assert_that!(&same_nx, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_rename_rejects_crossslot_keys_in_cluster_mode() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let source_key = b"acct:{100}".to_vec();
+        let mut destination_key = b"acct:{200}".to_vec();
+        let mut suffix = 0_u32;
+        while key_slot(&destination_key) == key_slot(&source_key) {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("acct:{{200}}:{suffix}").into_bytes();
+        }
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", &source_key, b"v"]))
+            .expect("SET source should execute");
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAME", &source_key, &destination_key]),
+            )
+            .expect("RENAME should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]
@@ -3311,6 +3416,40 @@ mod tests {
         assert_that!(entries.len(), eq(1_usize));
         assert_that!(
             String::from_utf8_lossy(&entries[0].payload).contains("MSETNX"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_rename_family_only_for_effective_mutations() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAMENX", b"src", b"dst"]),
+            )
+            .expect("RENAMENX success should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
+            )
+            .expect("RENAMENX same key should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"dst", b"dst"]))
+            .expect("RENAME same key should execute");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(entries[0].op, eq(JournalOp::Command));
+        assert_that!(entries[1].op, eq(JournalOp::Command));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("RENAMENX"),
             eq(true)
         );
     }

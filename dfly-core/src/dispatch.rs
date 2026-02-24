@@ -289,6 +289,16 @@ impl CommandRegistry {
             arity: CommandArity::Exact(2),
             handler: handle_move,
         });
+        self.register(CommandSpec {
+            name: "RENAME",
+            arity: CommandArity::Exact(2),
+            handler: handle_rename,
+        });
+        self.register(CommandSpec {
+            name: "RENAMENX",
+            arity: CommandArity::Exact(2),
+            handler: handle_renamenx,
+        });
     }
 
     fn register_expiry_commands(&mut self) {
@@ -678,6 +688,116 @@ fn handle_move(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
     state.bump_key_version(db, &key);
     state.bump_key_version(target_db, &key);
     CommandReply::Integer(1)
+}
+
+fn handle_rename(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    rename_single_state(db, &frame.args[0], &frame.args[1], false, state)
+}
+
+fn handle_renamenx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    rename_single_state(db, &frame.args[0], &frame.args[1], true, state)
+}
+
+/// Moves one key between two different shard states.
+///
+/// This helper exists for cross-shard `RENAME/RENAMENX` in `CoreModule`, where source and
+/// destination keys hash to different owners and therefore cannot be handled by one shard-local
+/// command dispatch.
+#[must_use]
+pub fn rename_between_states(
+    db: DbIndex,
+    source_key: &[u8],
+    destination_key: &[u8],
+    destination_should_not_exist: bool,
+    source_state: &mut DispatchState,
+    destination_state: &mut DispatchState,
+) -> CommandReply {
+    source_state.purge_expired_key(db, source_key);
+    destination_state.purge_expired_key(db, destination_key);
+
+    if !source_state
+        .db_map(db)
+        .is_some_and(|map| map.contains_key(source_key))
+    {
+        return CommandReply::Error("no such key".to_owned());
+    }
+    if destination_should_not_exist
+        && destination_state
+            .db_map(db)
+            .is_some_and(|map| map.contains_key(destination_key))
+    {
+        return CommandReply::Integer(0);
+    }
+
+    let Some(source_entry) = source_state.db_map_mut(db).remove(source_key) else {
+        return CommandReply::Error("no such key".to_owned());
+    };
+
+    if !destination_should_not_exist {
+        let _ = destination_state.db_map_mut(db).remove(destination_key);
+    }
+    destination_state
+        .db_map_mut(db)
+        .insert(destination_key.to_vec(), source_entry);
+
+    source_state.bump_key_version(db, source_key);
+    destination_state.bump_key_version(db, destination_key);
+
+    if destination_should_not_exist {
+        CommandReply::Integer(1)
+    } else {
+        CommandReply::SimpleString("OK".to_owned())
+    }
+}
+
+fn rename_single_state(
+    db: DbIndex,
+    source_key: &[u8],
+    destination_key: &[u8],
+    destination_should_not_exist: bool,
+    state: &mut DispatchState,
+) -> CommandReply {
+    state.purge_expired_key(db, source_key);
+    state.purge_expired_key(db, destination_key);
+
+    if !state
+        .db_map(db)
+        .is_some_and(|map| map.contains_key(source_key))
+    {
+        return CommandReply::Error("no such key".to_owned());
+    }
+    if source_key == destination_key {
+        if destination_should_not_exist {
+            return CommandReply::Integer(0);
+        }
+        return CommandReply::SimpleString("OK".to_owned());
+    }
+    if destination_should_not_exist
+        && state
+            .db_map(db)
+            .is_some_and(|map| map.contains_key(destination_key))
+    {
+        return CommandReply::Integer(0);
+    }
+
+    let Some(source_entry) = state.db_map_mut(db).remove(source_key) else {
+        return CommandReply::Error("no such key".to_owned());
+    };
+
+    if !destination_should_not_exist {
+        let _ = state.db_map_mut(db).remove(destination_key);
+    }
+    state
+        .db_map_mut(db)
+        .insert(destination_key.to_vec(), source_entry);
+    state.bump_key_version(db, source_key);
+    state.bump_key_version(db, destination_key);
+
+    if destination_should_not_exist {
+        CommandReply::Integer(1)
+    } else {
+        CommandReply::SimpleString("OK".to_owned())
+    }
 }
 
 fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -1572,6 +1692,121 @@ mod tests {
         );
         assert_that!(&source, eq(&CommandReply::BulkString(b"db0".to_vec())));
         assert_that!(&target, eq(&CommandReply::BulkString(b"db1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_rename_moves_value_to_destination_key() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"src".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"dst".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let renamed = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&renamed, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let src_value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"src".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&src_value, eq(&CommandReply::Null));
+
+        let dst_value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&dst_value, eq(&CommandReply::BulkString(b"v1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_renamenx_only_moves_when_destination_is_missing() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"src".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"dst".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let blocked = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAMENX", vec![b"src".to_vec(), b"dst".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&blocked, eq(&CommandReply::Integer(0)));
+
+        let moved = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAMENX", vec![b"src".to_vec(), b"new".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&moved, eq(&CommandReply::Integer(1)));
+
+        let src_value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"src".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&src_value, eq(&CommandReply::Null));
+
+        let new_value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"new".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&new_value, eq(&CommandReply::BulkString(b"v1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_rename_same_name_requires_existing_key() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let missing = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAME", vec![b"same".to_vec(), b"same".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&missing, eq(&CommandReply::Error("no such key".to_owned())));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"same".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+        let rename_ok = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAME", vec![b"same".to_vec(), b"same".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&rename_ok, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let renamenx_same = registry.dispatch(
+            0,
+            &CommandFrame::new("RENAMENX", vec![b"same".to_vec(), b"same".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&renamenx_same, eq(&CommandReply::Integer(0)));
     }
 
     #[rstest]

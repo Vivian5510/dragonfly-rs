@@ -8,7 +8,7 @@ pub mod sharding;
 use command::{CommandFrame, CommandReply};
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{DbIndex, ShardCount};
-use dispatch::{CommandRegistry, DispatchState, ValueEntry};
+use dispatch::{CommandRegistry, DispatchState, ValueEntry, rename_between_states};
 use sharding::{HashTagShardResolver, ShardResolver};
 
 /// Core module bootstrap object.
@@ -70,12 +70,66 @@ impl CoreModule {
     /// Executes one command frame in a selected logical DB.
     #[must_use]
     pub fn execute_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
+        match frame.name.as_str() {
+            "RENAME" => return self.execute_rename_in_db(db, frame, false),
+            "RENAMENX" => return self.execute_rename_in_db(db, frame, true),
+            _ => {}
+        }
+
         let target_shard = self.resolve_target_shard(frame);
         let target_index = usize::from(target_shard);
         let Some(target_state) = self.shard_states.get_mut(target_index) else {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
         };
         self.command_registry.dispatch(db, frame, target_state)
+    }
+
+    fn execute_rename_in_db(
+        &mut self,
+        db: DbIndex,
+        frame: &CommandFrame,
+        destination_should_not_exist: bool,
+    ) -> CommandReply {
+        if frame.args.len() != 2 {
+            let command = if destination_should_not_exist {
+                "RENAMENX"
+            } else {
+                "RENAME"
+            };
+            return CommandReply::Error(format!(
+                "wrong number of arguments for '{command}' command"
+            ));
+        }
+
+        let source_key = &frame.args[0];
+        let destination_key = &frame.args[1];
+
+        let source_shard = usize::from(self.resolve_shard_for_key(source_key));
+        let destination_shard = usize::from(self.resolve_shard_for_key(destination_key));
+
+        if source_shard == destination_shard {
+            let Some(target_state) = self.shard_states.get_mut(source_shard) else {
+                return CommandReply::Error(format!("invalid target shard {source_shard}"));
+            };
+            return self.command_registry.dispatch(db, frame, target_state);
+        }
+
+        let Some((source_state, destination_state)) =
+            shard_pair_mut(&mut self.shard_states, source_shard, destination_shard)
+        else {
+            return CommandReply::Error(format!(
+                "invalid rename shard pair {source_shard}->{destination_shard}"
+            ));
+        };
+
+        rename_between_states(
+            db,
+            source_key,
+            destination_key,
+            destination_should_not_exist,
+            source_state,
+            destination_state,
+        )
     }
 
     /// Validates a command against core command-table arity/existence rules.
@@ -195,16 +249,38 @@ impl CoreModule {
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
         match frame.name.as_str() {
             "GET" | "SET" | "TYPE" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "DEL"
-            | "UNLINK" | "EXISTS" | "TOUCH" | "MOVE" | "GETRANGE" | "SETRANGE" | "SETEX"
-            | "PSETEX" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "TTL" | "PTTL"
-            | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
-            | "SETNX" => frame
+            | "UNLINK" | "EXISTS" | "TOUCH" | "MOVE" | "RENAME" | "RENAMENX" | "GETRANGE"
+            | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT"
+            | "TTL" | "PTTL" | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME" | "INCR" | "DECR"
+            | "INCRBY" | "DECRBY" | "SETNX" => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),
             _ => 0,
         }
     }
+}
+
+fn shard_pair_mut(
+    shard_states: &mut [DispatchState],
+    source_shard: usize,
+    destination_shard: usize,
+) -> Option<(&mut DispatchState, &mut DispatchState)> {
+    if source_shard == destination_shard {
+        return None;
+    }
+
+    if source_shard < destination_shard {
+        let (left, right) = shard_states.split_at_mut(destination_shard);
+        let source = left.get_mut(source_shard)?;
+        let destination = right.get_mut(0)?;
+        return Some((source, destination));
+    }
+
+    let (left, right) = shard_states.split_at_mut(source_shard);
+    let destination = left.get_mut(destination_shard)?;
+    let source = right.get_mut(0)?;
+    Some((source, destination))
 }
 
 #[cfg(test)]
@@ -403,5 +479,83 @@ mod tests {
         assert_that!(core.db_size(0), eq(2_usize));
         assert_that!(core.db_size(1), eq(1_usize));
         assert_that!(core.db_size(2), eq(0_usize));
+    }
+
+    #[rstest]
+    fn core_rename_moves_value_across_shards() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let source_key = b"rename:src".to_vec();
+        let source_shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"rename:dst".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard == source_shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("rename:dst:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![destination_key.clone(), b"old".to_vec()]),
+        );
+
+        let rename = core.execute_in_db(
+            0,
+            &CommandFrame::new("RENAME", vec![source_key.clone(), destination_key.clone()]),
+        );
+        assert_that!(&rename, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let source = core.execute_in_db(0, &CommandFrame::new("GET", vec![source_key]));
+        let destination = core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+        assert_that!(&source, eq(&CommandReply::Null));
+        assert_that!(
+            &destination,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
+    }
+
+    #[rstest]
+    fn core_renamenx_blocks_when_destination_exists_across_shards() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let source_key = b"rename:nx:src".to_vec();
+        let source_shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"rename:nx:dst".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard == source_shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("rename:nx:dst:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"src".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![destination_key.clone(), b"dst".to_vec()]),
+        );
+
+        let renamenx = core.execute_in_db(
+            0,
+            &CommandFrame::new(
+                "RENAMENX",
+                vec![source_key.clone(), destination_key.clone()],
+            ),
+        );
+        assert_that!(&renamenx, eq(&CommandReply::Integer(0)));
+
+        let source = core.execute_in_db(0, &CommandFrame::new("GET", vec![source_key]));
+        let destination = core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+        assert_that!(&source, eq(&CommandReply::BulkString(b"src".to_vec())));
+        assert_that!(&destination, eq(&CommandReply::BulkString(b"dst".to_vec())));
     }
 }
