@@ -141,6 +141,15 @@ impl CoreModule {
         self.resolver.shard_for_key(key)
     }
 
+    /// Returns current mutation version for one key in selected logical DB.
+    #[must_use]
+    pub fn key_version(&self, db: DbIndex, key: &[u8]) -> u64 {
+        let shard = self.resolve_shard_for_key(key);
+        self.shard_states
+            .get(usize::from(shard))
+            .map_or(0, |state| state.key_version(db, key))
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -244,5 +253,18 @@ mod tests {
         let db2_get = restored.execute_in_db(2, &CommandFrame::new("GET", vec![b"user".to_vec()]));
         assert_that!(&db0_get, eq(&CommandReply::BulkString(b"alice".to_vec())));
         assert_that!(&db2_get, eq(&CommandReply::BulkString(b"bob".to_vec())));
+    }
+
+    #[rstest]
+    fn core_reports_key_version_for_watched_mutations() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let key = b"watch:1".to_vec();
+
+        assert_that!(core.key_version(0, &key), eq(0_u64));
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+        );
+        assert_that!(core.key_version(0, &key), eq(1_u64));
     }
 }

@@ -6,11 +6,23 @@
 
 use dfly_core::command::CommandFrame;
 
+/// One optimistic-watch descriptor tracked for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedKey {
+    /// Logical DB index.
+    pub db: u16,
+    /// Watched key bytes.
+    pub key: Vec<u8>,
+    /// Key version captured at `WATCH` time.
+    pub version: u64,
+}
+
 /// Mutable transaction state attached to one client connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransactionSession {
     in_multi: bool,
     queued_commands: Vec<CommandFrame>,
+    watched_keys: Vec<WatchedKey>,
 }
 
 impl TransactionSession {
@@ -49,6 +61,7 @@ impl TransactionSession {
         }
         self.in_multi = false;
         self.queued_commands.clear();
+        self.watched_keys.clear();
         true
     }
 
@@ -60,6 +73,7 @@ impl TransactionSession {
             return None;
         }
         self.in_multi = false;
+        self.watched_keys.clear();
         Some(std::mem::take(&mut self.queued_commands))
     }
 
@@ -67,6 +81,44 @@ impl TransactionSession {
     #[must_use]
     pub fn in_multi(&self) -> bool {
         self.in_multi
+    }
+
+    /// Adds or refreshes a watched key when outside of `MULTI`.
+    ///
+    /// Returns `false` when a transaction queue is already open.
+    #[must_use]
+    pub fn watch_key(&mut self, db: u16, key: Vec<u8>, version: u64) -> bool {
+        if self.in_multi {
+            return false;
+        }
+
+        if let Some(existing) = self
+            .watched_keys
+            .iter_mut()
+            .find(|entry| entry.db == db && entry.key == key)
+        {
+            existing.version = version;
+            return true;
+        }
+
+        self.watched_keys.push(WatchedKey { db, key, version });
+        true
+    }
+
+    /// Clears all optimistic watch descriptors.
+    pub fn unwatch(&mut self) {
+        self.watched_keys.clear();
+    }
+
+    /// Returns whether all watched keys still match their captured versions.
+    #[must_use]
+    pub fn watched_keys_are_clean<F>(&self, mut current_version: F) -> bool
+    where
+        F: FnMut(u16, &[u8]) -> u64,
+    {
+        self.watched_keys
+            .iter()
+            .all(|entry| current_version(entry.db, &entry.key) == entry.version)
     }
 }
 
@@ -106,5 +158,24 @@ mod tests {
         assert_that!(session.discard(), eq(true));
         assert_that!(session.in_multi(), eq(false));
         assert_that!(session.take_queued_for_exec().is_none(), eq(true));
+    }
+
+    #[rstest]
+    fn watch_keys_track_version_and_unwatch_clears_them() {
+        let mut session = TransactionSession::default();
+        assert_that!(session.watch_key(0, b"k".to_vec(), 2), eq(true));
+        assert_that!(
+            session
+                .watched_keys_are_clean(|db, key| { if db == 0 && key == b"k" { 2 } else { 0 } }),
+            eq(true)
+        );
+        assert_that!(
+            session
+                .watched_keys_are_clean(|db, key| { if db == 0 && key == b"k" { 3 } else { 0 } }),
+            eq(false)
+        );
+
+        session.unwatch();
+        assert_that!(session.watched_keys_are_clean(|_, _| 0), eq(true));
     }
 }

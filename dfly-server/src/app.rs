@@ -246,6 +246,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MULTI" => Some(Self::handle_multi(connection, frame)),
             "EXEC" => Some(self.handle_exec(connection, frame)),
             "DISCARD" => Some(Self::handle_discard(connection, frame)),
+            "WATCH" => Some(self.handle_watch(connection, frame)),
+            "UNWATCH" => Some(Self::handle_unwatch(connection, frame)),
             _ => None,
         }
     }
@@ -274,6 +276,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if !frame.args.is_empty() {
             return wrong_arity("EXEC");
         }
+        if !connection
+            .transaction
+            .watched_keys_are_clean(|db, key| self.core.key_version(db, key))
+        {
+            let _ = connection.transaction.discard();
+            return CommandReply::NullArray.to_resp_bytes();
+        }
         let Some(queued_commands) = connection.transaction.take_queued_for_exec() else {
             return CommandReply::Error("EXEC without MULTI".to_owned()).to_resp_bytes();
         };
@@ -292,6 +301,36 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             })
             .collect::<Vec<_>>();
         CommandReply::Array(replies).to_resp_bytes()
+    }
+
+    fn handle_watch(&mut self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        if frame.args.is_empty() {
+            return wrong_arity("WATCH");
+        }
+        if connection.transaction.in_multi() {
+            return CommandReply::Error("WATCH inside MULTI is not allowed".to_owned())
+                .to_resp_bytes();
+        }
+
+        let db = connection.parser.context.db_index;
+        for key in &frame.args {
+            let version = self.core.key_version(db, key);
+            let _ = connection.transaction.watch_key(db, key.clone(), version);
+        }
+        CommandReply::SimpleString("OK".to_owned()).to_resp_bytes()
+    }
+
+    fn handle_unwatch(connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        if !frame.args.is_empty() {
+            return wrong_arity("UNWATCH");
+        }
+        if connection.transaction.in_multi() {
+            return CommandReply::Error("UNWATCH inside MULTI is not allowed".to_owned())
+                .to_resp_bytes();
+        }
+
+        connection.transaction.unwatch();
+        CommandReply::SimpleString("OK".to_owned()).to_resp_bytes()
     }
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
@@ -592,6 +631,7 @@ fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
             output
         }
         (_, CommandReply::Array(_)) => b"ERROR unsupported array reply\r\n".to_vec(),
+        (_, CommandReply::NullArray) => b"ERROR unsupported null array reply\r\n".to_vec(),
         (_, CommandReply::Null) => b"END\r\n".to_vec(),
         (_, CommandReply::Error(message)) => format!("ERROR {message}\r\n").into_bytes(),
     }
@@ -830,6 +870,106 @@ mod tests {
             .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
             .expect("EXEC command should parse");
         assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_watch_aborts_exec_when_watched_key_changes() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nold\r\n",
+            )
+            .expect("seed SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
+            .expect("WATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
+            )
+            .expect("queued SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut writer_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
+            )
+            .expect("concurrent SET should succeed");
+
+        let exec = app
+            .feed_connection_bytes(&mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
+            .expect("EXEC should parse");
+        assert_that!(&exec, eq(&vec![b"*-1\r\n".to_vec()]));
+
+        let check = app
+            .feed_connection_bytes(&mut watch_conn, b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
+            .expect("GET should succeed");
+        assert_that!(&check, eq(&vec![b"$5\r\nother\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_watch_exec_succeeds_when_key_unchanged() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
+            .expect("WATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n",
+            )
+            .expect("SET should queue");
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+            .expect("EXEC should succeed");
+        assert_that!(&exec, eq(&vec![b"*1\r\n+OK\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_unwatch_clears_watch_set() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
+            .expect("WATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, b"*1\r\n$7\r\nUNWATCH\r\n")
+            .expect("UNWATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut writer_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
+            )
+            .expect("external SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
+            )
+            .expect("SET should queue");
+
+        let exec = app
+            .feed_connection_bytes(&mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
+            .expect("EXEC should run queued SET");
+        assert_that!(&exec, eq(&vec![b"*1\r\n+OK\r\n".to_vec()]));
     }
 
     #[rstest]

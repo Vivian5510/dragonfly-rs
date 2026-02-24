@@ -46,6 +46,8 @@ pub struct DispatchState {
     ///
     /// First key is logical DB index (`SELECT`), second key is user key bytes.
     pub db_kv: HashMap<DbIndex, HashMap<Vec<u8>, ValueEntry>>,
+    /// Monotonic per-key versions used by optimistic transaction checks (`WATCH`).
+    db_versions: HashMap<DbIndex, HashMap<Vec<u8>, u64>>,
 }
 
 /// Stored value with optional expiration metadata.
@@ -77,6 +79,23 @@ impl DispatchState {
         self.db_kv.get(&db)
     }
 
+    /// Returns tracked version for one key.
+    #[must_use]
+    pub fn key_version(&self, db: DbIndex, key: &[u8]) -> u64 {
+        self.db_versions
+            .get(&db)
+            .and_then(|versions| versions.get(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bumps version of one key after successful mutation.
+    fn bump_key_version(&mut self, db: DbIndex, key: &[u8]) {
+        let versions = self.db_versions.entry(db).or_default();
+        let next = versions.get(key).copied().unwrap_or(0).saturating_add(1);
+        versions.insert(key.to_vec(), next);
+    }
+
     /// Removes one key when its expiration timestamp has already passed.
     fn purge_expired_key(&mut self, db: DbIndex, key: &[u8]) {
         let should_remove = self
@@ -85,8 +104,11 @@ impl DispatchState {
             .and_then(|entry| entry.expire_at_unix_secs)
             .is_some_and(|expire_at| expire_at <= Self::now_unix_seconds());
 
-        if should_remove && let Some(map) = self.db_kv.get_mut(&db) {
-            let _ = map.remove(key);
+        if should_remove
+            && let Some(map) = self.db_kv.get_mut(&db)
+            && map.remove(key).is_some()
+        {
+            self.bump_key_version(db, key);
         }
     }
 
@@ -205,12 +227,13 @@ fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
     let key = frame.args[0].clone();
     let value = frame.args[1].clone();
     state.db_map_mut(db).insert(
-        key,
+        key.clone(),
         ValueEntry {
             value,
             expire_at_unix_secs: None,
         },
     );
+    state.bump_key_version(db, &key);
     CommandReply::SimpleString("OK".to_owned())
 }
 
@@ -236,8 +259,11 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     }
 
     if seconds <= 0 {
-        let _ = state.db_map_mut(db).remove(key);
-        return CommandReply::Integer(1);
+        if state.db_map_mut(db).remove(key).is_some() {
+            state.bump_key_version(db, key);
+            return CommandReply::Integer(1);
+        }
+        return CommandReply::Integer(0);
     }
 
     let Ok(expire_delta) = u64::try_from(seconds) else {
@@ -245,8 +271,13 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     };
     let expire_at = DispatchState::now_unix_seconds().saturating_add(expire_delta);
 
+    let mut updated = false;
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
         entry.expire_at_unix_secs = Some(expire_at);
+        updated = true;
+    }
+    if updated {
+        state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
     CommandReply::Integer(0)
@@ -421,5 +452,35 @@ mod tests {
         );
         assert_that!(&db0, eq(&CommandReply::BulkString(b"db0".to_vec())));
         assert_that!(&db1, eq(&CommandReply::BulkString(b"db1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_bumps_key_version_on_mutations() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"watched:key".to_vec();
+
+        assert_that!(state.key_version(0, &key), eq(0_u64));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"v1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(state.key_version(0, &key), eq(1_u64));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRE", vec![key.clone(), b"10".to_vec()]),
+            &mut state,
+        );
+        assert_that!(state.key_version(0, &key), eq(2_u64));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRE", vec![key.clone(), b"0".to_vec()]),
+            &mut state,
+        );
+        assert_that!(state.key_version(0, &key), eq(3_u64));
     }
 }
