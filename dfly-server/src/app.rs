@@ -23,7 +23,7 @@ use dfly_transaction::TransactionModule;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use dfly_transaction::session::TransactionSession;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 /// Unit 0 composition container.
@@ -714,7 +714,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         txid: Option<TxId>,
     ) -> CommandReply {
         if txid.is_none() {
-            match self.dispatch_single_command_runtime(frame) {
+            match self.dispatch_direct_command_runtime(frame) {
                 Ok(()) => {}
                 Err(error) => {
                     return CommandReply::Error(format!("runtime dispatch failed: {error}"));
@@ -727,25 +727,75 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         reply
     }
 
-    fn dispatch_single_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
-        if !matches!(
-            self.core.command_routing(frame),
-            CommandRouting::SingleKey { .. }
-        ) {
+    fn dispatch_direct_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
+        let target_shards = self.runtime_target_shards_for_direct_command(frame);
+        if target_shards.is_empty() {
             return Ok(());
         }
 
-        let target_shard = self.core.resolve_target_shard(frame);
-        let sequence = self.submit_runtime_envelope_with_sequence(target_shard, frame)?;
-        let reached = self.runtime.wait_for_processed_sequence(
-            target_shard,
-            sequence,
-            Duration::from_millis(200),
-        )?;
-        if reached {
-            return Ok(());
+        // Direct command path mirrors Dragonfly's coordinator ingress:
+        // 1) push one envelope to each touched shard queue,
+        // 2) wait until all shard workers report they consumed the envelope.
+        let mut barriers = Vec::with_capacity(target_shards.len());
+        for shard in target_shards {
+            let sequence = self.submit_runtime_envelope_with_sequence(shard, frame)?;
+            barriers.push((shard, sequence));
         }
-        Err(DflyError::InvalidState("runtime dispatch timed out"))
+        for (shard, sequence) in barriers {
+            let reached = self.runtime.wait_for_processed_sequence(
+                shard,
+                sequence,
+                Duration::from_millis(200),
+            )?;
+            if !reached {
+                return Err(DflyError::InvalidState("runtime dispatch timed out"));
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime_target_shards_for_direct_command(&self, frame: &CommandFrame) -> Vec<u16> {
+        if matches!(
+            self.core.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return vec![self.core.resolve_target_shard(frame)];
+        }
+
+        match frame.name.as_str() {
+            // Multi-key fanout commands: each key can belong to a different shard owner.
+            "MGET" | "DEL" | "UNLINK" | "EXISTS" | "TOUCH" if !frame.args.is_empty() => {
+                self.collect_unique_runtime_shards_for_keys(frame.args.iter().map(Vec::as_slice))
+            }
+            // MSET and MSETNX use key/value pairs, so key positions are 0,2,4,...
+            "MSET" | "MSETNX" if frame.args.len() >= 2 && frame.args.len().is_multiple_of(2) => {
+                self.collect_unique_runtime_shards_for_keys(
+                    frame.args.iter().step_by(2).map(Vec::as_slice),
+                )
+            }
+            // COPY/RENAME family touches source and destination owners.
+            "COPY" if frame.args.len() >= 2 => self.collect_unique_runtime_shards_for_keys([
+                frame.args[0].as_slice(),
+                frame.args[1].as_slice(),
+            ]),
+            "RENAME" | "RENAMENX" if frame.args.len() == 2 => self
+                .collect_unique_runtime_shards_for_keys([
+                    frame.args[0].as_slice(),
+                    frame.args[1].as_slice(),
+                ]),
+            _ => Vec::new(),
+        }
+    }
+
+    fn collect_unique_runtime_shards_for_keys<'a, I>(&self, keys: I) -> Vec<u16>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut shards = BTreeSet::new();
+        for key in keys {
+            let _ = shards.insert(self.core.resolve_shard_for_key(key));
+        }
+        shards.into_iter().collect()
     }
 
     fn execute_command_without_side_effects(
@@ -3861,6 +3911,108 @@ mod tests {
             .expect("drain should succeed");
         assert_that!(runtime.len(), eq(1_usize));
         assert_that!(&runtime[0].command, eq(&command));
+    }
+
+    #[rstest]
+    fn direct_mget_dispatches_runtime_to_each_touched_shard() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let first_key = b"direct:rt:mget:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"direct:rt:mget:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("direct:rt:mget:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let frame = CommandFrame::new("MGET", vec![first_key, second_key]);
+        let reply = app.execute_user_command(0, &frame, None);
+        assert_that!(
+            &reply,
+            eq(&CommandReply::Array(vec![
+                CommandReply::Null,
+                CommandReply::Null
+            ]))
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let first_runtime = app
+            .runtime
+            .drain_processed_for_shard(first_shard)
+            .expect("drain should succeed");
+        let second_runtime = app
+            .runtime
+            .drain_processed_for_shard(second_shard)
+            .expect("drain should succeed");
+        assert_that!(first_runtime.len(), eq(1_usize));
+        assert_that!(second_runtime.len(), eq(1_usize));
+        assert_that!(&first_runtime[0].command, eq(&frame));
+        assert_that!(&second_runtime[0].command, eq(&frame));
+    }
+
+    #[rstest]
+    fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let first_key = b"direct:rt:same:1".to_vec();
+        let shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"direct:rt:same:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard != shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("direct:rt:same:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let frame = CommandFrame::new("MGET", vec![first_key, second_key]);
+        let _ = app.execute_user_command(0, &frame, None);
+        let runtime = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+        assert_that!(runtime.len(), eq(1_usize));
+        assert_that!(&runtime[0].command, eq(&frame));
+    }
+
+    #[rstest]
+    fn direct_mset_with_odd_arity_does_not_dispatch_runtime() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let frame = CommandFrame::new(
+            "MSET",
+            vec![
+                b"direct:rt:odd:1".to_vec(),
+                b"a".to_vec(),
+                b"orphan-key".to_vec(),
+            ],
+        );
+
+        let reply = app.execute_user_command(0, &frame, None);
+        assert_that!(
+            &reply,
+            eq(&CommandReply::Error(
+                "wrong number of arguments for 'MSET' command".to_owned()
+            ))
+        );
+        for shard in 0_u16..app.config.shard_count.get() {
+            let runtime = app
+                .runtime
+                .drain_processed_for_shard(shard)
+                .expect("drain should succeed");
+            assert_that!(runtime.is_empty(), eq(true));
+        }
     }
 
     #[rstest]
