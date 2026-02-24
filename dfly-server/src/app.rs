@@ -601,9 +601,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "GETRANGE" | "SETRANGE"
-            | "EXPIRE" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
-                self.execute_key_command(db, frame)
-            }
+            | "EXPIRE" | "EXPIREAT" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
+            | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1594,6 +1593,13 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         {
             Some(JournalOp::Command)
         }
+        ("EXPIREAT", CommandReply::Integer(1)) => {
+            if expireat_is_delete(frame) {
+                Some(JournalOp::Expired)
+            } else {
+                Some(JournalOp::Command)
+            }
+        }
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -1621,6 +1627,20 @@ fn expire_is_delete(frame: &CommandFrame) -> bool {
         .and_then(|seconds| std::str::from_utf8(seconds).ok())
         .and_then(|seconds| seconds.parse::<i64>().ok())
         .is_some_and(|seconds| seconds <= 0)
+}
+
+fn expireat_is_delete(frame: &CommandFrame) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        });
+    frame
+        .args
+        .get(1)
+        .and_then(|timestamp| std::str::from_utf8(timestamp).ok())
+        .and_then(|timestamp| timestamp.parse::<i64>().ok())
+        .is_some_and(|timestamp| timestamp <= now)
 }
 
 fn parse_db_index_arg(arg: &[u8]) -> Result<u16, String> {
@@ -2096,6 +2116,52 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
             .expect("GET should execute");
         assert_that!(&value, eq(&vec![b"$5\r\nhillo\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_expireat_sets_future_expire_and_deletes_past_keys() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"future", b"v"]))
+            .expect("SET future should execute");
+        let future_timestamp = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_secs()
+            + 120)
+            .to_string()
+            .into_bytes();
+        let expireat_future = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIREAT", b"future", &future_timestamp]),
+            )
+            .expect("EXPIREAT future should execute");
+        assert_that!(&expireat_future, eq(&vec![b":1\r\n".to_vec()]));
+
+        let ttl_future = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"future"]))
+            .expect("TTL should execute");
+        let ttl_value = parse_resp_integer(&ttl_future[0]);
+        assert_that!(ttl_value > 0, eq(true));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"past", b"v"]))
+            .expect("SET past should execute");
+        let expireat_past = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIREAT", b"past", b"1"]),
+            )
+            .expect("EXPIREAT past should execute");
+        assert_that!(&expireat_past, eq(&vec![b":1\r\n".to_vec()]));
+
+        let removed = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"past"]))
+            .expect("GET should execute");
+        assert_that!(&removed, eq(&vec![b"$-1\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -4534,6 +4600,17 @@ mod tests {
         std::str::from_utf8(&frame[payload_start..payload_end])
             .expect("payload must be UTF-8")
             .to_owned()
+    }
+
+    fn parse_resp_integer(frame: &[u8]) -> i64 {
+        assert_that!(frame.first(), eq(Some(&b':')));
+        assert_that!(frame.ends_with(b"\r\n"), eq(true));
+
+        let number = std::str::from_utf8(&frame[1..frame.len() - 2])
+            .expect("RESP integer payload must be UTF-8");
+        number
+            .parse::<i64>()
+            .expect("RESP integer payload must parse")
     }
 
     fn extract_sync_id_from_capa_reply(frame: &[u8]) -> String {
