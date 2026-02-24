@@ -1,6 +1,5 @@
 //! Scheduler interfaces for transaction execution.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
@@ -47,10 +46,33 @@ pub struct InMemoryTransactionScheduler {
 struct SchedulerState {
     /// Pending queue per shard, ordered by scheduling time.
     shard_queues: HashMap<ShardId, VecDeque<TxId>>,
-    /// Exclusive key owner map `(shard, key) -> txid`.
-    key_locks: HashMap<(ShardId, Vec<u8>), TxId>,
+    /// Key owner map `(shard, key) -> read/write lock state`.
+    key_locks: HashMap<KeyId, KeyLockState>,
     /// Lease descriptors for active transactions.
     active: HashMap<TxId, ActiveLease>,
+}
+
+type KeyId = (ShardId, Vec<u8>);
+type KeyAccessList = Vec<(KeyId, KeyAccess)>;
+
+#[derive(Debug, Default)]
+struct KeyLockState {
+    /// Shared readers currently holding the key.
+    readers: HashSet<TxId>,
+    /// Exclusive writer currently holding the key.
+    writer: Option<TxId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAccess {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyLease {
+    key_id: KeyId,
+    access: KeyAccess,
 }
 
 #[derive(Debug, Default)]
@@ -58,34 +80,34 @@ struct ActiveLease {
     /// Shards reserved by this transaction in scheduling queues.
     reserved_shards: Vec<ShardId>,
     /// Key locks held by this transaction.
-    locked_keys: Vec<(ShardId, Vec<u8>)>,
+    key_leases: Vec<KeyLease>,
 }
 
 impl TransactionScheduler for InMemoryTransactionScheduler {
     fn schedule(&self, plan: &TransactionPlan) -> DflyResult<()> {
         validate_plan_shape(plan)?;
 
-        // Non-atomic mode is intentionally lock-free: commands are executed as independent reads.
-        if plan.mode == TransactionMode::NonAtomic {
-            return Ok(());
-        }
+        let key_accesses = match plan.mode {
+            // Non-atomic mode stays lock-free but must remain read-only and single-key.
+            TransactionMode::NonAtomic => {
+                validate_non_atomic_mode(plan)?;
+                Vec::new()
+            }
+            TransactionMode::LockAhead => collect_lock_ahead_accesses(plan)?,
+            // Global mode models a coarse barrier and does not need per-key locks.
+            TransactionMode::Global => Vec::new(),
+        };
 
         let mut touched_shards = HashSet::new();
-        let mut touched_keys = HashSet::new();
         for hop in &plan.hops {
             for (shard, command) in &hop.per_shard {
                 let _ = touched_shards.insert(*shard);
-                if let Some(primary_key) = command.args.first() {
-                    let _ = touched_keys.insert((*shard, primary_key.clone()));
-                }
+                let _ = command;
             }
         }
 
         let mut shards = touched_shards.into_iter().collect::<Vec<_>>();
         shards.sort_unstable();
-
-        let mut keys = touched_keys.into_iter().collect::<Vec<_>>();
-        keys.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
 
         let mut state = self
             .state
@@ -113,27 +135,21 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             reserved_shards.push(*shard);
         }
 
-        let mut locked_keys = Vec::new();
-        for key_id in &keys {
-            match state.key_locks.entry(key_id.clone()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(plan.txid);
-                    locked_keys.push(key_id.clone());
-                }
-                Entry::Occupied(owner) => {
-                    if *owner.get() != plan.txid {
-                        rollback_leases(&mut state, plan.txid, &reserved_shards, &locked_keys);
-                        return Err(DflyError::InvalidState("key lock is busy"));
-                    }
-                }
+        let mut key_leases = Vec::new();
+        for (key_id, access) in key_accesses {
+            let lock_state = state.key_locks.entry(key_id.clone()).or_default();
+            if !try_acquire_key_lock(lock_state, plan.txid, access) {
+                rollback_leases(&mut state, plan.txid, &reserved_shards, &key_leases);
+                return Err(DflyError::InvalidState("key lock is busy"));
             }
+            key_leases.push(KeyLease { key_id, access });
         }
 
         let _ = state.active.insert(
             plan.txid,
             ActiveLease {
                 reserved_shards,
-                locked_keys,
+                key_leases,
             },
         );
         Ok(())
@@ -150,7 +166,7 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             return Ok(());
         };
 
-        rollback_leases(&mut state, txid, &lease.reserved_shards, &lease.locked_keys);
+        rollback_leases(&mut state, txid, &lease.reserved_shards, &lease.key_leases);
         Ok(())
     }
 }
@@ -182,20 +198,128 @@ fn validate_plan_shape(plan: &TransactionPlan) -> DflyResult<()> {
     Ok(())
 }
 
+fn validate_non_atomic_mode(plan: &TransactionPlan) -> DflyResult<()> {
+    for hop in &plan.hops {
+        for (_, command) in &hop.per_shard {
+            if classify_single_key_access(command) != Some(KeyAccess::Read) {
+                return Err(DflyError::InvalidState(
+                    "non-atomic mode requires read-only single-key commands",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_lock_ahead_accesses(plan: &TransactionPlan) -> DflyResult<KeyAccessList> {
+    let mut by_key = HashMap::<KeyId, KeyAccess>::new();
+    for hop in &plan.hops {
+        for (shard, command) in &hop.per_shard {
+            let Some(access) = classify_single_key_access(command) else {
+                return Err(DflyError::InvalidState(
+                    "lock-ahead mode requires single-key commands",
+                ));
+            };
+            let Some(primary_key) = command.args.first() else {
+                return Err(DflyError::InvalidState(
+                    "single-key command is missing key argument",
+                ));
+            };
+            by_key
+                .entry((*shard, primary_key.clone()))
+                .and_modify(|current| {
+                    if *current == KeyAccess::Read && access == KeyAccess::Write {
+                        *current = KeyAccess::Write;
+                    }
+                })
+                .or_insert(access);
+        }
+    }
+
+    let mut accesses = by_key.into_iter().collect::<Vec<_>>();
+    accesses.sort_by(|(left_key, _), (right_key, _)| {
+        left_key
+            .0
+            .cmp(&right_key.0)
+            .then(left_key.1.cmp(&right_key.1))
+    });
+    Ok(accesses)
+}
+
+fn classify_single_key_access(command: &dfly_core::command::CommandFrame) -> Option<KeyAccess> {
+    let has_exactly_one_key_arg = command.args.len() == 1;
+    let has_primary_key = !command.args.is_empty();
+
+    match command.name.as_str() {
+        "GET" | "TYPE" | "STRLEN" | "GETRANGE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME"
+            if has_exactly_one_key_arg =>
+        {
+            Some(KeyAccess::Read)
+        }
+        "EXISTS" | "TOUCH" if has_exactly_one_key_arg => Some(KeyAccess::Read),
+        "SET" | "GETSET" | "GETDEL" | "APPEND" | "MOVE" | "SETRANGE" | "SETEX" | "PSETEX"
+        | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "INCR" | "DECR"
+        | "INCRBY" | "DECRBY" | "SETNX"
+            if has_primary_key =>
+        {
+            Some(KeyAccess::Write)
+        }
+        "DEL" | "UNLINK" if has_exactly_one_key_arg => Some(KeyAccess::Write),
+        _ => None,
+    }
+}
+
+fn try_acquire_key_lock(lock_state: &mut KeyLockState, txid: TxId, access: KeyAccess) -> bool {
+    match access {
+        KeyAccess::Read => {
+            if lock_state.writer.is_some_and(|owner| owner != txid) {
+                return false;
+            }
+            let _ = lock_state.readers.insert(txid);
+            true
+        }
+        KeyAccess::Write => {
+            if lock_state.writer.is_some_and(|owner| owner != txid) {
+                return false;
+            }
+            if lock_state.readers.iter().any(|reader| *reader != txid) {
+                return false;
+            }
+            lock_state.writer = Some(txid);
+            true
+        }
+    }
+}
+
+fn release_key_lease(state: &mut SchedulerState, txid: TxId, lease: &KeyLease) {
+    let mut remove_state = false;
+    if let Some(lock_state) = state.key_locks.get_mut(&lease.key_id) {
+        match lease.access {
+            KeyAccess::Read => {
+                let _ = lock_state.readers.remove(&txid);
+            }
+            KeyAccess::Write => {
+                if lock_state.writer == Some(txid) {
+                    lock_state.writer = None;
+                }
+                let _ = lock_state.readers.remove(&txid);
+            }
+        }
+        remove_state = lock_state.writer.is_none() && lock_state.readers.is_empty();
+    }
+    if remove_state {
+        let _ = state.key_locks.remove(&lease.key_id);
+    }
+}
+
 fn rollback_leases(
     state: &mut SchedulerState,
     txid: TxId,
     reserved_shards: &[ShardId],
-    locked_keys: &[(ShardId, Vec<u8>)],
+    key_leases: &[KeyLease],
 ) {
-    for key_id in locked_keys {
-        if state
-            .key_locks
-            .get(key_id)
-            .is_some_and(|owner| *owner == txid)
-        {
-            let _ = state.key_locks.remove(key_id);
-        }
+    for key_lease in key_leases {
+        release_key_lease(state, txid, key_lease);
     }
 
     for shard in reserved_shards {
@@ -269,6 +393,60 @@ mod tests {
 
         let result = scheduler.schedule(&plan);
         assert_that!(result.is_ok(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_non_atomic_write_commands() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::NonAtomic,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_non_atomic_multi_key_commands() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::NonAtomic,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("EXISTS", vec![b"k1".to_vec(), b"k2".to_vec()]),
+                )],
+            }],
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_lockahead_for_non_single_key_commands() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]),
+                )],
+            }],
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_err(), eq(true));
     }
 
     #[rstest]

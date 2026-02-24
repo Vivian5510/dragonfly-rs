@@ -376,15 +376,56 @@ impl CoreModule {
     /// Returns transaction-planning routing class for one command frame.
     #[must_use]
     pub fn command_routing(&self, frame: &CommandFrame) -> CommandRouting {
-        match frame.name.as_str() {
-            "GET" | "TYPE" | "STRLEN" | "EXISTS" | "TOUCH" | "GETRANGE" | "TTL" | "PTTL"
-            | "EXPIRETIME" | "PEXPIRETIME" => CommandRouting::SingleKey { is_write: false },
-            "SET" | "GETSET" | "GETDEL" | "APPEND" | "DEL" | "UNLINK" | "MOVE" | "COPY"
-            | "RENAME" | "RENAMENX" | "SETRANGE" | "SETEX" | "PSETEX" | "EXPIRE" | "PEXPIRE"
-            | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
-            | "SETNX" => CommandRouting::SingleKey { is_write: true },
-            _ => CommandRouting::NonKey,
+        let name = frame.name.as_str();
+        let has_exactly_one_key_arg = frame.args.len() == 1;
+        let has_primary_key = !frame.args.is_empty();
+
+        if has_exactly_one_key_arg
+            && matches!(
+                name,
+                "GET"
+                    | "TYPE"
+                    | "STRLEN"
+                    | "GETRANGE"
+                    | "TTL"
+                    | "PTTL"
+                    | "EXPIRETIME"
+                    | "PEXPIRETIME"
+                    | "EXISTS"
+                    | "TOUCH"
+            )
+        {
+            return CommandRouting::SingleKey { is_write: false };
         }
+
+        if (has_primary_key
+            && matches!(
+                name,
+                "SET"
+                    | "GETSET"
+                    | "GETDEL"
+                    | "APPEND"
+                    | "MOVE"
+                    | "SETRANGE"
+                    | "SETEX"
+                    | "PSETEX"
+                    | "EXPIRE"
+                    | "PEXPIRE"
+                    | "EXPIREAT"
+                    | "PEXPIREAT"
+                    | "PERSIST"
+                    | "INCR"
+                    | "DECR"
+                    | "INCRBY"
+                    | "DECRBY"
+                    | "SETNX"
+            ))
+            || (has_exactly_one_key_arg && matches!(name, "DEL" | "UNLINK"))
+        {
+            return CommandRouting::SingleKey { is_write: true };
+        }
+
+        CommandRouting::NonKey
     }
 
     /// Returns whether command can participate in single-key lock-ahead planning.
@@ -564,6 +605,31 @@ mod tests {
             core.command_routing(&get),
             eq(CommandRouting::SingleKey { is_write: false })
         );
+
+        let del_single = CommandFrame::new("DEL", vec![b"k".to_vec()]);
+        assert_that!(core.is_single_key_command(&del_single), eq(true));
+        assert_that!(
+            core.command_routing(&del_single),
+            eq(CommandRouting::SingleKey { is_write: true })
+        );
+
+        let del_multi = CommandFrame::new("DEL", vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert_that!(core.is_single_key_command(&del_multi), eq(false));
+        assert_that!(core.command_routing(&del_multi), eq(CommandRouting::NonKey));
+
+        let exists_multi = CommandFrame::new(
+            "EXISTS",
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        );
+        assert_that!(core.is_single_key_command(&exists_multi), eq(false));
+        assert_that!(
+            core.command_routing(&exists_multi),
+            eq(CommandRouting::NonKey)
+        );
+
+        let rename = CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]);
+        assert_that!(core.is_single_key_command(&rename), eq(false));
+        assert_that!(core.command_routing(&rename), eq(CommandRouting::NonKey));
 
         let ping = CommandFrame::new("PING", Vec::new());
         assert_that!(core.is_single_key_command(&ping), eq(false));

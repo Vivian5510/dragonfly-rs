@@ -586,13 +586,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     TransactionMode::NonAtomic => {
                         if matches!(
                             self.core.command_routing(command),
-                            CommandRouting::SingleKey { is_write: true }
+                            CommandRouting::SingleKey { is_write: false }
                         ) {
-                            replies.push(CommandReply::Error(
-                                "transaction planning error: NonAtomic mode cannot execute write commands".to_owned(),
-                            ));
-                        } else {
                             replies.push(self.execute_user_command(db, command, None));
+                        } else {
+                            replies.push(CommandReply::Error(
+                                "transaction planning error: NonAtomic mode requires read-only single-key commands".to_owned(),
+                            ));
                         }
                     }
                     TransactionMode::LockAhead | TransactionMode::Global => {
@@ -1962,10 +1962,10 @@ mod tests {
     use dfly_cluster::slot::{SlotRange, key_slot};
     use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
-    use dfly_core::command::CommandFrame;
+    use dfly_core::command::{CommandFrame, CommandReply};
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
-    use dfly_transaction::plan::TransactionMode;
+    use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
     use googletest::prelude::*;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -3638,6 +3638,27 @@ mod tests {
             .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
             .collect::<Vec<_>>();
         assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
+    fn exec_non_atomic_execution_rejects_non_single_key_read_only_commands() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::NonAtomic,
+            hops: vec![TransactionHop {
+                per_shard: vec![(0, CommandFrame::new("PING", Vec::new()))],
+            }],
+        };
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![CommandReply::Error(
+                "transaction planning error: NonAtomic mode requires read-only single-key commands"
+                    .to_owned()
+            )])
+        );
     }
 
     #[rstest]
