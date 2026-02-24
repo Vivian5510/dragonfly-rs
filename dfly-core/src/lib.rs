@@ -265,8 +265,8 @@ impl CoreModule {
             let Ok(shard) = u16::try_from(shard_index) else {
                 continue;
             };
-            for (db, keyspace) in &state.db_kv {
-                for (key, value_entry) in keyspace {
+            for (db, table) in &state.db_tables {
+                for (key, value_entry) in &table.prime {
                     entries.push(SnapshotEntry {
                         shard,
                         db: *db,
@@ -303,7 +303,7 @@ impl CoreModule {
                     entry.shard
                 )));
             };
-            state.db_kv.entry(entry.db).or_default().insert(
+            state.db_tables.entry(entry.db).or_default().prime.insert(
                 entry.key.clone(),
                 ValueEntry {
                     value: entry.value.clone(),
@@ -367,7 +367,7 @@ impl CoreModule {
 
         let mut candidates = Vec::new();
         for state in &self.shard_states {
-            let Some(keyspace) = state.db_kv.get(&db) else {
+            let Some(keyspace) = state.db_tables.get(&db).map(|table| &table.prime) else {
                 continue;
             };
             for (key, value) in keyspace {
@@ -408,7 +408,7 @@ impl CoreModule {
         let mut matched = Vec::new();
 
         for state in &self.shard_states {
-            let Some(keyspace) = state.db_kv.get(&db) else {
+            let Some(keyspace) = state.db_tables.get(&db).map(|table| &table.prime) else {
                 continue;
             };
             for (key, value) in keyspace {

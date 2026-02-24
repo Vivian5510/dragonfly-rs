@@ -45,6 +45,7 @@ dependencies = [
 name = "dfly-core"
 version = "0.1.0"
 dependencies = [
+ "dfly-cluster",
  "dfly-common",
  "googletest",
  "rstest",

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dfly_cluster::slot::key_slot;
 use dfly_common::ids::DbIndex;
 
 use crate::command::{CommandFrame, CommandReply};
@@ -36,16 +37,30 @@ pub struct CommandSpec {
     pub handler: CommandHandler,
 }
 
+/// One logical DB table in the shard-local slice.
+///
+/// This shape mirrors Dragonfly's `DbTable` layering:
+/// - `prime`: main key/value dictionary (`PrimeTable` concept),
+/// - `expire`: expiration index (`ExpireTable` concept),
+/// - `slot_stats`: per-slot key cardinality used by slot-aware operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbTable {
+    /// Main key/value dictionary.
+    pub prime: HashMap<Vec<u8>, ValueEntry>,
+    /// Expiration index with absolute unix-second deadlines.
+    pub expire: HashMap<Vec<u8>, u64>,
+    /// Key cardinality by Redis cluster slot.
+    pub slot_stats: HashMap<u16, usize>,
+}
+
 /// Mutable execution state used by command handlers.
 ///
-/// The `kv` map is a minimal placeholder representing per-node key-value state.
-/// In later units this will be replaced by shard-aware storage and transaction views.
+/// Dragonfly keeps per-DB tables in one shard-local `DbSlice`. This learning implementation uses
+/// the same high-level structure and maintains a layered table per DB.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DispatchState {
-    /// In-memory key/value dictionary for learning-path command execution.
-    ///
-    /// First key is logical DB index (`SELECT`), second key is user key bytes.
-    pub db_kv: HashMap<DbIndex, HashMap<Vec<u8>, ValueEntry>>,
+    /// Per-DB layered tables in this shard.
+    pub db_tables: HashMap<DbIndex, DbTable>,
     /// Monotonic per-key versions used by optimistic transaction checks (`WATCH`).
     db_versions: HashMap<DbIndex, HashMap<Vec<u8>, u64>>,
 }
@@ -78,14 +93,65 @@ impl DispatchState {
         }
     }
 
+    /// Returns mutable table for one logical DB, creating it when missing.
+    fn db_table_mut(&mut self, db: DbIndex) -> &mut DbTable {
+        self.db_tables.entry(db).or_default()
+    }
+
+    /// Returns immutable table for one logical DB.
+    fn db_table(&self, db: DbIndex) -> Option<&DbTable> {
+        self.db_tables.get(&db)
+    }
+
     /// Returns mutable map for one logical DB, creating it when missing.
     fn db_map_mut(&mut self, db: DbIndex) -> &mut HashMap<Vec<u8>, ValueEntry> {
-        self.db_kv.entry(db).or_default()
+        &mut self.db_table_mut(db).prime
     }
 
     /// Returns immutable map for one logical DB.
     fn db_map(&self, db: DbIndex) -> Option<&HashMap<Vec<u8>, ValueEntry>> {
-        self.db_kv.get(&db)
+        self.db_table(db).map(|table| &table.prime)
+    }
+
+    /// Rebuilds expiration index and per-slot cardinality for one DB table.
+    ///
+    /// This keeps the layered table model consistent even while command handlers are still
+    /// written in terms of `prime` map updates.
+    fn rebuild_table_indexes(&mut self, db: DbIndex) {
+        let Some(table) = self.db_tables.get_mut(&db) else {
+            return;
+        };
+
+        table.expire.clear();
+        table.slot_stats.clear();
+        for (key, entry) in &table.prime {
+            if let Some(expire_at) = entry.expire_at_unix_secs {
+                let _ = table.expire.insert(key.clone(), expire_at);
+            }
+            let slot = key_slot(key);
+            let cardinality = table.slot_stats.entry(slot).or_default();
+            *cardinality = cardinality.saturating_add(1);
+        }
+    }
+
+    /// Rebuilds all DB table secondary indexes (`expire`, `slot_stats`).
+    fn rebuild_all_table_indexes(&mut self) {
+        let dbs = self.db_tables.keys().copied().collect::<Vec<_>>();
+        for db in dbs {
+            self.rebuild_table_indexes(db);
+        }
+    }
+
+    fn decrement_slot_stat(table: &mut DbTable, key: &[u8]) {
+        let slot = key_slot(key);
+        let mut should_remove = false;
+        if let Some(cardinality) = table.slot_stats.get_mut(&slot) {
+            *cardinality = cardinality.saturating_sub(1);
+            should_remove = *cardinality == 0;
+        }
+        if should_remove {
+            let _ = table.slot_stats.remove(&slot);
+        }
     }
 
     /// Returns tracked version for one key.
@@ -110,20 +176,23 @@ impl DispatchState {
     /// This keeps optimistic watch checks consistent after `LOAD`/snapshot import.
     pub fn mark_key_loaded(&mut self, db: DbIndex, key: &[u8]) {
         self.bump_key_version(db, key);
+        self.rebuild_table_indexes(db);
     }
 
     /// Removes one key when its expiration timestamp has already passed.
     fn purge_expired_key(&mut self, db: DbIndex, key: &[u8]) {
         let should_remove = self
-            .db_map(db)
-            .and_then(|map| map.get(key))
-            .and_then(|entry| entry.expire_at_unix_secs)
+            .db_table(db)
+            .and_then(|table| table.expire.get(key))
+            .copied()
             .is_some_and(|expire_at| expire_at <= Self::now_unix_seconds());
 
         if should_remove
-            && let Some(map) = self.db_kv.get_mut(&db)
-            && map.remove(key).is_some()
+            && let Some(table) = self.db_tables.get_mut(&db)
+            && table.prime.remove(key).is_some()
         {
+            let _ = table.expire.remove(key);
+            Self::decrement_slot_stat(table, key);
             self.bump_key_version(db, key);
         }
     }
@@ -138,7 +207,7 @@ impl DispatchState {
     ///
     /// Returns the number of removed keys.
     pub fn flush_db(&mut self, db: DbIndex) -> usize {
-        let Some(keyspace) = self.db_kv.get(&db) else {
+        let Some(keyspace) = self.db_tables.get(&db).map(|table| &table.prime) else {
             return 0;
         };
 
@@ -147,7 +216,7 @@ impl DispatchState {
         for key in &keys {
             self.bump_key_version(db, key);
         }
-        let _ = self.db_kv.remove(&db);
+        let _ = self.db_tables.remove(&db);
         removed
     }
 
@@ -158,8 +227,8 @@ impl DispatchState {
         let mut keys_per_db = Vec::new();
         let mut removed = 0_usize;
 
-        for (db, keyspace) in &self.db_kv {
-            let keys = keyspace.keys().cloned().collect::<Vec<_>>();
+        for (db, table) in &self.db_tables {
+            let keys = table.prime.keys().cloned().collect::<Vec<_>>();
             removed = removed.saturating_add(keys.len());
             keys_per_db.push((*db, keys));
         }
@@ -169,7 +238,7 @@ impl DispatchState {
                 self.bump_key_version(db, &key);
             }
         }
-        self.db_kv.clear();
+        self.db_tables.clear();
         removed
     }
 }
@@ -432,7 +501,10 @@ impl CommandRegistry {
         let Some(spec) = self.entries.get(&command_name) else {
             return CommandReply::Error(format!("unknown command '{command_name}'"));
         };
-        (spec.handler)(db, frame, state)
+        let reply = (spec.handler)(db, frame, state);
+        // Keep layered table indexes synchronized after each command execution.
+        state.rebuild_all_table_indexes();
+        reply
     }
 }
 
@@ -1630,8 +1702,66 @@ fn normalize_redis_range(start: i64, end: i64, len: usize) -> Option<(usize, usi
 mod tests {
     use super::{CommandRegistry, DispatchState};
     use crate::command::{CommandFrame, CommandReply};
+    use dfly_cluster::slot::key_slot;
     use googletest::prelude::*;
     use rstest::rstest;
+
+    #[rstest]
+    fn dispatch_rebuilds_expire_index_for_layered_db_table() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:expire:key".to_vec();
+
+        let set = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    key.clone(),
+                    b"value".to_vec(),
+                    b"EX".to_vec(),
+                    b"30".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table must exist after SET");
+        };
+        assert_that!(table.expire.contains_key(&key), eq(true));
+
+        let _ = registry.dispatch(0, &CommandFrame::new("DEL", vec![key.clone()]), &mut state);
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table should be kept after key deletion");
+        };
+        assert_that!(table.expire.contains_key(&key), eq(false));
+    }
+
+    #[rstest]
+    fn dispatch_rebuilds_slot_stats_for_layered_db_table() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:slot:key".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+            &mut state,
+        );
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table must exist after SET");
+        };
+        assert_that!(table.slot_stats.get(&slot).copied(), eq(Some(1_usize)));
+
+        let _ = registry.dispatch(0, &CommandFrame::new("DEL", vec![key.clone()]), &mut state);
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table should be kept after key deletion");
+        };
+        assert_that!(table.slot_stats.get(&slot).copied(), eq(None));
+    }
 
     #[rstest]
     fn dispatch_ping_and_echo() {
