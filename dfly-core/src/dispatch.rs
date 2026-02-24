@@ -96,6 +96,13 @@ impl DispatchState {
         versions.insert(key.to_vec(), next);
     }
 
+    /// Marks one key as loaded from snapshot and advances its mutation version.
+    ///
+    /// This keeps optimistic watch checks consistent after `LOAD`/snapshot import.
+    pub fn mark_key_loaded(&mut self, db: DbIndex, key: &[u8]) {
+        self.bump_key_version(db, key);
+    }
+
     /// Removes one key when its expiration timestamp has already passed.
     fn purge_expired_key(&mut self, db: DbIndex, key: &[u8]) {
         let should_remove = self

@@ -3317,6 +3317,62 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_watch_aborts_exec_when_dfly_load_creates_watched_key() {
+        let path = unique_test_snapshot_path("watch-load-abort");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+
+        let mut source = ServerApp::new(RuntimeConfig::default());
+        let mut source_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_conn,
+                &resp_command(&[b"SET", b"load:watch:key", b"seed"]),
+            )
+            .expect("seed key should be created for snapshot");
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_conn,
+                &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
+            )
+            .expect("DFLY SAVE should succeed");
+
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut admin_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                &resp_command(&[b"WATCH", b"load:watch:key"]),
+            )
+            .expect("WATCH should succeed");
+        let load_reply = app
+            .feed_connection_bytes(
+                &mut admin_conn,
+                &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+            )
+            .expect("DFLY LOAD should execute");
+        assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                &resp_command(&[b"SET", b"load:watch:key", b"mine"]),
+            )
+            .expect("SET should queue");
+
+        let exec_reply = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(&exec_reply, eq(&vec![b"*-1\r\n".to_vec()]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[rstest]
     fn dfly_load_reports_missing_file_error() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut conn = ServerApp::new_connection(ClientProtocol::Resp);

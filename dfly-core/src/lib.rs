@@ -140,6 +140,7 @@ impl CoreModule {
                     expire_at_unix_secs: entry.expire_at_unix_secs,
                 },
             );
+            state.mark_key_loaded(entry.db, &entry.key);
         }
         Ok(())
     }
@@ -262,6 +263,24 @@ mod tests {
         let db2_get = restored.execute_in_db(2, &CommandFrame::new("GET", vec![b"user".to_vec()]));
         assert_that!(&db0_get, eq(&CommandReply::BulkString(b"alice".to_vec())));
         assert_that!(&db2_get, eq(&CommandReply::BulkString(b"bob".to_vec())));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_marks_loaded_keys_as_versioned() {
+        let mut source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let key = b"loaded:key".to_vec();
+        let _ = source.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+        );
+        let snapshot = source.export_snapshot();
+
+        let mut restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        restored
+            .import_snapshot(&snapshot)
+            .expect("snapshot import should succeed");
+
+        assert_that!(restored.key_version(0, &key), eq(1_u64));
     }
 
     #[rstest]
