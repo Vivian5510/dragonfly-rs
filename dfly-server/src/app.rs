@@ -438,6 +438,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_info(&self, frame: &CommandFrame) -> CommandReply {
+        use std::fmt::Write as _;
+
         if frame.args.len() > 1 {
             return CommandReply::Error("wrong number of arguments for 'INFO' command".to_owned());
         }
@@ -456,13 +458,22 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error(format!("unsupported INFO section '{section}'"));
         }
 
-        let info = format!(
+        let mut info = format!(
             "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\nlast_ack_lsn:{}\r\n",
             self.replication.connected_replicas(),
             self.replication.master_replid(),
             self.replication.replication_offset(),
             self.replication.last_acked_lsn(),
         );
+        for (index, (address, port, state, lag)) in
+            self.replication.replica_info_rows().into_iter().enumerate()
+        {
+            write!(
+                info,
+                "slave{index}:ip={address},port={port},state={state},lag={lag}\r\n"
+            )
+            .expect("writing to String should not fail");
+        }
         CommandReply::BulkString(info.into_bytes())
     }
 
@@ -1910,6 +1921,63 @@ mod tests {
             .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
             .expect("WAIT should execute");
         assert_that!(&wait_two, eq(&vec![b":2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_info_replication_reports_per_replica_state_and_lag() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[
+                    b"REPLCONF",
+                    b"LISTENING-PORT",
+                    b"7001",
+                    b"IP-ADDRESS",
+                    b"10.0.0.1",
+                ]),
+            )
+            .expect("replica1 REPLCONF endpoint registration should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica2,
+                &resp_command(&[
+                    b"REPLCONF",
+                    b"LISTENING-PORT",
+                    b"7002",
+                    b"IP-ADDRESS",
+                    b"10.0.0.2",
+                ]),
+            )
+            .expect("replica2 REPLCONF endpoint registration should succeed");
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut client,
+                &resp_command(&[b"SET", b"info:replica:key", b"value"]),
+            )
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica1 ACK should parse");
+
+        let info = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:2\r\n"), eq(true));
+        assert_that!(
+            body.contains("slave0:ip=10.0.0.1,port=7001,state=stable_sync,lag=0\r\n"),
+            eq(true)
+        );
+        assert_that!(
+            body.contains("slave1:ip=10.0.0.2,port=7002,state=preparation,lag=1\r\n"),
+            eq(true)
+        );
     }
 
     #[rstest]

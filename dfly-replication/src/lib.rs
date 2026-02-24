@@ -124,6 +124,24 @@ impl ReplicationModule {
             .collect()
     }
 
+    /// Returns `INFO REPLICATION` rows: `(address, port, state, lag)`.
+    #[must_use]
+    pub fn replica_info_rows(&self) -> Vec<(String, u16, &'static str, u64)> {
+        let current_offset = self.replication_offset();
+        self.state
+            .replicas
+            .iter()
+            .map(|replica| {
+                (
+                    replica.address.clone(),
+                    replica.listening_port,
+                    replica.state.as_role_state(),
+                    current_offset.saturating_sub(replica.last_acked_lsn),
+                )
+            })
+            .collect()
+    }
+
     /// Records one replica ACK offset for a specific endpoint.
     ///
     /// Returns `false` when endpoint is not registered.
