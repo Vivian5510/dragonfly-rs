@@ -41,6 +41,7 @@ pub trait ShardRuntime: Send + Sync {
 /// The design mirrors Dragonfly's shared-nothing execution boundary:
 /// each shard owns a queue and a dedicated execution domain. This unit keeps
 /// execution payload minimal by recording envelopes into per-shard logs.
+#[derive(Debug)]
 pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
     senders: Vec<mpsc::Sender<RuntimeEnvelope>>,
@@ -50,11 +51,8 @@ pub struct InMemoryShardRuntime {
 
 impl InMemoryShardRuntime {
     /// Creates one runtime with one worker thread per shard.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Io` when spawning one worker thread fails.
-    pub fn new(shard_count: ShardCount) -> DflyResult<Self> {
+    #[must_use]
+    pub fn new(shard_count: ShardCount) -> Self {
         let shard_len = usize::from(shard_count.get());
         let executed_per_shard = Arc::new(
             (0..shard_len)
@@ -69,20 +67,16 @@ impl InMemoryShardRuntime {
             senders.push(sender);
 
             let executed = Arc::clone(&executed_per_shard);
-            let worker_name = format!("dfly-shard-runtime-{shard}");
-            let handle = thread::Builder::new()
-                .name(worker_name)
-                .spawn(move || shard_worker_loop(shard, receiver, &executed))
-                .map_err(|error| DflyError::Io(error.to_string()))?;
+            let handle = thread::spawn(move || shard_worker_loop(shard, receiver, &executed));
             workers.push(handle);
         }
 
-        Ok(Self {
+        Self {
             shard_count,
             senders,
             executed_per_shard,
             workers,
-        })
+        }
     }
 
     /// Returns and clears all processed envelopes for one shard.
@@ -195,8 +189,7 @@ mod tests {
 
     #[rstest]
     fn runtime_rejects_out_of_range_target_shard() {
-        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"))
-            .expect("runtime should initialize");
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
         let envelope = RuntimeEnvelope {
             target_shard: 2,
             command: CommandFrame::new("PING", Vec::new()),
@@ -208,8 +201,7 @@ mod tests {
 
     #[rstest]
     fn runtime_dispatches_to_target_shard_worker() {
-        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"))
-            .expect("runtime should initialize");
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
         let envelope = RuntimeEnvelope {
             target_shard: 1,
             command: CommandFrame::new("GET", vec![b"k".to_vec()]),
@@ -231,8 +223,7 @@ mod tests {
 
     #[rstest]
     fn runtime_keeps_processed_logs_isolated_between_shards() {
-        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"))
-            .expect("runtime should initialize");
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
 
         let shard_zero = RuntimeEnvelope {
             target_shard: 0,

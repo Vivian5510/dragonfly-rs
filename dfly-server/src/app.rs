@@ -9,6 +9,7 @@ use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
 use dfly_core::CoreModule;
 use dfly_core::command::{CommandFrame, CommandReply};
+use dfly_core::runtime::{InMemoryShardRuntime, RuntimeEnvelope, ShardRuntime};
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
@@ -36,6 +37,8 @@ pub struct ServerApp {
     pub facade: FacadeModule,
     /// Core routing and command model layer.
     pub core: CoreModule,
+    /// Shard-thread runtime queue layer.
+    pub runtime: InMemoryShardRuntime,
     /// Transaction planner/scheduler layer.
     pub transaction: TransactionModule,
     /// Storage layer.
@@ -58,6 +61,7 @@ impl ServerApp {
     pub fn new(config: RuntimeConfig) -> Self {
         let facade = FacadeModule::from_config(&config);
         let core = CoreModule::new(config.shard_count);
+        let runtime = InMemoryShardRuntime::new(config.shard_count);
         let transaction = TransactionModule::new();
         let storage = StorageModule::new();
         let replication = ReplicationModule::new(true);
@@ -69,6 +73,7 @@ impl ServerApp {
             config,
             facade,
             core,
+            runtime,
             transaction,
             storage,
             replication,
@@ -581,7 +586,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     fn execute_transaction_plan(&mut self, db: u16, plan: &TransactionPlan) -> Vec<CommandReply> {
         let mut replies = Vec::new();
         for hop in &plan.hops {
-            for (_, command) in &hop.per_shard {
+            for (shard, command) in &hop.per_shard {
                 match plan.mode {
                     TransactionMode::NonAtomic => {
                         if matches!(
@@ -596,12 +601,27 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                         }
                     }
                     TransactionMode::LockAhead | TransactionMode::Global => {
+                        if let Err(error) = self.submit_runtime_envelope(*shard, command) {
+                            replies.push(CommandReply::Error(format!(
+                                "runtime dispatch failed: {error}"
+                            )));
+                            continue;
+                        }
                         replies.push(self.execute_user_command(db, command, Some(plan.txid)));
                     }
                 }
             }
         }
         replies
+    }
+
+    fn submit_runtime_envelope(&self, shard: u16, command: &CommandFrame) -> DflyResult<()> {
+        // Dragonfly routes each hop command to its owner shard queue before execution.
+        // This learning path keeps execution local for now, while still modeling queue ingress.
+        self.runtime.submit(RuntimeEnvelope {
+            target_shard: shard,
+            command: command.clone(),
+        })
     }
 
     fn execute_user_command(
@@ -1969,7 +1989,7 @@ mod tests {
     use googletest::prelude::*;
     use rstest::rstest;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[rstest]
     fn resp_connection_executes_set_then_get() {
@@ -3638,6 +3658,85 @@ mod tests {
             .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
             .collect::<Vec<_>>();
         assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
+    fn exec_plan_dispatches_lockahead_commands_into_runtime_queues() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+
+        let first_key = b"plan:rt:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"plan:rt:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("plan:rt:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let queued = vec![
+            CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+            CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        ];
+        let plan = app.build_exec_plan(&queued);
+        assert_that!(plan.mode, eq(TransactionMode::LockAhead));
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![
+                CommandReply::SimpleString("OK".to_owned()),
+                CommandReply::SimpleString("OK".to_owned()),
+            ])
+        );
+
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let first_runtime = app
+            .runtime
+            .drain_processed_for_shard(first_shard)
+            .expect("drain should succeed");
+        let second_runtime = app
+            .runtime
+            .drain_processed_for_shard(second_shard)
+            .expect("drain should succeed");
+        assert_that!(first_runtime.len(), eq(1_usize));
+        assert_that!(second_runtime.len(), eq(1_usize));
+        assert_that!(&first_runtime[0].command, eq(&queued[0]));
+        assert_that!(&second_runtime[0].command, eq(&queued[1]));
+    }
+
+    #[rstest]
+    fn exec_plan_non_atomic_does_not_enqueue_runtime_commands() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"plan:rt:readonly".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::NonAtomic,
+            hops: vec![TransactionHop {
+                per_shard: vec![(shard, CommandFrame::new("GET", vec![key]))],
+            }],
+        };
+
+        let _ = app.execute_transaction_plan(0, &plan);
+        let runtime = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+        assert_that!(&runtime, eq(&Vec::new()));
     }
 
     #[rstest]
