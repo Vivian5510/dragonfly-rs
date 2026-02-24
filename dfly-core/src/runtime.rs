@@ -1,6 +1,5 @@
 //! Runtime envelopes for coordinator-to-shard dispatch.
 
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -8,6 +7,9 @@ use std::time::Duration;
 use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::{DbIndex, ShardCount, ShardId};
+use tokio::runtime::Builder as TokioBuilder;
+use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 
 use crate::command::{CommandFrame, CommandReply};
 
@@ -64,9 +66,13 @@ pub trait ShardRuntime: Send + Sync {
 /// The design mirrors Dragonfly's shared-nothing execution boundary:
 /// each shard owns a queue and a dedicated execution domain. This unit keeps
 /// execution payload minimal by recording envelopes into per-shard logs.
+///
+/// Unlike the initial blocking-loop version, each shard thread now hosts a
+/// coroutine executor (`tokio` current-thread runtime + `LocalSet`) so command
+/// execution can follow Dragonfly's "thread + fiber" shape.
 pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
-    senders: Vec<mpsc::Sender<QueuedEnvelope>>,
+    senders: Vec<mpsc::UnboundedSender<QueuedEnvelope>>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
     submitted_sequence_per_shard: Vec<Mutex<u64>>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -119,13 +125,15 @@ impl InMemoryShardRuntime {
         let mut senders = Vec::with_capacity(shard_len);
         let mut workers = Vec::with_capacity(shard_len);
         for shard in 0..shard_len {
-            let (sender, receiver) = mpsc::channel::<QueuedEnvelope>();
+            // Coordinator-to-shard ingress stays lock-free and per-shard, same
+            // ownership boundary as Dragonfly's per-engine-shard dispatch.
+            let (sender, receiver) = mpsc::unbounded_channel::<QueuedEnvelope>();
             senders.push(sender);
 
             let execution = Arc::clone(&execution_per_shard);
             let shard_executor = Arc::clone(&executor);
             let handle = thread::spawn(move || {
-                shard_worker_loop(shard, receiver, &execution, &*shard_executor);
+                shard_worker_thread_main(shard, receiver, execution, shard_executor);
             });
             workers.push(handle);
         }
@@ -305,13 +313,30 @@ impl Drop for InMemoryShardRuntime {
     }
 }
 
-fn shard_worker_loop(
+fn shard_worker_thread_main(
     shard: usize,
-    receiver: mpsc::Receiver<QueuedEnvelope>,
-    execution_per_shard: &[ShardExecutionState],
-    executor: &RuntimeExecutor,
+    mut receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
+    execution_per_shard: Arc<Vec<ShardExecutionState>>,
+    executor: Arc<RuntimeExecutor>,
 ) {
-    for queued in receiver {
+    let Ok(runtime) = TokioBuilder::new_current_thread().build() else {
+        // Keep failure mode contained to this worker thread. Producers will
+        // observe a closed queue through `submit_with_sequence`.
+        return;
+    };
+    let local_set = LocalSet::new();
+    runtime.block_on(local_set.run_until(async move {
+        shard_worker_loop_async(shard, &mut receiver, &execution_per_shard, &executor).await;
+    }));
+}
+
+async fn shard_worker_loop_async(
+    shard: usize,
+    receiver: &mut mpsc::UnboundedReceiver<QueuedEnvelope>,
+    execution_per_shard: &[ShardExecutionState],
+    executor: &Arc<RuntimeExecutor>,
+) {
+    while let Some(queued) = receiver.recv().await {
         let envelope = queued.envelope;
         // Keep one explicit shard check so the queue ownership contract is visible
         // and invalid routing data does not pollute another shard log.
@@ -319,8 +344,18 @@ fn shard_worker_loop(
             continue;
         }
 
+        // Dragonfly executes transaction/dispatch callbacks inside fibers running
+        // on shard-owned threads. Spawning a local task here keeps that boundary:
+        // queue consumer coroutine -> command coroutine within same shard thread.
         let reply = if envelope.execute_on_worker {
-            executor(&envelope)
+            let envelope_for_fiber = envelope.clone();
+            let executor_for_fiber = Arc::clone(executor);
+            match tokio::task::spawn_local(async move { executor_for_fiber(&envelope_for_fiber) })
+                .await
+            {
+                Ok(reply) => reply,
+                Err(_join_error) => CommandReply::Error("runtime worker fiber failed".to_owned()),
+            }
         } else {
             CommandReply::SimpleString("QUEUED".to_owned())
         };
@@ -561,6 +596,41 @@ mod tests {
         assert_that!(
             &reply,
             eq(&Some(CommandReply::BulkString(b"db7:1:GET".to_vec())))
+        );
+    }
+
+    #[rstest]
+    fn runtime_worker_executor_panic_isolated_by_fiber_boundary() {
+        let runtime = InMemoryShardRuntime::new_with_executor(
+            ShardCount::new(2).expect("count should be valid"),
+            |_envelope| {
+                panic!("expected panic from test executor");
+            },
+        );
+
+        let sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                db: 7,
+                execute_on_worker: true,
+                command: CommandFrame::new("GET", vec![b"k".to_vec()]),
+            })
+            .expect("submission should succeed");
+        assert_that!(
+            runtime
+                .wait_for_processed_sequence(1, sequence, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let reply = runtime
+            .take_processed_reply(1, sequence)
+            .expect("reply fetch should succeed");
+        assert_that!(
+            &reply,
+            eq(&Some(CommandReply::Error(
+                "runtime worker fiber failed".to_owned()
+            )))
         );
     }
 }
