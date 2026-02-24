@@ -20,7 +20,7 @@ impl SlotRange {
 }
 
 /// Simple slot ownership router placeholder.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotRouter {
     owned: Vec<SlotRange>,
 }

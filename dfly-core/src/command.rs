@@ -38,6 +38,13 @@ pub enum CommandReply {
     Array(Vec<CommandReply>),
     /// RESP null array (`*-1`) used by `EXEC` abort on watched key changes.
     NullArray,
+    /// RESP MOVED redirection (`-MOVED <slot> <endpoint>`).
+    Moved {
+        /// Redirect slot id.
+        slot: u16,
+        /// Target endpoint host:port.
+        endpoint: String,
+    },
     /// `-ERR ...` style error.
     Error(String),
 }
@@ -71,6 +78,7 @@ impl CommandReply {
                 output
             }
             Self::NullArray => b"*-1\r\n".to_vec(),
+            Self::Moved { slot, endpoint } => format!("-MOVED {slot} {endpoint}\r\n").into_bytes(),
             Self::Error(message) => {
                 let mut output = Vec::with_capacity(message.len() + 6);
                 output.extend_from_slice(b"-ERR ");

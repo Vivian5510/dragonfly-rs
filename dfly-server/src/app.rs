@@ -373,8 +373,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "CLUSTER" => Self::execute_cluster(frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
+            "GET" | "SET" | "EXPIRE" | "TTL" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
+    }
+
+    fn execute_key_command(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        let Some(key) = frame.args.first() else {
+            return self.core.execute_in_db(db, frame);
+        };
+        if let Some(moved) = self.cluster_moved_reply_for_key(key) {
+            return moved;
+        }
+        self.core.execute_in_db(db, frame)
     }
 
     fn execute_cluster(frame: &CommandFrame) -> CommandReply {
@@ -407,7 +418,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
         }
         if let Some(error_reply) =
-            self.ensure_cluster_single_slot(frame.args.iter().map(Vec::as_slice))
+            self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
         {
             return error_reply;
         }
@@ -427,9 +438,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
         }
-        if let Some(error_reply) = self
-            .ensure_cluster_single_slot(frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()))
-        {
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(
+            frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()),
+        ) {
             return error_reply;
         }
 
@@ -443,7 +454,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn ensure_cluster_single_slot<'a, I>(&self, keys: I) -> Option<CommandReply>
+    fn ensure_cluster_multi_key_constraints<'a, I>(&self, keys: I) -> Option<CommandReply>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
@@ -453,6 +464,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let mut key_iter = keys.into_iter();
         let first_key = key_iter.next()?;
+        if let Some(moved) = self.cluster_moved_reply_for_key(first_key) {
+            return Some(moved);
+        }
         let first_slot = key_slot(first_key);
         if key_iter.any(|key| key_slot(key) != first_slot) {
             return Some(CommandReply::Error(
@@ -460,6 +474,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             ));
         }
         None
+    }
+
+    fn cluster_moved_reply_for_key(&self, key: &[u8]) -> Option<CommandReply> {
+        self.cluster
+            .moved_slot_for_key(key)
+            .map(|slot| CommandReply::Moved {
+                slot,
+                endpoint: self.cluster.redirect_endpoint.clone(),
+            })
     }
 
     fn replay_journal_entries(&mut self, entries: &[JournalEntry]) -> DflyResult<usize> {
@@ -632,6 +655,9 @@ fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
         }
         (_, CommandReply::Array(_)) => b"ERROR unsupported array reply\r\n".to_vec(),
         (_, CommandReply::NullArray) => b"ERROR unsupported null array reply\r\n".to_vec(),
+        (_, CommandReply::Moved { slot, endpoint }) => {
+            format!("ERROR MOVED {slot} {endpoint}\r\n").into_bytes()
+        }
         (_, CommandReply::Null) => b"END\r\n".to_vec(),
         (_, CommandReply::Error(message)) => format!("ERROR {message}\r\n").into_bytes(),
     }
@@ -660,7 +686,7 @@ pub fn run() -> DflyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::ServerApp;
-    use dfly_cluster::slot::key_slot;
+    use dfly_cluster::slot::{SlotRange, key_slot};
     use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
     use dfly_facade::protocol::ClientProtocol;
@@ -1208,6 +1234,35 @@ mod tests {
                 b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn cluster_mode_redirects_unowned_single_key_command_with_moved() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let key = b"user:{42}";
+        let slot = key_slot(key);
+        let owned = if slot == 0 {
+            SlotRange { start: 1, end: 100 }
+        } else {
+            SlotRange {
+                start: 0,
+                end: slot - 1,
+            }
+        };
+        app.cluster.set_owned_ranges(vec![owned]);
+
+        let command = resp_command(&[b"GET", key]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &command)
+            .expect("GET should parse");
+        let expected = vec![format!("-MOVED {slot} 127.0.0.1:7000\r\n").into_bytes()];
+        assert_that!(&reply, eq(&expected));
     }
 
     #[rstest]
