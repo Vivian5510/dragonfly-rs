@@ -428,6 +428,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         match frame.name.as_str() {
             "INFO" => self.execute_info(frame),
             "ROLE" => self.execute_role(frame),
+            "READONLY" => Self::execute_readonly(frame),
+            "READWRITE" => self.execute_readwrite(frame),
             "PSYNC" => self.execute_psync(frame),
             "WAIT" => self.execute_wait(frame),
             "CLUSTER" => self.execute_cluster(frame),
@@ -477,6 +479,29 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             .expect("writing to String should not fail");
         }
         CommandReply::BulkString(info.into_bytes())
+    }
+
+    fn execute_readonly(frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'READONLY' command".to_owned(),
+            );
+        }
+        CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_readwrite(&self, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'READWRITE' command".to_owned(),
+            );
+        }
+        if self.cluster.mode != ClusterMode::Emulated {
+            return CommandReply::Error(
+                "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
+            );
+        }
+        CommandReply::SimpleString("OK".to_owned())
     }
 
     fn execute_role(&self, frame: &CommandFrame) -> CommandReply {
@@ -2743,6 +2768,43 @@ mod tests {
                 b"-ERR Cluster is disabled. Use --cluster_mode=yes to enable.\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn resp_readonly_returns_ok() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"READONLY"]))
+            .expect("READONLY should execute");
+        assert_that!(&reply, eq(&vec![b"+OK\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_readwrite_requires_cluster_emulated_mode() {
+        let mut disabled = ServerApp::new(RuntimeConfig::default());
+        let mut disabled_connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let disabled_reply = disabled
+            .feed_connection_bytes(&mut disabled_connection, &resp_command(&[b"READWRITE"]))
+            .expect("READWRITE should parse");
+        assert_that!(
+            &disabled_reply,
+            eq(&vec![
+                b"-ERR Cluster is disabled. Use --cluster_mode=yes to enable.\r\n".to_vec()
+            ])
+        );
+
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut emulated = ServerApp::new(config);
+        let mut emulated_connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let emulated_reply = emulated
+            .feed_connection_bytes(&mut emulated_connection, &resp_command(&[b"READWRITE"]))
+            .expect("READWRITE should execute in emulated mode");
+        assert_that!(&emulated_reply, eq(&vec![b"+OK\r\n".to_vec()]));
     }
 
     #[rstest]
