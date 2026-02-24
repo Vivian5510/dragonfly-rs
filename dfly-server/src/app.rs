@@ -600,9 +600,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
-            "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "GETRANGE" | "SETRANGE"
-            | "EXPIRE" | "EXPIREAT" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
-            | "SETNX" => self.execute_key_command(db, frame),
+            "GET" | "SET" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "GETRANGE"
+            | "SETRANGE" | "EXPIRE" | "EXPIREAT" | "TTL" | "PERSIST" | "INCR" | "DECR"
+            | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1584,6 +1584,7 @@ fn parse_flow_lsn_vector_for_flow(
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("SETEX", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("SETNX" | "MSETNX", CommandReply::Integer(1))
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
         | ("GETDEL", CommandReply::BulkString(_))
@@ -1940,6 +1941,44 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"ttl:key"]))
             .expect("GET should execute");
         assert_that!(&value, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_setex_sets_value_with_ttl_and_rejects_non_positive_ttl() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let ok = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"session", b"60", b"alive"]),
+            )
+            .expect("SETEX should execute");
+        assert_that!(&ok, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"session"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$5\r\nalive\r\n".to_vec()]));
+
+        let ttl = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"session"]))
+            .expect("TTL should execute");
+        let ttl_value = parse_resp_integer(&ttl[0]);
+        assert_that!(ttl_value > 0, eq(true));
+
+        let bad = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"session", b"0", b"alive"]),
+            )
+            .expect("SETEX should parse");
+        assert_that!(
+            &bad,
+            eq(&vec![
+                b"-ERR invalid expire time in 'SETEX' command\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]
@@ -2682,6 +2721,33 @@ mod tests {
         assert_that!(
             app.replication.journal_entries()[0].op,
             eq(JournalOp::Command),
+        );
+    }
+
+    #[rstest]
+    fn journal_records_setex_only_for_successful_updates() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"k", b"10", b"v"]),
+            )
+            .expect("SETEX should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"k", b"0", b"v"]),
+            )
+            .expect("SETEX should parse");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(1_usize));
+        assert_that!(entries[0].op, eq(JournalOp::Command));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("SETEX"),
+            eq(true)
         );
     }
 

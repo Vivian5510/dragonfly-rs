@@ -264,6 +264,11 @@ impl CommandRegistry {
 
     fn register_expiry_commands(&mut self) {
         self.register(CommandSpec {
+            name: "SETEX",
+            arity: CommandArity::Exact(3),
+            handler: handle_setex,
+        });
+        self.register(CommandSpec {
             name: "EXPIRE",
             arity: CommandArity::Exact(2),
             handler: handle_expire,
@@ -574,6 +579,30 @@ fn handle_exists(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     }
 
     CommandReply::Integer(existing)
+}
+
+fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let Ok(seconds) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    if seconds <= 0 {
+        return CommandReply::Error("invalid expire time in 'SETEX' command".to_owned());
+    }
+    let Ok(expire_delta) = u64::try_from(seconds) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let expire_at = DispatchState::now_unix_seconds().saturating_add(expire_delta);
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value: frame.args[2].clone(),
+            expire_at_unix_secs: Some(expire_at),
+        },
+    );
+    state.bump_key_version(db, &key);
+    CommandReply::SimpleString("OK".to_owned())
 }
 
 fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -1281,6 +1310,60 @@ mod tests {
             &mut state,
         );
         assert_that!(&reply, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_setex_sets_value_and_ttl() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let setex = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETEX",
+                vec![b"session".to_vec(), b"60".to_vec(), b"alive".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&setex, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"session".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"alive".to_vec())));
+
+        let ttl = registry.dispatch(
+            0,
+            &CommandFrame::new("TTL", vec![b"session".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(ttl_secs) = ttl else {
+            panic!("TTL must return integer");
+        };
+        assert_that!(ttl_secs > 0, eq(true));
+    }
+
+    #[rstest]
+    fn dispatch_setex_rejects_non_positive_expire_values() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let reply = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETEX",
+                vec![b"session".to_vec(), b"0".to_vec(), b"alive".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &reply,
+            eq(&CommandReply::Error(
+                "invalid expire time in 'SETEX' command".to_owned()
+            ))
+        );
     }
 
     #[rstest]
