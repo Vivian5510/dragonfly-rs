@@ -251,6 +251,11 @@ impl ServerApp {
                 return reply;
             }
 
+            if let Some(reply) = self.execute_multi_key_counting_command_via_runtime(db, frame) {
+                self.maybe_append_journal_for_command(txid, db, frame, &reply);
+                return reply;
+            }
+
             match self.dispatch_direct_command_runtime(db, frame) {
                 Ok(()) => {}
                 Err(error) => {
@@ -262,6 +267,39 @@ impl ServerApp {
         let reply = self.execute_command_without_side_effects(db, frame);
         self.maybe_append_journal_for_command(txid, db, frame, &reply);
         reply
+    }
+
+    pub(super) fn execute_multi_key_counting_command_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> Option<CommandReply> {
+        if !matches!(frame.name.as_str(), "DEL" | "UNLINK" | "EXISTS" | "TOUCH")
+            || frame.args.len() <= 1
+        {
+            return None;
+        }
+
+        let mut total = 0_i64;
+        for key in &frame.args {
+            let single_key_frame = CommandFrame::new(frame.name.as_str(), vec![key.clone()]);
+            let reply = self.execute_single_shard_command_via_runtime(db, &single_key_frame);
+            match reply {
+                CommandReply::Integer(delta) => {
+                    total = total.saturating_add(delta.max(0));
+                }
+                CommandReply::Moved { .. } | CommandReply::Error(_) => {
+                    return Some(reply);
+                }
+                _ => {
+                    return Some(CommandReply::Error(format!(
+                        "internal error: {} did not return integer reply",
+                        frame.name
+                    )));
+                }
+            }
+        }
+        Some(CommandReply::Integer(total))
     }
 
     pub(super) fn execute_single_shard_command_via_runtime(

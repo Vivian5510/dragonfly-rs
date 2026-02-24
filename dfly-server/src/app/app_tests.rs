@@ -2050,6 +2050,78 @@ fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
 }
 
 #[rstest]
+fn direct_del_multikey_executes_each_key_on_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"direct:rt:del:1".to_vec();
+    let first_shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"direct:rt:del:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard == first_shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("direct:rt:del:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let set_first = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+        None,
+    );
+    let set_second = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        None,
+    );
+    assert_that!(&set_first, eq(&CommandReply::SimpleString("OK".to_owned())));
+    assert_that!(
+        &set_second,
+        eq(&CommandReply::SimpleString("OK".to_owned()))
+    );
+
+    for shard in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+    }
+
+    let frame = CommandFrame::new("DEL", vec![first_key.clone(), second_key.clone()]);
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::Integer(2)));
+
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let first_runtime = app
+        .runtime
+        .drain_processed_for_shard(first_shard)
+        .expect("drain should succeed");
+    let second_runtime = app
+        .runtime
+        .drain_processed_for_shard(second_shard)
+        .expect("drain should succeed");
+    assert_that!(first_runtime.len(), eq(1_usize));
+    assert_that!(second_runtime.len(), eq(1_usize));
+    assert_that!(&first_runtime[0].command.name, eq(&"DEL".to_owned()));
+    assert_that!(&second_runtime[0].command.name, eq(&"DEL".to_owned()));
+    assert_that!(&first_runtime[0].command.args, eq(&vec![first_key]));
+    assert_that!(&second_runtime[0].command.args, eq(&vec![second_key]));
+    assert_that!(first_runtime[0].execute_on_worker, eq(true));
+    assert_that!(second_runtime[0].execute_on_worker, eq(true));
+}
+
+#[rstest]
 fn direct_mset_with_odd_arity_does_not_dispatch_runtime() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let frame = CommandFrame::new(
