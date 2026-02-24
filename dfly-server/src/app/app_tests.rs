@@ -6244,6 +6244,58 @@ fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command(
     assert_that!(second_runtime.len(), eq(1_usize));
     assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
     assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
+    assert_that!(first_runtime[0].execute_on_worker, eq(false));
+    assert_that!(second_runtime[0].execute_on_worker, eq(false));
+}
+
+#[rstest]
+fn journal_replay_executes_same_shard_multikey_command_on_worker() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"journal:rt:mset:same:1".to_vec();
+    let shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"journal:rt:mset:same:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("journal:rt:mset:same:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
+    app.replication.append_journal(JournalEntry {
+        txid: 1,
+        db: 0,
+        op: JournalOp::Command,
+        payload,
+    });
+
+    let applied = app
+        .recover_from_replication_journal()
+        .expect("journal replay should succeed");
+    assert_that!(applied, eq(1_usize));
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command.name, eq(&"MSET".to_owned()));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let first_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![first_key.clone()]));
+    let second_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![second_key.clone()]));
+    assert_that!(&first_value, eq(&CommandReply::BulkString(b"a".to_vec())));
+    assert_that!(&second_value, eq(&CommandReply::BulkString(b"b".to_vec())));
 }
 
 #[rstest]
