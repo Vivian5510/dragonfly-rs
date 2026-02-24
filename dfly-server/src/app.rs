@@ -1975,7 +1975,7 @@ mod tests {
             eq(true)
         );
         assert_that!(
-            body.contains("slave1:ip=10.0.0.2,port=7002,state=preparation,lag=1\r\n"),
+            body.contains("slave1:ip=10.0.0.2,port=7002,state=preparation,lag=0\r\n"),
             eq(true)
         );
     }

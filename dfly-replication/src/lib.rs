@@ -132,11 +132,16 @@ impl ReplicationModule {
             .replicas
             .iter()
             .map(|replica| {
+                let lag = if replica.state == ReplicaSyncState::StableSync {
+                    current_offset.saturating_sub(replica.last_acked_lsn)
+                } else {
+                    0
+                };
                 (
                     replica.address.clone(),
                     replica.listening_port,
                     replica.state.as_role_state(),
-                    current_offset.saturating_sub(replica.last_acked_lsn),
+                    lag,
                 )
             })
             .collect()
