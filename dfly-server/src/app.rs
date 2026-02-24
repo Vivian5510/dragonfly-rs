@@ -600,8 +600,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
-            "GET" | "SET" | "GETSET" | "GETDEL" | "EXPIRE" | "TTL" | "PERSIST" | "INCR"
-            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
+            "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "EXPIRE" | "TTL"
+            | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
+                self.execute_key_command(db, frame)
+            }
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1585,7 +1587,8 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("SETNX" | "MSETNX", CommandReply::Integer(1))
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
-        | ("GETDEL", CommandReply::BulkString(_)) => Some(JournalOp::Command),
+        | ("GETDEL", CommandReply::BulkString(_))
+        | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -2032,6 +2035,32 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
             .expect("GETDEL should execute");
         assert_that!(&missing, eq(&vec![b"$-1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_append_and_strlen_track_string_size() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"he"]))
+            .expect("first APPEND should execute");
+        assert_that!(&first, eq(&vec![b":2\r\n".to_vec()]));
+
+        let second = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"llo"]))
+            .expect("second APPEND should execute");
+        assert_that!(&second, eq(&vec![b":5\r\n".to_vec()]));
+
+        let strlen = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"STRLEN", b"k"]))
+            .expect("STRLEN should execute");
+        assert_that!(&strlen, eq(&vec![b":5\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$5\r\nhello\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2732,6 +2761,30 @@ mod tests {
         );
         assert_that!(
             String::from_utf8_lossy(&entries[2].payload).contains("GETDEL"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_append_writes() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"he"]))
+            .expect("first APPEND should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"llo"]))
+            .expect("second APPEND should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("APPEND"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("APPEND"),
             eq(true)
         );
     }

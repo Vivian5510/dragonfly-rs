@@ -235,6 +235,16 @@ impl CommandRegistry {
             handler: handle_expire,
         });
         registry.register(CommandSpec {
+            name: "APPEND",
+            arity: CommandArity::Exact(2),
+            handler: handle_append,
+        });
+        registry.register(CommandSpec {
+            name: "STRLEN",
+            arity: CommandArity::Exact(1),
+            handler: handle_strlen,
+        });
+        registry.register(CommandSpec {
             name: "TTL",
             arity: CommandArity::Exact(1),
             handler: handle_ttl,
@@ -405,6 +415,40 @@ fn handle_getdel(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
         return CommandReply::BulkString(entry.value);
     }
     CommandReply::Null
+}
+
+fn handle_append(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let suffix = &frame.args[1];
+    state.purge_expired_key(db, &key);
+
+    let (mut value, expire_at_unix_secs) =
+        if let Some(existing) = state.db_map(db).and_then(|map| map.get(&key)) {
+            (existing.value.clone(), existing.expire_at_unix_secs)
+        } else {
+            (Vec::new(), None)
+        };
+    value.extend_from_slice(suffix);
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value: value.clone(),
+            expire_at_unix_secs,
+        },
+    );
+    state.bump_key_version(db, &key);
+    CommandReply::Integer(i64::try_from(value.len()).unwrap_or(i64::MAX))
+}
+
+fn handle_strlen(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+    let length = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map_or(0_usize, |entry| entry.value.len());
+    CommandReply::Integer(i64::try_from(length).unwrap_or(i64::MAX))
 }
 
 fn handle_del(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -711,6 +755,40 @@ mod tests {
             &mut state,
         );
         assert_that!(&missing, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn dispatch_append_and_strlen_manage_string_length() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new("APPEND", vec![b"k".to_vec(), b"he".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::Integer(2)));
+
+        let second = registry.dispatch(
+            0,
+            &CommandFrame::new("APPEND", vec![b"k".to_vec(), b"llo".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&second, eq(&CommandReply::Integer(5)));
+
+        let strlen = registry.dispatch(
+            0,
+            &CommandFrame::new("STRLEN", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&strlen, eq(&CommandReply::Integer(5)));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"hello".to_vec())));
     }
 
     #[rstest]
