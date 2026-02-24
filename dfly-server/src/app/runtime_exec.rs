@@ -251,6 +251,11 @@ impl ServerApp {
                 return reply;
             }
 
+            if let Some(reply) = self.execute_multikey_string_commands_via_runtime(db, frame) {
+                self.maybe_append_journal_for_command(txid, db, frame, &reply);
+                return reply;
+            }
+
             if let Some(reply) = self.execute_multi_key_counting_command_via_runtime(db, frame) {
                 self.maybe_append_journal_for_command(txid, db, frame, &reply);
                 return reply;
@@ -267,6 +272,106 @@ impl ServerApp {
         let reply = self.execute_command_without_side_effects(db, frame);
         self.maybe_append_journal_for_command(txid, db, frame, &reply);
         reply
+    }
+
+    pub(super) fn execute_multikey_string_commands_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> Option<CommandReply> {
+        match frame.name.as_str() {
+            "MGET" => Some(self.execute_mget_via_runtime(db, frame)),
+            "MSET" => Some(self.execute_mset_via_runtime(db, frame)),
+            "MSETNX" => Some(self.execute_msetnx_via_runtime(db, frame)),
+            _ => None,
+        }
+    }
+
+    fn execute_mget_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() {
+            return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
+        }
+        if let Some(error_reply) =
+            self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
+        {
+            return error_reply;
+        }
+
+        let mut replies = Vec::with_capacity(frame.args.len());
+        for key in &frame.args {
+            let get_frame = CommandFrame::new("GET", vec![key.clone()]);
+            let reply = self.execute_single_shard_command_via_runtime(db, &get_frame);
+            match reply {
+                CommandReply::BulkString(_) | CommandReply::Null => replies.push(reply),
+                CommandReply::Moved { .. } | CommandReply::Error(_) => return reply,
+                _ => {
+                    return CommandReply::Error(
+                        "internal error: GET did not return bulk-string or null reply".to_owned(),
+                    );
+                }
+            }
+        }
+
+        CommandReply::Array(replies)
+    }
+
+    fn execute_mset_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+            return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
+        }
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(
+            frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()),
+        ) {
+            return error_reply;
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
+            let reply = self.execute_single_shard_command_via_runtime(db, &set_frame);
+            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
+                return reply;
+            }
+        }
+
+        CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_msetnx_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+            return CommandReply::Error(
+                "wrong number of arguments for 'MSETNX' command".to_owned(),
+            );
+        }
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(
+            frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()),
+        ) {
+            return error_reply;
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let exists_frame = CommandFrame::new("EXISTS", vec![pair[0].clone()]);
+            let reply = self.execute_single_shard_command_via_runtime(db, &exists_frame);
+            match reply {
+                CommandReply::Integer(1) => return CommandReply::Integer(0),
+                CommandReply::Integer(_) => {}
+                CommandReply::Moved { .. } | CommandReply::Error(_) => return reply,
+                _ => {
+                    return CommandReply::Error(
+                        "internal error: EXISTS did not return integer reply".to_owned(),
+                    );
+                }
+            }
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
+            let reply = self.execute_single_shard_command_via_runtime(db, &set_frame);
+            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
+                return CommandReply::Error("MSETNX failed while setting key".to_owned());
+            }
+        }
+
+        CommandReply::Integer(1)
     }
 
     pub(super) fn execute_multi_key_counting_command_via_runtime(
