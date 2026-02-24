@@ -73,6 +73,12 @@ impl ReplicationModule {
         self.journal.entry_at_lsn(lsn)
     }
 
+    /// Returns journal suffix from one starting LSN (inclusive) when available in backlog.
+    #[must_use]
+    pub fn journal_entries_from_lsn(&self, start_lsn: u64) -> Option<Vec<JournalEntry>> {
+        self.journal.entries_from_lsn(start_lsn)
+    }
+
     /// Records one replica ACK offset.
     pub fn record_replica_ack(&mut self, ack_lsn: u64) {
         self.state.record_ack_lsn(ack_lsn);

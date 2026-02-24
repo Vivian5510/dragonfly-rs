@@ -155,17 +155,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             )));
         }
 
-        let mut entries = Vec::new();
-        let mut lsn = start_lsn;
-        while lsn < current_lsn {
-            let Some(entry) = self.replication.journal_entry_at_lsn(lsn) else {
-                return Err(DflyError::Protocol(format!(
-                    "journal LSN {lsn} disappeared from backlog during replay"
-                )));
-            };
-            entries.push(entry);
-            lsn = lsn.saturating_add(1);
-        }
+        let Some(entries) = self.replication.journal_entries_from_lsn(start_lsn) else {
+            return Err(DflyError::Protocol(format!(
+                "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
+            )));
+        };
         self.replay_journal_entries(&entries)
     }
 

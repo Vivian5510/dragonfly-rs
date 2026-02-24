@@ -124,6 +124,31 @@ impl InMemoryJournal {
             .collect()
     }
 
+    /// Returns journal entries from one starting LSN (inclusive).
+    ///
+    /// `start_lsn` follows backlog cursor semantics:
+    /// - `start_lsn == current_lsn()` returns an empty suffix.
+    /// - stale/future cursors return `None`.
+    #[must_use]
+    pub fn entries_from_lsn(&self, start_lsn: u64) -> Option<Vec<JournalEntry>> {
+        if start_lsn == self.current_lsn() {
+            return Some(Vec::new());
+        }
+        if start_lsn > self.current_lsn() {
+            return None;
+        }
+        if !self.is_lsn_in_buffer(start_lsn) {
+            return None;
+        }
+        Some(
+            self.records
+                .iter()
+                .filter(|record| record.lsn >= start_lsn)
+                .map(|record| record.entry.clone())
+                .collect(),
+        )
+    }
+
     /// Number of currently buffered entries.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -204,5 +229,71 @@ mod tests {
             .map(|entry| String::from_utf8_lossy(&entry.payload).to_string());
         assert_that!(&lsn2_payload, eq(&Some("SET b 2".to_owned())));
         assert_that!(&lsn3_payload, eq(&Some("SET c 3".to_owned())));
+    }
+
+    #[rstest]
+    fn in_memory_journal_entries_from_lsn_returns_suffix_or_empty_cursor() {
+        let mut journal = InMemoryJournal::new();
+        let _ = journal.append(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 1".to_vec(),
+        });
+        let _ = journal.append(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 2".to_vec(),
+        });
+        let _ = journal.append(JournalEntry {
+            txid: 3,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 3".to_vec(),
+        });
+
+        let suffix = journal
+            .entries_from_lsn(2)
+            .expect("lsn 2 should be available");
+        assert_that!(suffix.len(), eq(2_usize));
+        assert_that!(suffix[0].txid, eq(2_u64));
+        assert_that!(suffix[1].txid, eq(3_u64));
+
+        let empty_suffix = journal
+            .entries_from_lsn(journal.current_lsn())
+            .expect("current cursor should return empty suffix");
+        assert_that!(empty_suffix.is_empty(), eq(true));
+    }
+
+    #[rstest]
+    fn in_memory_journal_entries_from_lsn_rejects_stale_or_future_cursor() {
+        let mut journal = InMemoryJournal::with_backlog(2);
+        let _ = journal.append(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 1".to_vec(),
+        });
+        let _ = journal.append(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 2".to_vec(),
+        });
+        let _ = journal.append(JournalEntry {
+            txid: 3,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 3".to_vec(),
+        });
+
+        assert_that!(journal.entries_from_lsn(1).is_none(), eq(true));
+        assert_that!(
+            journal
+                .entries_from_lsn(journal.current_lsn().saturating_add(1))
+                .is_none(),
+            eq(true)
+        );
     }
 }
