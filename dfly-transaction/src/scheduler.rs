@@ -82,15 +82,20 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
     fn schedule(&self, plan: &TransactionPlan) -> DflyResult<()> {
         validate_plan_shape(plan)?;
 
+        if plan.mode == TransactionMode::NonAtomic {
+            // Non-atomic mode is intentionally lock-free: it validates command shape only and
+            // does not reserve shard queues or key leases in scheduler state.
+            validate_non_atomic_mode(plan)?;
+            return Ok(());
+        }
+
         let key_accesses = match plan.mode {
-            // Non-atomic mode stays lock-free but must remain read-only and single-key.
-            TransactionMode::NonAtomic => {
-                validate_non_atomic_mode(plan)?;
-                Vec::new()
-            }
             TransactionMode::LockAhead => collect_lock_ahead_accesses(plan)?,
             // Global mode models a coarse barrier and does not need per-key locks.
             TransactionMode::Global => Vec::new(),
+            TransactionMode::NonAtomic => {
+                unreachable!("non-atomic mode returns before queue/lock scheduling")
+            }
         };
 
         let mut touched_shards = HashSet::new();
@@ -405,6 +410,31 @@ mod tests {
 
         let result = scheduler.schedule(&plan);
         assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_keeps_non_atomic_mode_lock_free() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let non_atomic = TransactionPlan {
+            txid: 10,
+            mode: TransactionMode::NonAtomic,
+            hops: vec![TransactionHop {
+                per_shard: vec![(0, CommandFrame::new("GET", vec![b"k".to_vec()]))],
+            }],
+        };
+        let lock_ahead = TransactionPlan {
+            txid: 11,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+        };
+
+        assert_that!(scheduler.schedule(&non_atomic).is_ok(), eq(true));
+        assert_that!(scheduler.schedule(&lock_ahead).is_ok(), eq(true));
     }
 
     #[rstest]
