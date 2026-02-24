@@ -9,10 +9,12 @@ use std::collections::HashMap;
 use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dfly_common::ids::DbIndex;
+
 use crate::command::{CommandFrame, CommandReply};
 
 /// Handler function signature used by command registry entries.
-pub type CommandHandler = fn(&CommandFrame, &mut DispatchState) -> CommandReply;
+pub type CommandHandler = fn(DbIndex, &CommandFrame, &mut DispatchState) -> CommandReply;
 
 /// Arity constraints for a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +43,9 @@ pub struct CommandSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DispatchState {
     /// In-memory key/value dictionary for learning-path command execution.
-    pub kv: HashMap<Vec<u8>, ValueEntry>,
+    ///
+    /// First key is logical DB index (`SELECT`), second key is user key bytes.
+    pub db_kv: HashMap<DbIndex, HashMap<Vec<u8>, ValueEntry>>,
 }
 
 /// Stored value with optional expiration metadata.
@@ -63,17 +67,33 @@ impl DispatchState {
         }
     }
 
+    /// Returns mutable map for one logical DB, creating it when missing.
+    fn db_map_mut(&mut self, db: DbIndex) -> &mut HashMap<Vec<u8>, ValueEntry> {
+        self.db_kv.entry(db).or_default()
+    }
+
+    /// Returns immutable map for one logical DB.
+    fn db_map(&self, db: DbIndex) -> Option<&HashMap<Vec<u8>, ValueEntry>> {
+        self.db_kv.get(&db)
+    }
+
     /// Removes one key when its expiration timestamp has already passed.
-    fn purge_expired_key(&mut self, key: &[u8]) {
+    fn purge_expired_key(&mut self, db: DbIndex, key: &[u8]) {
         let should_remove = self
-            .kv
-            .get(key)
+            .db_map(db)
+            .and_then(|map| map.get(key))
             .and_then(|entry| entry.expire_at_unix_secs)
             .is_some_and(|expire_at| expire_at <= Self::now_unix_seconds());
 
-        if should_remove {
-            let _ = self.kv.remove(key);
+        if should_remove && let Some(map) = self.db_kv.get_mut(&db) {
+            let _ = map.remove(key);
         }
+    }
+
+    /// Number of keys currently stored in one logical DB.
+    #[must_use]
+    pub fn db_len(&self, db: DbIndex) -> usize {
+        self.db_map(db).map_or(0, HashMap::len)
     }
 }
 
@@ -136,7 +156,12 @@ impl CommandRegistry {
 
     /// Dispatches one canonical command frame to its registered handler.
     #[must_use]
-    pub fn dispatch(&self, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    pub fn dispatch(
+        &self,
+        db: DbIndex,
+        frame: &CommandFrame,
+        state: &mut DispatchState,
+    ) -> CommandReply {
         let command_name = frame.name.to_ascii_uppercase();
         let Some(spec) = self.entries.get(&command_name) else {
             return CommandReply::Error(format!("unknown command '{command_name}'"));
@@ -158,11 +183,11 @@ impl CommandRegistry {
             _ => {}
         }
 
-        (spec.handler)(frame, state)
+        (spec.handler)(db, frame, state)
     }
 }
 
-fn handle_ping(frame: &CommandFrame, _state: &mut DispatchState) -> CommandReply {
+fn handle_ping(_db: DbIndex, frame: &CommandFrame, _state: &mut DispatchState) -> CommandReply {
     if frame.args.is_empty() {
         return CommandReply::SimpleString("PONG".to_owned());
     }
@@ -172,14 +197,14 @@ fn handle_ping(frame: &CommandFrame, _state: &mut DispatchState) -> CommandReply
     CommandReply::Error("wrong number of arguments for 'PING' command".to_owned())
 }
 
-fn handle_echo(frame: &CommandFrame, _state: &mut DispatchState) -> CommandReply {
+fn handle_echo(_db: DbIndex, frame: &CommandFrame, _state: &mut DispatchState) -> CommandReply {
     CommandReply::BulkString(frame.args[0].clone())
 }
 
-fn handle_set(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = frame.args[0].clone();
     let value = frame.args[1].clone();
-    state.kv.insert(
+    state.db_map_mut(db).insert(
         key,
         ValueEntry {
             value,
@@ -189,29 +214,29 @@ fn handle_set(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     CommandReply::SimpleString("OK".to_owned())
 }
 
-fn handle_get(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
-    state.purge_expired_key(key);
-    match state.kv.get(key) {
+    state.purge_expired_key(db, key);
+    match state.db_map(db).and_then(|map| map.get(key)) {
         Some(value) => CommandReply::BulkString(value.value.clone()),
         None => CommandReply::Null,
     }
 }
 
-fn handle_expire(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
-    state.purge_expired_key(key);
+    state.purge_expired_key(db, key);
 
     let seconds = match parse_i64_arg(&frame.args[1], "EXPIRE seconds") {
         Ok(seconds) => seconds,
         Err(error) => return CommandReply::Error(error),
     };
-    if !state.kv.contains_key(key) {
+    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
         return CommandReply::Integer(0);
     }
 
     if seconds <= 0 {
-        let _ = state.kv.remove(key);
+        let _ = state.db_map_mut(db).remove(key);
         return CommandReply::Integer(1);
     }
 
@@ -220,23 +245,23 @@ fn handle_expire(frame: &CommandFrame, state: &mut DispatchState) -> CommandRepl
     };
     let expire_at = DispatchState::now_unix_seconds().saturating_add(expire_delta);
 
-    if let Some(entry) = state.kv.get_mut(key) {
+    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
         entry.expire_at_unix_secs = Some(expire_at);
         return CommandReply::Integer(1);
     }
     CommandReply::Integer(0)
 }
 
-fn handle_ttl(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+fn handle_ttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
-    state.purge_expired_key(key);
+    state.purge_expired_key(db, key);
 
     let Some(expire_at) = state
-        .kv
-        .get(key)
+        .db_map(db)
+        .and_then(|map| map.get(key))
         .and_then(|entry| entry.expire_at_unix_secs)
     else {
-        if state.kv.contains_key(key) {
+        if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
             return CommandReply::Integer(-1);
         }
         return CommandReply::Integer(-2);
@@ -244,7 +269,7 @@ fn handle_ttl(frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
 
     let now = DispatchState::now_unix_seconds();
     if expire_at <= now {
-        let _ = state.kv.remove(key);
+        let _ = state.db_map_mut(db).remove(key);
         return CommandReply::Integer(-2);
     }
     let remaining = expire_at.saturating_sub(now);
@@ -272,10 +297,11 @@ mod tests {
         let registry = CommandRegistry::with_builtin_commands();
         let mut state = DispatchState::default();
 
-        let ping = registry.dispatch(&CommandFrame::new("PING", Vec::new()), &mut state);
+        let ping = registry.dispatch(0, &CommandFrame::new("PING", Vec::new()), &mut state);
         assert_that!(&ping, eq(&CommandReply::SimpleString("PONG".to_owned())));
 
         let echo = registry.dispatch(
+            0,
             &CommandFrame::new("ECHO", vec![b"hello".to_vec()]),
             &mut state,
         );
@@ -288,12 +314,14 @@ mod tests {
         let mut state = DispatchState::default();
 
         let set_reply = registry.dispatch(
+            0,
             &CommandFrame::new("SET", vec![b"user:1".to_vec(), b"alice".to_vec()]),
             &mut state,
         );
         assert_that!(&set_reply, eq(&CommandReply::SimpleString("OK".to_owned())));
 
         let get_reply = registry.dispatch(
+            0,
             &CommandFrame::new("GET", vec![b"user:1".to_vec()]),
             &mut state,
         );
@@ -305,7 +333,7 @@ mod tests {
         let registry = CommandRegistry::with_builtin_commands();
         let mut state = DispatchState::default();
 
-        let reply = registry.dispatch(&CommandFrame::new("NOPE", Vec::new()), &mut state);
+        let reply = registry.dispatch(0, &CommandFrame::new("NOPE", Vec::new()), &mut state);
         let CommandReply::Error(message) = reply else {
             panic!("expected error reply");
         };
@@ -318,29 +346,34 @@ mod tests {
         let mut state = DispatchState::default();
 
         let _ = registry.dispatch(
+            0,
             &CommandFrame::new("SET", vec![b"temp".to_vec(), b"value".to_vec()]),
             &mut state,
         );
 
         let ttl_without_expire = registry.dispatch(
+            0,
             &CommandFrame::new("TTL", vec![b"temp".to_vec()]),
             &mut state,
         );
         assert_that!(&ttl_without_expire, eq(&CommandReply::Integer(-1)));
 
         let expire_now = registry.dispatch(
+            0,
             &CommandFrame::new("EXPIRE", vec![b"temp".to_vec(), b"0".to_vec()]),
             &mut state,
         );
         assert_that!(&expire_now, eq(&CommandReply::Integer(1)));
 
         let get_after_expire = registry.dispatch(
+            0,
             &CommandFrame::new("GET", vec![b"temp".to_vec()]),
             &mut state,
         );
         assert_that!(&get_after_expire, eq(&CommandReply::Null));
 
         let ttl_after_expire = registry.dispatch(
+            0,
             &CommandFrame::new("TTL", vec![b"temp".to_vec()]),
             &mut state,
         );
@@ -353,9 +386,40 @@ mod tests {
         let mut state = DispatchState::default();
 
         let reply = registry.dispatch(
+            0,
             &CommandFrame::new("EXPIRE", vec![b"nope".to_vec(), b"10".to_vec()]),
             &mut state,
         );
         assert_that!(&reply, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_keeps_values_isolated_between_databases() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"shared".to_vec(), b"db0".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            1,
+            &CommandFrame::new("SET", vec![b"shared".to_vec(), b"db1".to_vec()]),
+            &mut state,
+        );
+
+        let db0 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"shared".to_vec()]),
+            &mut state,
+        );
+        let db1 = registry.dispatch(
+            1,
+            &CommandFrame::new("GET", vec![b"shared".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&db0, eq(&CommandReply::BulkString(b"db0".to_vec())));
+        assert_that!(&db1, eq(&CommandReply::BulkString(b"db1".to_vec())));
     }
 }

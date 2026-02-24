@@ -137,6 +137,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             // Redis `MULTI/EXEC/DISCARD` is connection-scoped control flow and is handled
             // before core command execution, matching Dragonfly's high-level transaction entry.
             if connection.parser.context.protocol == ClientProtocol::Resp {
+                if let Some(select_reply) = Self::handle_resp_select(connection, &frame) {
+                    responses.push(select_reply);
+                    continue;
+                }
+
                 if let Some(transaction_reply) =
                     self.handle_resp_transaction_control(connection, &frame)
                 {
@@ -159,8 +164,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 }
             }
 
-            let reply = self.core.execute(&frame);
-            self.maybe_append_journal_for_command(None, &frame, &reply);
+            let db = connection.parser.context.db_index;
+            let reply = self.core.execute_in_db(db, &frame);
+            self.maybe_append_journal_for_command(None, db, &frame, &reply);
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
@@ -170,6 +176,30 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         Ok(responses)
+    }
+
+    fn handle_resp_select(
+        connection: &mut ServerConnection,
+        frame: &CommandFrame,
+    ) -> Option<Vec<u8>> {
+        if frame.name != "SELECT" {
+            return None;
+        }
+        if frame.args.len() != 1 {
+            return Some(wrong_arity("SELECT"));
+        }
+        if connection.transaction.in_multi() {
+            return Some(
+                CommandReply::Error("SELECT is not allowed in MULTI".to_owned()).to_resp_bytes(),
+            );
+        }
+
+        let db_index = match parse_db_index_arg(&frame.args[0]) {
+            Ok(db_index) => db_index,
+            Err(error) => return Some(CommandReply::Error(error).to_resp_bytes()),
+        };
+        connection.parser.context.db_index = db_index;
+        Some(CommandReply::SimpleString("OK".to_owned()).to_resp_bytes())
     }
 
     /// Handles RESP transaction control commands.
@@ -225,8 +255,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let replies = queued_commands
             .into_iter()
             .map(|queued| {
-                let reply = self.core.execute(&queued);
-                self.maybe_append_journal_for_command(Some(plan.txid), &queued, &reply);
+                let db = connection.parser.context.db_index;
+                let reply = self.core.execute_in_db(db, &queued);
+                self.maybe_append_journal_for_command(Some(plan.txid), db, &queued, &reply);
                 reply
             })
             .collect::<Vec<_>>();
@@ -262,6 +293,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     fn maybe_append_journal_for_command(
         &mut self,
         txid: Option<TxId>,
+        db: u16,
         frame: &CommandFrame,
         reply: &CommandReply,
     ) {
@@ -273,16 +305,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let payload = serialize_command_frame(frame);
         self.replication.append_journal(JournalEntry {
             txid,
-            db: connection_db_index(),
+            db,
             op,
             payload,
         });
     }
-}
-
-fn connection_db_index() -> u16 {
-    // Unit 1 keeps only DB 0 active. Future units wire `SELECT` state into journal records.
-    0
 }
 
 /// Per-client state stored by the server.
@@ -324,6 +351,15 @@ fn expire_is_delete(frame: &CommandFrame) -> bool {
         .and_then(|seconds| std::str::from_utf8(seconds).ok())
         .and_then(|seconds| seconds.parse::<i64>().ok())
         .is_some_and(|seconds| seconds <= 0)
+}
+
+fn parse_db_index_arg(arg: &[u8]) -> Result<u16, String> {
+    let db_text =
+        std::str::from_utf8(arg).map_err(|_| "SELECT DB index must be UTF-8".to_owned())?;
+    let db_index = db_text
+        .parse::<u16>()
+        .map_err(|_| "SELECT DB index must be an unsigned 16-bit integer".to_owned())?;
+    Ok(db_index)
 }
 
 /// Serializes one command frame as RESP array payload for journal replay.
@@ -608,5 +644,62 @@ mod tests {
         assert_that!(entries.len(), eq(2_usize));
         assert_that!(entries[0].txid, eq(entries[1].txid));
         assert_that!(entries[1].op, eq(JournalOp::Expired));
+    }
+
+    #[rstest]
+    fn resp_select_switches_logical_db_namespace() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
+            )
+            .expect("SET in DB 0 should succeed");
+
+        let select_db1 = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+            .expect("SELECT 1 should succeed");
+        assert_that!(&select_db1, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let get_in_db1 = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n")
+            .expect("GET in DB 1 should succeed");
+        assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb1\r\n",
+            )
+            .expect("SET in DB 1 should succeed");
+
+        let select_db0 = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+            .expect("SELECT 0 should succeed");
+        assert_that!(&select_db0, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let get_in_db0 = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n")
+            .expect("GET in DB 0 should succeed");
+        assert_that!(&get_in_db0, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_select_is_rejected_while_multi_is_open() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+            .expect("MULTI should succeed");
+        let select = app
+            .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+            .expect("SELECT should parse");
+        assert_that!(
+            &select,
+            eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
+        );
     }
 }

@@ -6,7 +6,7 @@ pub mod runtime;
 pub mod sharding;
 
 use command::{CommandFrame, CommandReply};
-use dfly_common::ids::ShardCount;
+use dfly_common::ids::{DbIndex, ShardCount};
 use dispatch::{CommandRegistry, DispatchState};
 use sharding::{HashTagShardResolver, ShardResolver};
 
@@ -41,12 +41,18 @@ impl CoreModule {
     /// Executes one command frame on its selected target shard.
     #[must_use]
     pub fn execute(&mut self, frame: &CommandFrame) -> CommandReply {
+        self.execute_in_db(0, frame)
+    }
+
+    /// Executes one command frame in a selected logical DB.
+    #[must_use]
+    pub fn execute_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
         let target_shard = self.resolve_target_shard(frame);
         let target_index = usize::from(target_shard);
         let Some(target_state) = self.shard_states.get_mut(target_index) else {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
         };
-        self.command_registry.dispatch(frame, target_state)
+        self.command_registry.dispatch(db, frame, target_state)
     }
 
     /// Resolves the owner shard for a key using the active sharding policy.
@@ -63,7 +69,7 @@ impl CoreModule {
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
         match frame.name.as_str() {
-            "GET" | "SET" => frame
+            "GET" | "SET" | "EXPIRE" | "TTL" => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),
@@ -125,11 +131,11 @@ mod tests {
         ));
 
         assert_that!(
-            core.shard_states[usize::from(first_shard)].kv.len(),
+            core.shard_states[usize::from(first_shard)].db_len(0),
             eq(1_usize),
         );
         assert_that!(
-            core.shard_states[usize::from(second_shard)].kv.len(),
+            core.shard_states[usize::from(second_shard)].db_len(0),
             eq(1_usize),
         );
     }
