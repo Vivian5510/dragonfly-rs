@@ -83,6 +83,14 @@ mod tests {
         })
     }
 
+    fn make_memcache_connection() -> ConnectionState {
+        ConnectionState::new(ConnectionContext {
+            protocol: ClientProtocol::Memcache,
+            db_index: 0,
+            privileged: false,
+        })
+    }
+
     #[rstest]
     fn connection_parses_command_across_multiple_feeds() {
         let mut connection = make_resp_connection();
@@ -124,5 +132,25 @@ mod tests {
         assert_that!(second.name, eq("ECHO"));
         assert_that!(&second.args, eq(&expected_args));
         assert_that!(connection.pending_bytes(), eq(0));
+    }
+
+    #[rstest]
+    fn memcache_connection_waits_until_set_payload_is_complete() {
+        let mut connection = make_memcache_connection();
+        connection.feed_bytes(b"set profile:1 0 0 5\r\nali");
+
+        let first_attempt = connection
+            .try_pop_command()
+            .expect("partial payload should not fail");
+        assert_that!(&first_attempt, eq(&None));
+
+        connection.feed_bytes(b"ce\r\n");
+        let parsed = connection
+            .try_pop_command()
+            .expect("set command should parse once payload is complete")
+            .expect("one command should be available");
+        let expected_args = vec![b"profile:1".to_vec(), b"alice".to_vec()];
+        assert_that!(parsed.name, eq("SET"));
+        assert_that!(&parsed.args, eq(&expected_args));
     }
 }

@@ -137,9 +137,7 @@ fn parse_next_resp_command(input: &[u8]) -> DflyResult<ParseStatus> {
             "RESP command name cannot be empty".to_owned(),
         ));
     }
-    let command_name = str::from_utf8(command_name_raw)
-        .map_err(|_| DflyError::Protocol("RESP command name must be valid UTF-8".to_owned()))?
-        .to_ascii_uppercase();
+    let command_name = parse_uppercase_token(command_name_raw, "RESP command name")?;
 
     Ok(ParseStatus::Complete {
         command: ParsedCommand {
@@ -155,7 +153,7 @@ fn parse_next_resp_command(input: &[u8]) -> DflyResult<ParseStatus> {
 /// For Unit 1 we focus on the command-line form where one request maps to one CRLF line.
 /// Value-body commands (for example `set`) are modeled later together with storage semantics.
 fn parse_next_memcache_command(input: &[u8]) -> DflyResult<ParseStatus> {
-    let Some((line, consumed)) = read_crlf_line(input, 0)? else {
+    let Some((line, line_consumed)) = read_crlf_line(input, 0)? else {
         return Ok(ParseStatus::Incomplete);
     };
 
@@ -165,20 +163,29 @@ fn parse_next_memcache_command(input: &[u8]) -> DflyResult<ParseStatus> {
         ));
     }
 
-    let mut parts = line.split(|b| *b == b' ').filter(|part| !part.is_empty());
-    let Some(name_raw) = parts.next() else {
+    let parts = line
+        .split(|byte| *byte == b' ')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    let Some(name_raw) = parts.first() else {
         return Err(DflyError::Protocol(
             "memcache command requires command name".to_owned(),
         ));
     };
-    let name = str::from_utf8(name_raw)
-        .map_err(|_| DflyError::Protocol("memcache command name must be valid UTF-8".to_owned()))?
-        .to_ascii_uppercase();
-    let args = parts.map(ToOwned::to_owned).collect();
+    let name = parse_uppercase_token(name_raw, "memcache command name")?;
+
+    // Memcache storage commands carry value payload in a second logical segment after the
+    // command line. We normalize it into the same `SET key value` frame used by RESP path.
+    if name == "SET" {
+        return parse_memcache_set_command(input, &parts, line_consumed);
+    }
+
+    let args = parts.iter().skip(1).map(|part| (*part).to_vec()).collect();
 
     Ok(ParseStatus::Complete {
         command: ParsedCommand { name, args },
-        consumed,
+        consumed: line_consumed,
     })
 }
 
@@ -212,6 +219,66 @@ fn parse_decimal_i64(value: &[u8], field_name: &str) -> DflyResult<i64> {
         .map_err(|_| DflyError::Protocol(format!("{field_name} must be valid UTF-8")))?;
     text.parse::<i64>()
         .map_err(|_| DflyError::Protocol(format!("{field_name} must be a valid integer")))
+}
+
+/// Parses one storage `set` command with payload block from memcache protocol.
+fn parse_memcache_set_command(
+    input: &[u8],
+    parts: &[&[u8]],
+    line_consumed: usize,
+) -> DflyResult<ParseStatus> {
+    if !(parts.len() == 5 || parts.len() == 6) {
+        return Err(DflyError::Protocol(
+            "memcache set requires: set <key> <flags> <exptime> <bytes> [noreply]".to_owned(),
+        ));
+    }
+    if parts.len() == 6 && !parts[5].eq_ignore_ascii_case(b"noreply") {
+        return Err(DflyError::Protocol(
+            "memcache set optional trailing token must be 'noreply'".to_owned(),
+        ));
+    }
+
+    let key = parts[1].to_vec();
+    let value_len = parse_decimal_usize(parts[4], "memcache set <bytes>")?;
+    if input.len().saturating_sub(line_consumed) < value_len + 2 {
+        return Ok(ParseStatus::Incomplete);
+    }
+
+    let value_start = line_consumed;
+    let value_end = value_start + value_len;
+    if input[value_end] != b'\r' || input[value_end + 1] != b'\n' {
+        return Err(DflyError::Protocol(
+            "memcache set value payload must end with CRLF".to_owned(),
+        ));
+    }
+
+    Ok(ParseStatus::Complete {
+        command: ParsedCommand {
+            name: "SET".to_owned(),
+            args: vec![key, input[value_start..value_end].to_vec()],
+        },
+        consumed: value_end + 2,
+    })
+}
+
+/// Parses a UTF-8 token and normalizes it to uppercase ASCII.
+fn parse_uppercase_token(value: &[u8], field_name: &str) -> DflyResult<String> {
+    str::from_utf8(value)
+        .map(str::to_owned)
+        .map(|token| token.to_ascii_uppercase())
+        .map_err(|_| DflyError::Protocol(format!("{field_name} must be valid UTF-8")))
+}
+
+/// Parses a decimal `usize` value used by payload length fields.
+fn parse_decimal_usize(value: &[u8], field_name: &str) -> DflyResult<usize> {
+    let value = parse_decimal_i64(value, field_name)?;
+    if value < 0 {
+        return Err(DflyError::Protocol(format!(
+            "{field_name} must be non-negative"
+        )));
+    }
+    usize::try_from(value)
+        .map_err(|_| DflyError::Protocol(format!("{field_name} exceeds supported usize")))
 }
 
 #[cfg(test)]
@@ -255,6 +322,29 @@ mod tests {
         assert_that!(consumed, eq(wire.len()));
         assert_that!(command.name, eq("GET"));
         assert_that!(&command.args, eq(&expected_args));
+    }
+
+    #[rstest]
+    fn parse_memcache_set_command_with_value_payload() {
+        let wire = b"set user:42 0 0 5\r\nalice\r\n";
+        let status =
+            parse_next_command(ClientProtocol::Memcache, wire).expect("valid memcache set");
+        let ParseStatus::Complete { command, consumed } = status else {
+            panic!("expected complete parse");
+        };
+        let expected_args = vec![b"user:42".to_vec(), b"alice".to_vec()];
+
+        assert_that!(consumed, eq(wire.len()));
+        assert_that!(command.name, eq("SET"));
+        assert_that!(&command.args, eq(&expected_args));
+    }
+
+    #[rstest]
+    fn parse_memcache_set_reports_incomplete_value_payload() {
+        let partial = b"set user:42 0 0 5\r\nali";
+        let status = parse_next_command(ClientProtocol::Memcache, partial)
+            .expect("incomplete payload should not fail");
+        assert_that!(&status, eq(&ParseStatus::Incomplete));
     }
 
     #[rstest]

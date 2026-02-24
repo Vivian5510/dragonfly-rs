@@ -136,7 +136,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
-            let encoded = encode_reply_for_protocol(connection.parser.context.protocol, reply);
+            let encoded =
+                encode_reply_for_protocol(connection.parser.context.protocol, &frame, reply);
             responses.push(encoded);
         }
 
@@ -154,24 +155,47 @@ pub struct ServerConnection {
 /// Encodes a canonical reply according to the target client protocol.
 fn encode_reply_for_protocol(
     protocol: ClientProtocol,
+    frame: &CommandFrame,
     reply: dfly_core::command::CommandReply,
 ) -> Vec<u8> {
     match protocol {
         ClientProtocol::Resp => reply.to_resp_bytes(),
-        ClientProtocol::Memcache => match reply {
-            dfly_core::command::CommandReply::SimpleString(message) => {
-                format!("{message}\r\n").into_bytes()
+        ClientProtocol::Memcache => encode_memcache_reply(frame, reply),
+    }
+}
+
+/// Encodes replies in memcache text protocol style for supported command subset.
+fn encode_memcache_reply(frame: &CommandFrame, reply: dfly_core::command::CommandReply) -> Vec<u8> {
+    match (frame.name.as_str(), reply) {
+        ("SET", dfly_core::command::CommandReply::SimpleString(ok)) if ok == "OK" => {
+            b"STORED\r\n".to_vec()
+        }
+        ("GET", dfly_core::command::CommandReply::BulkString(payload)) => {
+            if let Some(key) = frame.args.first() {
+                let key_text = String::from_utf8_lossy(key);
+                let mut output = format!("VALUE {key_text} 0 {}\r\n", payload.len()).into_bytes();
+                output.extend_from_slice(&payload);
+                output.extend_from_slice(b"\r\nEND\r\n");
+                return output;
             }
-            dfly_core::command::CommandReply::BulkString(payload) => {
-                let mut output = payload;
-                output.extend_from_slice(b"\r\n");
-                output
-            }
-            dfly_core::command::CommandReply::Null => b"END\r\n".to_vec(),
-            dfly_core::command::CommandReply::Error(message) => {
-                format!("ERROR {message}\r\n").into_bytes()
-            }
-        },
+
+            // Defensive fallback for malformed frame shape: still return the payload.
+            let mut output = payload;
+            output.extend_from_slice(b"\r\n");
+            output
+        }
+        (_, dfly_core::command::CommandReply::SimpleString(message)) => {
+            format!("{message}\r\n").into_bytes()
+        }
+        (_, dfly_core::command::CommandReply::BulkString(payload)) => {
+            let mut output = payload;
+            output.extend_from_slice(b"\r\n");
+            output
+        }
+        (_, dfly_core::command::CommandReply::Null) => b"END\r\n".to_vec(),
+        (_, dfly_core::command::CommandReply::Error(message)) => {
+            format!("ERROR {message}\r\n").into_bytes()
+        }
     }
 }
 
@@ -235,6 +259,41 @@ mod tests {
             .feed_connection_bytes(&mut connection, b"llo\r\n")
             .expect("completion bytes should execute pending command");
         let expected = vec![b"$5\r\nhello\r\n".to_vec()];
+        assert_that!(&final_responses, eq(&expected));
+    }
+
+    #[rstest]
+    fn memcache_connection_executes_set_then_get() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Memcache);
+
+        let set_responses = app
+            .feed_connection_bytes(&mut connection, b"set user:42 0 0 5\r\nalice\r\n")
+            .expect("memcache set should execute");
+        let expected_set = vec![b"STORED\r\n".to_vec()];
+        assert_that!(&set_responses, eq(&expected_set));
+
+        let get_responses = app
+            .feed_connection_bytes(&mut connection, b"get user:42\r\n")
+            .expect("memcache get should execute");
+        let expected_get = vec![b"VALUE user:42 0 5\r\nalice\r\nEND\r\n".to_vec()];
+        assert_that!(&get_responses, eq(&expected_get));
+    }
+
+    #[rstest]
+    fn memcache_set_handles_partial_value_payload() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Memcache);
+
+        let partial_responses = app
+            .feed_connection_bytes(&mut connection, b"set cache:key 0 0 7\r\nru")
+            .expect("partial memcache set should not fail");
+        assert_that!(partial_responses.is_empty(), eq(true));
+
+        let final_responses = app
+            .feed_connection_bytes(&mut connection, b"sty42\r\n")
+            .expect("payload completion should execute set");
+        let expected = vec![b"STORED\r\n".to_vec()];
         assert_that!(&final_responses, eq(&expected));
     }
 }
