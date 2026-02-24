@@ -5,7 +5,7 @@
 //! protocol parsing produces a canonical command frame, then a registry resolves and executes
 //! the matching handler.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,6 +50,8 @@ pub struct DbTable {
     pub prime: HashMap<Vec<u8>, ValueEntry>,
     /// Expiration index with absolute unix-second deadlines.
     pub expire: HashMap<Vec<u8>, u64>,
+    /// Reverse expiration index ordered by deadline for active-expiry scans.
+    pub expire_order: BTreeMap<u64, HashSet<Vec<u8>>>,
     /// Key cardinality by Redis cluster slot.
     pub slot_stats: HashMap<u16, usize>,
     /// Key membership by Redis cluster slot.
@@ -111,9 +113,32 @@ impl DispatchState {
         self.db_table(db).map(|table| &table.prime)
     }
 
+    fn remove_expire_deadline(table: &mut DbTable, key: &[u8], expire_at: u64) {
+        let mut should_remove_deadline = false;
+        if let Some(keys) = table.expire_order.get_mut(&expire_at) {
+            let _ = keys.remove(key);
+            should_remove_deadline = keys.is_empty();
+        }
+        if should_remove_deadline {
+            let _ = table.expire_order.remove(&expire_at);
+        }
+    }
+
+    fn add_expire_deadline(table: &mut DbTable, key: &[u8], expire_at: u64) {
+        let _ = table
+            .expire_order
+            .entry(expire_at)
+            .or_default()
+            .insert(key.to_vec());
+    }
+
     fn update_expire_index(table: &mut DbTable, key: &[u8], expire_at: Option<u64>) {
+        if let Some(previous_expire) = table.expire.get(key).copied() {
+            Self::remove_expire_deadline(table, key, previous_expire);
+        }
         if let Some(expire_at_unix_secs) = expire_at {
             let _ = table.expire.insert(key.to_vec(), expire_at_unix_secs);
+            Self::add_expire_deadline(table, key, expire_at_unix_secs);
         } else {
             let _ = table.expire.remove(key);
         }
@@ -162,7 +187,9 @@ impl DispatchState {
     fn remove_key(&mut self, db: DbIndex, key: &[u8]) -> Option<ValueEntry> {
         let table = self.db_tables.get_mut(&db)?;
         let removed = table.prime.remove(key)?;
-        let _ = table.expire.remove(key);
+        if let Some(previous_expire) = table.expire.remove(key) {
+            Self::remove_expire_deadline(table, key, previous_expire);
+        }
         Self::decrement_slot_stat(table, key);
         Some(removed)
     }
@@ -251,16 +278,14 @@ impl DispatchState {
 
         let now = Self::now_unix_seconds();
         let mut candidates = Vec::with_capacity(limit);
-        for (db, table) in &self.db_tables {
-            for (key, expire_at) in &table.expire {
-                if *expire_at <= now {
-                    candidates.push((*db, key.clone()));
-                    if candidates.len() >= limit {
-                        break;
-                    }
-                }
+        for (db, table) in &mut self.db_tables {
+            while candidates.len() < limit {
+                let Some(key) = Self::pop_next_expired_key(table, now) else {
+                    break;
+                };
+                candidates.push((*db, key));
             }
-            if candidates.len() >= limit {
+            if candidates.len() == limit {
                 break;
             }
         }
@@ -273,6 +298,28 @@ impl DispatchState {
             }
         }
         removed
+    }
+
+    fn pop_next_expired_key(table: &mut DbTable, now: u64) -> Option<Vec<u8>> {
+        let earliest_deadline = table
+            .expire_order
+            .first_key_value()
+            .map(|(deadline, _)| *deadline)?;
+        if earliest_deadline > now {
+            return None;
+        }
+
+        let (expired_key, should_remove_deadline) = {
+            let keys = table.expire_order.get_mut(&earliest_deadline)?;
+            let key = keys.iter().next().cloned()?;
+            let _ = keys.remove(&key);
+            (key, keys.is_empty())
+        };
+        if should_remove_deadline {
+            let _ = table.expire_order.remove(&earliest_deadline);
+        }
+        let _ = table.expire.remove(&expired_key);
+        Some(expired_key)
     }
 
     /// Number of keys currently stored in one logical DB.
@@ -1796,12 +1843,105 @@ mod tests {
             panic!("db table must exist after SET");
         };
         assert_that!(table.expire.contains_key(&key), eq(true));
+        let expire_at = table
+            .expire
+            .get(&key)
+            .copied()
+            .expect("set with EX should keep expiry index");
+        assert_that!(
+            table
+                .expire_order
+                .get(&expire_at)
+                .is_some_and(|keys| keys.contains(&key)),
+            eq(true)
+        );
 
         let _ = registry.dispatch(0, &CommandFrame::new("DEL", vec![key.clone()]), &mut state);
         let Some(table) = state.db_tables.get(&0) else {
             panic!("db table should be kept after key deletion");
         };
         assert_that!(table.expire.contains_key(&key), eq(false));
+        assert_that!(
+            table.expire_order.values().any(|keys| keys.contains(&key)),
+            eq(false)
+        );
+    }
+
+    #[rstest]
+    fn dispatch_rebuilds_ordered_expire_index_after_ttl_updates() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:expire:update:key".to_vec();
+
+        let set = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    key.clone(),
+                    b"value".to_vec(),
+                    b"EX".to_vec(),
+                    b"30".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+        let original_deadline = state
+            .db_tables
+            .get(&0)
+            .and_then(|table| table.expire.get(&key))
+            .copied()
+            .expect("initial ttl should be indexed");
+
+        let expire = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRE", vec![key.clone(), b"90".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&expire, eq(&CommandReply::Integer(1)));
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table should exist after EXPIRE");
+        };
+        let updated_deadline = table
+            .expire
+            .get(&key)
+            .copied()
+            .expect("updated ttl should be indexed");
+        assert_that!(updated_deadline > original_deadline, eq(true));
+        assert_that!(
+            table
+                .expire_order
+                .get(&original_deadline)
+                .is_none_or(|keys| !keys.contains(&key)),
+            eq(true)
+        );
+        assert_that!(
+            table
+                .expire_order
+                .get(&updated_deadline)
+                .is_some_and(|keys| keys.contains(&key)),
+            eq(true)
+        );
+
+        let persist = registry.dispatch(
+            0,
+            &CommandFrame::new("PERSIST", vec![key.clone()]),
+            &mut state,
+        );
+        assert_that!(&persist, eq(&CommandReply::Integer(1)));
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table should remain allocated after PERSIST");
+        };
+        assert_that!(table.expire.is_empty(), eq(true));
+        assert_that!(
+            table
+                .expire_order
+                .values()
+                .flat_map(HashSet::iter)
+                .any(|indexed_key| indexed_key == &key),
+            eq(false)
+        );
     }
 
     #[rstest]
