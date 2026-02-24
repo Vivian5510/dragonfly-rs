@@ -6292,6 +6292,37 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_dfly_flow_rejects_duplicate_flow_registration() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let handshake = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+            )
+            .expect("REPLCONF CAPA dragonfly should succeed");
+        let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
+        let master_id = app.replication.master_replid().as_bytes().to_vec();
+        let first = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+            )
+            .expect("first DFLY FLOW should succeed");
+        let (sync_type, _) = extract_dfly_flow_reply(&first[0]);
+        assert_that!(sync_type.as_str(), eq("FULL"));
+
+        let second = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+            )
+            .expect("second DFLY FLOW should parse");
+        assert_that!(&second, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
+    }
+
+    #[rstest]
     fn resp_replconf_registration_and_psync_update_role_replica_state() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);

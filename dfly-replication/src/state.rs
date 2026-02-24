@@ -300,6 +300,9 @@ impl ReplicationState {
         if flow_id >= session.flows.len() {
             return Err(SyncSessionError::FlowOutOfRange);
         }
+        if session.flows[flow_id].is_some() {
+            return Err(SyncSessionError::InvalidState);
+        }
 
         session.flows[flow_id] = Some(SyncFlow {
             sync_type,
@@ -505,6 +508,23 @@ mod tests {
         );
         assert_that!(
             state.mark_sync_session_stable_sync(&sync),
+            eq(Err(SyncSessionError::InvalidState))
+        );
+    }
+
+    #[rstest]
+    fn sync_session_rejects_duplicate_flow_registration() {
+        let mut state = ReplicationState::default();
+        let sync = state.create_sync_session(1);
+
+        let token_0 = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync, 0, FlowSyncType::Full, None, token_0),
+            eq(Ok(()))
+        );
+        let token_1 = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync, 0, FlowSyncType::Partial, Some(5), token_1),
             eq(Err(SyncSessionError::InvalidState))
         );
     }
