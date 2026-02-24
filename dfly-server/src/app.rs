@@ -1621,7 +1621,7 @@ fn parse_flow_lsn_vector_for_flow(
 /// Returns journal op kind when the command mutated keyspace state.
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
-        ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("SET", _) if set_command_mutated(frame, reply) => Some(JournalOp::Command),
         ("SETEX" | "PSETEX", CommandReply::SimpleString(ok)) if ok == "OK" => {
             Some(JournalOp::Command)
         }
@@ -1677,6 +1677,34 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
             }
         }
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetJournalCondition {
+    Always,
+    IfMissing,
+    IfExists,
+}
+
+fn set_command_mutated(frame: &CommandFrame, reply: &CommandReply) -> bool {
+    let mut condition = SetJournalCondition::Always;
+    let mut wants_get = false;
+    for option in frame.args.iter().skip(2) {
+        if option.eq_ignore_ascii_case(b"NX") {
+            condition = SetJournalCondition::IfMissing;
+        } else if option.eq_ignore_ascii_case(b"XX") {
+            condition = SetJournalCondition::IfExists;
+        } else if option.eq_ignore_ascii_case(b"GET") {
+            wants_get = true;
+        }
+    }
+
+    match reply {
+        CommandReply::SimpleString(ok) => ok == "OK",
+        CommandReply::BulkString(_) => wants_get && condition != SetJournalCondition::IfMissing,
+        CommandReply::Null => wants_get && condition != SetJournalCondition::IfExists,
+        _ => false,
     }
 }
 
@@ -1875,6 +1903,177 @@ mod tests {
             .expect("GET command should execute");
         let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
         assert_that!(&get_responses, eq(&expected_get));
+    }
+
+    #[rstest]
+    fn resp_set_supports_conditional_and_get_options() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
+            )
+            .expect("SET NX should execute");
+        assert_that!(&first, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let skipped = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
+            )
+            .expect("SET NX on existing key should execute");
+        assert_that!(&skipped, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let skipped_with_get = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
+            )
+            .expect("SET NX GET should execute");
+        assert_that!(&skipped_with_get, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+
+        let missing_with_xx_get = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"missing", b"value", b"XX", b"GET"]),
+            )
+            .expect("SET XX GET on missing key should execute");
+        assert_that!(&missing_with_xx_get, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let existing_with_xx_get = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
+            )
+            .expect("SET XX GET on existing key should execute");
+        assert_that!(&existing_with_xx_get, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
+
+        let current = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should execute");
+        assert_that!(&current, eq(&vec![b"$2\r\nv2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_set_applies_expire_and_keepttl_options() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let with_ex = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"ttl:key", b"value", b"EX", b"30"]),
+            )
+            .expect("SET EX should execute");
+        assert_that!(&with_ex, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let ttl_before = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
+            .expect("TTL should execute");
+        assert_that!(parse_resp_integer(&ttl_before[0]) > 0, eq(true));
+
+        let keep_ttl = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"ttl:key", b"next", b"KEEPTTL"]),
+            )
+            .expect("SET KEEPTTL should execute");
+        assert_that!(&keep_ttl, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let ttl_after_keep = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
+            .expect("TTL should execute");
+        assert_that!(parse_resp_integer(&ttl_after_keep[0]) > 0, eq(true));
+
+        let clear_ttl = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"ttl:key", b"final"]),
+            )
+            .expect("plain SET should execute");
+        assert_that!(&clear_ttl, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let ttl_after_plain = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
+            .expect("TTL should execute");
+        assert_that!(&ttl_after_plain, eq(&vec![b":-1\r\n".to_vec()]));
+
+        let with_px = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"px:key", b"value", b"PX", b"1200"]),
+            )
+            .expect("SET PX should execute");
+        assert_that!(&with_px, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let pttl = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"px:key"]))
+            .expect("PTTL should execute");
+        assert_that!(parse_resp_integer(&pttl[0]) > 0, eq(true));
+    }
+
+    #[rstest]
+    fn resp_set_rejects_invalid_option_combinations() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let nx_xx = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"key", b"value", b"NX", b"XX"]),
+            )
+            .expect("SET NX XX should parse");
+        assert_that!(&nx_xx, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
+
+        let duplicate_expire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"PX", b"1000"]),
+            )
+            .expect("SET EX PX should parse");
+        assert_that!(
+            &duplicate_expire,
+            eq(&vec![b"-ERR syntax error\r\n".to_vec()])
+        );
+
+        let keep_with_expire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"KEEPTTL"]),
+            )
+            .expect("SET EX KEEPTTL should parse");
+        assert_that!(
+            &keep_with_expire,
+            eq(&vec![b"-ERR syntax error\r\n".to_vec()])
+        );
+
+        let invalid_integer = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"key", b"value", b"EX", b"abc"]),
+            )
+            .expect("SET EX invalid integer should parse");
+        assert_that!(
+            &invalid_integer,
+            eq(&vec![
+                b"-ERR value is not an integer or out of range\r\n".to_vec()
+            ])
+        );
+
+        let invalid_expire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"key", b"value", b"PX", b"0"]),
+            )
+            .expect("SET PX zero should parse");
+        assert_that!(
+            &invalid_expire,
+            eq(&vec![
+                b"-ERR invalid expire time in 'SET' command\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]
@@ -3646,6 +3845,64 @@ mod tests {
         assert_that!(
             app.replication.journal_entries()[0].op,
             eq(JournalOp::Command),
+        );
+    }
+
+    #[rstest]
+    fn journal_records_set_only_when_mutation_happens_with_conditions_and_get() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
+            )
+            .expect("SET NX should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
+            )
+            .expect("SET NX should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
+            )
+            .expect("SET NX GET should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
+            )
+            .expect("SET XX GET should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"missing", b"v", b"XX", b"GET"]),
+            )
+            .expect("SET XX GET on missing key should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"fresh", b"v", b"GET"]),
+            )
+            .expect("SET GET should execute");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("SET"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("SET"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[2].payload).contains("SET"),
+            eq(true)
         );
     }
 

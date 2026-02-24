@@ -216,7 +216,7 @@ impl CommandRegistry {
     fn register_string_commands(&mut self) {
         self.register(CommandSpec {
             name: "SET",
-            arity: CommandArity::Exact(2),
+            arity: CommandArity::AtLeast(2),
             handler: handle_set,
         });
         self.register(CommandSpec {
@@ -450,18 +450,81 @@ fn handle_echo(_db: DbIndex, frame: &CommandFrame, _state: &mut DispatchState) -
     CommandReply::BulkString(frame.args[0].clone())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetCondition {
+    Always,
+    IfMissing,
+    IfExists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetExpire {
+    Seconds(u64),
+    Milliseconds(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetOptions {
+    condition: SetCondition,
+    return_previous: bool,
+    keep_ttl: bool,
+    expire: Option<SetExpire>,
+}
+
+impl Default for SetOptions {
+    fn default() -> Self {
+        Self {
+            condition: SetCondition::Always,
+            return_previous: false,
+            keep_ttl: false,
+            expire: None,
+        }
+    }
+}
+
 fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = frame.args[0].clone();
     let value = frame.args[1].clone();
+    let options = match parse_set_options(&frame.args[2..]) {
+        Ok(options) => options,
+        Err(error) => return CommandReply::Error(error),
+    };
+    state.purge_expired_key(db, &key);
+
+    let existing = state.db_map(db).and_then(|map| map.get(&key)).cloned();
+    let key_exists = existing.is_some();
+    let previous_value = existing.as_ref().map(|entry| entry.value.clone());
+    let previous_expire_at = existing.and_then(|entry| entry.expire_at_unix_secs);
+
+    if !set_condition_satisfied(options.condition, key_exists) {
+        if options.return_previous {
+            return previous_value.map_or(CommandReply::Null, CommandReply::BulkString);
+        }
+        return CommandReply::Null;
+    }
+
+    let expire_at_unix_secs = if let Some(expire) = options.expire {
+        Some(resolve_set_expire_at_unix_secs(expire))
+    } else if options.keep_ttl {
+        previous_expire_at
+    } else {
+        None
+    };
+
     state.db_map_mut(db).insert(
         key.clone(),
         ValueEntry {
             value,
-            expire_at_unix_secs: None,
+            expire_at_unix_secs,
         },
     );
     state.bump_key_version(db, &key);
-    CommandReply::SimpleString("OK".to_owned())
+
+    if options.return_previous {
+        previous_value.map_or(CommandReply::Null, CommandReply::BulkString)
+    } else {
+        CommandReply::SimpleString("OK".to_owned())
+    }
 }
 
 fn handle_setnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -1355,6 +1418,92 @@ fn mutate_counter_by(
     CommandReply::Integer(next)
 }
 
+fn parse_set_options(args: &[Vec<u8>]) -> Result<SetOptions, String> {
+    let mut options = SetOptions::default();
+    let mut index = 0_usize;
+
+    while let Some(arg) = args.get(index) {
+        if arg.eq_ignore_ascii_case(b"NX") {
+            if options.condition == SetCondition::IfExists {
+                return Err("syntax error".to_owned());
+            }
+            options.condition = SetCondition::IfMissing;
+            index = index.saturating_add(1);
+            continue;
+        }
+        if arg.eq_ignore_ascii_case(b"XX") {
+            if options.condition == SetCondition::IfMissing {
+                return Err("syntax error".to_owned());
+            }
+            options.condition = SetCondition::IfExists;
+            index = index.saturating_add(1);
+            continue;
+        }
+        if arg.eq_ignore_ascii_case(b"GET") {
+            options.return_previous = true;
+            index = index.saturating_add(1);
+            continue;
+        }
+        if arg.eq_ignore_ascii_case(b"KEEPTTL") {
+            options.keep_ttl = true;
+            index = index.saturating_add(1);
+            continue;
+        }
+        if arg.eq_ignore_ascii_case(b"EX") || arg.eq_ignore_ascii_case(b"PX") {
+            if options.expire.is_some() {
+                return Err("syntax error".to_owned());
+            }
+            let Some(raw_expire) = args.get(index.saturating_add(1)) else {
+                return Err("syntax error".to_owned());
+            };
+            let Ok(expire) = parse_redis_i64(raw_expire) else {
+                return Err("value is not an integer or out of range".to_owned());
+            };
+            if expire <= 0 {
+                return Err("invalid expire time in 'SET' command".to_owned());
+            }
+            let Ok(expire) = u64::try_from(expire) else {
+                return Err("value is not an integer or out of range".to_owned());
+            };
+
+            options.expire = if arg.eq_ignore_ascii_case(b"EX") {
+                Some(SetExpire::Seconds(expire))
+            } else {
+                Some(SetExpire::Milliseconds(expire))
+            };
+            index = index.saturating_add(2);
+            continue;
+        }
+
+        return Err("syntax error".to_owned());
+    }
+
+    if options.keep_ttl && options.expire.is_some() {
+        return Err("syntax error".to_owned());
+    }
+    Ok(options)
+}
+
+fn set_condition_satisfied(condition: SetCondition, key_exists: bool) -> bool {
+    match condition {
+        SetCondition::Always => true,
+        SetCondition::IfMissing => !key_exists,
+        SetCondition::IfExists => key_exists,
+    }
+}
+
+fn resolve_set_expire_at_unix_secs(expire: SetExpire) -> u64 {
+    match expire {
+        SetExpire::Seconds(seconds) => DispatchState::now_unix_seconds().saturating_add(seconds),
+        SetExpire::Milliseconds(milliseconds) => {
+            DispatchState::now_unix_millis()
+                .saturating_add(milliseconds)
+                .saturating_add(999)
+                / 1000
+        }
+    }
+}
+
 type ExpireOptions = u8;
 
 const EXPIRE_ALWAYS: ExpireOptions = 0;
@@ -1518,6 +1667,300 @@ mod tests {
             &mut state,
         );
         assert_that!(&get_reply, eq(&CommandReply::BulkString(b"alice".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_set_supports_conditional_and_get_options() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k".to_vec(), b"v1".to_vec(), b"NX".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let skipped = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![b"k".to_vec(), b"ignored".to_vec(), b"nx".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&skipped, eq(&CommandReply::Null));
+
+        let skipped_with_get = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"k".to_vec(),
+                    b"ignored".to_vec(),
+                    b"NX".to_vec(),
+                    b"GET".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &skipped_with_get,
+            eq(&CommandReply::BulkString(b"v1".to_vec()))
+        );
+
+        let xx_missing = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"missing".to_vec(),
+                    b"value".to_vec(),
+                    b"XX".to_vec(),
+                    b"GET".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&xx_missing, eq(&CommandReply::Null));
+
+        let xx_existing = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"k".to_vec(),
+                    b"v2".to_vec(),
+                    b"xx".to_vec(),
+                    b"get".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&xx_existing, eq(&CommandReply::BulkString(b"v1".to_vec())));
+
+        let current = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&current, eq(&CommandReply::BulkString(b"v2".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_set_applies_expire_and_keepttl_options() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let with_ex = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"ttl:key".to_vec(),
+                    b"v1".to_vec(),
+                    b"EX".to_vec(),
+                    b"60".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&with_ex, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let first_ttl = registry.dispatch(
+            0,
+            &CommandFrame::new("TTL", vec![b"ttl:key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(first_ttl) = first_ttl else {
+            panic!("TTL must return integer");
+        };
+        assert_that!(first_ttl > 0, eq(true));
+
+        let keep_ttl = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![b"ttl:key".to_vec(), b"v2".to_vec(), b"KEEPTTL".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&keep_ttl, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let ttl_after_keep = registry.dispatch(
+            0,
+            &CommandFrame::new("TTL", vec![b"ttl:key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(ttl_after_keep) = ttl_after_keep else {
+            panic!("TTL must return integer");
+        };
+        assert_that!(ttl_after_keep > 0, eq(true));
+
+        let clear_ttl = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"ttl:key".to_vec(), b"v3".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&clear_ttl, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let ttl_after_plain = registry.dispatch(
+            0,
+            &CommandFrame::new("TTL", vec![b"ttl:key".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&ttl_after_plain, eq(&CommandReply::Integer(-1)));
+
+        let with_px = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"px:key".to_vec(),
+                    b"value".to_vec(),
+                    b"PX".to_vec(),
+                    b"1200".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&with_px, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let pttl = registry.dispatch(
+            0,
+            &CommandFrame::new("PTTL", vec![b"px:key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(pttl) = pttl else {
+            panic!("PTTL must return integer");
+        };
+        assert_that!(pttl > 0, eq(true));
+    }
+
+    #[rstest]
+    fn dispatch_set_rejects_invalid_option_combinations() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let nx_xx = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"key".to_vec(),
+                    b"value".to_vec(),
+                    b"NX".to_vec(),
+                    b"XX".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&nx_xx, eq(&CommandReply::Error("syntax error".to_owned())));
+
+        let duplicate_expire = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"key".to_vec(),
+                    b"value".to_vec(),
+                    b"EX".to_vec(),
+                    b"1".to_vec(),
+                    b"PX".to_vec(),
+                    b"1000".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &duplicate_expire,
+            eq(&CommandReply::Error("syntax error".to_owned()))
+        );
+
+        let keepttl_with_expire = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"key".to_vec(),
+                    b"value".to_vec(),
+                    b"EX".to_vec(),
+                    b"5".to_vec(),
+                    b"KEEPTTL".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &keepttl_with_expire,
+            eq(&CommandReply::Error("syntax error".to_owned()))
+        );
+
+        let missing_expire_value = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![b"key".to_vec(), b"value".to_vec(), b"EX".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &missing_expire_value,
+            eq(&CommandReply::Error("syntax error".to_owned()))
+        );
+
+        let invalid_expire_integer = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"key".to_vec(),
+                    b"value".to_vec(),
+                    b"EX".to_vec(),
+                    b"abc".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &invalid_expire_integer,
+            eq(&CommandReply::Error(
+                "value is not an integer or out of range".to_owned()
+            ))
+        );
+
+        let invalid_expire_time = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![
+                    b"key".to_vec(),
+                    b"value".to_vec(),
+                    b"PX".to_vec(),
+                    b"0".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &invalid_expire_time,
+            eq(&CommandReply::Error(
+                "invalid expire time in 'SET' command".to_owned()
+            ))
+        );
+
+        let unknown_option = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![b"key".to_vec(), b"value".to_vec(), b"SOMETHING".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &unknown_option,
+            eq(&CommandReply::Error("syntax error".to_owned()))
+        );
     }
 
     #[rstest]
