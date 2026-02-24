@@ -102,6 +102,13 @@ impl ReplicationModule {
             .register_replica_endpoint(address, listening_port);
     }
 
+    /// Removes one replica endpoint when present.
+    ///
+    /// Returns `true` when one endpoint was removed.
+    pub fn remove_replica_endpoint(&mut self, address: &str, listening_port: u16) -> bool {
+        self.state.remove_replica_endpoint(address, listening_port)
+    }
+
     /// Marks all registered replicas as being in full sync.
     pub fn mark_replicas_full_sync(&mut self) {
         self.state

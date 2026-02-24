@@ -1182,6 +1182,24 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         Ok(())
     }
 
+    fn register_connection_replica_endpoint(
+        &mut self,
+        connection: &mut ServerConnection,
+        endpoint: ReplicaEndpointIdentity,
+    ) {
+        if let Some(existing) = connection.replica_endpoint.clone()
+            && existing != endpoint
+        {
+            let _ = self
+                .replication
+                .remove_replica_endpoint(&existing.address, existing.listening_port);
+        }
+
+        self.replication
+            .register_replica_endpoint(endpoint.address.clone(), endpoint.listening_port);
+        connection.replica_endpoint = Some(endpoint);
+    }
+
     fn apply_replconf_endpoint_update(
         &mut self,
         connection: &mut ServerConnection,
@@ -1197,24 +1215,29 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                         .map(|endpoint| endpoint.address.clone())
                 })
                 .unwrap_or_else(|| "127.0.0.1".to_owned());
-            self.replication
-                .register_replica_endpoint(address.clone(), port);
-            connection.replica_endpoint = Some(ReplicaEndpointIdentity {
-                address,
-                listening_port: port,
-            });
+            self.register_connection_replica_endpoint(
+                connection,
+                ReplicaEndpointIdentity {
+                    address,
+                    listening_port: port,
+                },
+            );
             return;
         }
 
         if let Some(address) = announced_ip
-            && let Some(existing) = connection.replica_endpoint.as_ref()
+            && let Some(existing_port) = connection
+                .replica_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.listening_port)
         {
-            self.replication
-                .register_replica_endpoint(address.clone(), existing.listening_port);
-            connection.replica_endpoint = Some(ReplicaEndpointIdentity {
-                address,
-                listening_port: existing.listening_port,
-            });
+            self.register_connection_replica_endpoint(
+                connection,
+                ReplicaEndpointIdentity {
+                    address,
+                    listening_port: existing_port,
+                },
+            );
         }
     }
 
@@ -6565,6 +6588,53 @@ mod tests {
             .expect("INFO REPLICATION should succeed");
         let body = decode_resp_bulk_payload(&info[0]);
         assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_replconf_endpoint_identity_update_replaces_stale_endpoint_row() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut client,
+                &resp_command(&[b"SET", b"replconf:identity:key", b"value"]),
+            )
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica ACK should parse");
+        assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica,
+                &resp_command(&[b"REPLCONF", b"IP-ADDRESS", b"10.0.0.8"]),
+            )
+            .expect("replica REPLCONF IP-ADDRESS should succeed");
+
+        let info = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
+        assert_that!(
+            body.contains("slave0:ip=10.0.0.8,port=7001,state=preparation,lag=0\r\n"),
+            eq(true)
+        );
+        assert_that!(body.contains("127.0.0.1"), eq(false));
+
+        let wait = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
     }
 
     #[rstest]

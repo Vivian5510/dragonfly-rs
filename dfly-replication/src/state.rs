@@ -192,6 +192,26 @@ impl ReplicationState {
         self.connected_replicas = self.replicas.len();
     }
 
+    /// Removes one replica endpoint when present.
+    ///
+    /// Returns `true` when one endpoint row was removed.
+    pub fn remove_replica_endpoint(&mut self, address: &str, listening_port: u16) -> bool {
+        let before_len = self.replicas.len();
+        self.replicas
+            .retain(|entry| !(entry.address == address && entry.listening_port == listening_port));
+        let removed = self.replicas.len() != before_len;
+        if removed {
+            self.connected_replicas = self.replicas.len();
+            self.last_acked_lsn = self
+                .replicas
+                .iter()
+                .map(|replica| replica.last_acked_lsn)
+                .max()
+                .unwrap_or(0);
+        }
+        removed
+    }
+
     /// Records one replica ACK offset for a specific endpoint.
     ///
     /// ACK is clamped to current master offset and applied monotonically for that endpoint.
@@ -600,5 +620,35 @@ mod tests {
         assert_that!(state.replicas[0].last_acked_lsn, eq(0_u64));
         assert_that!(state.replicas[1].last_acked_lsn, eq(3_u64));
         assert_that!(state.last_acked_lsn, eq(3_u64));
+    }
+
+    #[rstest]
+    fn removing_replica_endpoint_recomputes_replica_count_and_global_ack() {
+        let mut state = ReplicationState::default();
+        state.set_last_lsn_from_next_cursor(6);
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        state.register_replica_endpoint("10.0.0.2".to_owned(), 7002);
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.1", 7001, 5),
+            eq(true)
+        );
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.2", 7002, 3),
+            eq(true)
+        );
+        assert_that!(state.connected_replicas, eq(2_usize));
+        assert_that!(state.last_acked_lsn, eq(5_u64));
+
+        assert_that!(state.remove_replica_endpoint("10.0.0.1", 7001), eq(true));
+        assert_that!(state.connected_replicas, eq(1_usize));
+        assert_that!(state.last_acked_lsn, eq(3_u64));
+        assert_that!(
+            state
+                .replicas
+                .iter()
+                .all(|entry| !(entry.address == "10.0.0.1" && entry.listening_port == 7001)),
+            eq(true)
+        );
+        assert_that!(state.remove_replica_endpoint("10.0.0.9", 7009), eq(false));
     }
 }
