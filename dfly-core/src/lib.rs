@@ -190,7 +190,7 @@ impl CoreModule {
         match frame.name.as_str() {
             "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "DEL" | "EXISTS"
             | "GETRANGE" | "SETRANGE" | "SETEX" | "EXPIRE" | "EXPIREAT" | "TTL" | "PERSIST"
-            | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => frame
+            | "EXPIRETIME" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),

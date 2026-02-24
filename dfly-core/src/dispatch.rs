@@ -284,6 +284,11 @@ impl CommandRegistry {
             handler: handle_ttl,
         });
         self.register(CommandSpec {
+            name: "EXPIRETIME",
+            arity: CommandArity::Exact(1),
+            handler: handle_expiretime,
+        });
+        self.register(CommandSpec {
             name: "PERSIST",
             arity: CommandArity::Exact(1),
             handler: handle_persist,
@@ -697,6 +702,27 @@ fn handle_ttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
     let remaining = expire_at.saturating_sub(now);
     match i64::try_from(remaining) {
         Ok(remaining) => CommandReply::Integer(remaining),
+        Err(_) => CommandReply::Integer(i64::MAX),
+    }
+}
+
+fn handle_expiretime(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let Some(expire_at) = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .and_then(|entry| entry.expire_at_unix_secs)
+    else {
+        if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+            return CommandReply::Integer(-1);
+        }
+        return CommandReply::Integer(-2);
+    };
+
+    match i64::try_from(expire_at) {
+        Ok(expire_at) => CommandReply::Integer(expire_at),
         Err(_) => CommandReply::Integer(i64::MAX),
     }
 }
@@ -1182,6 +1208,50 @@ mod tests {
             &mut state,
         );
         assert_that!(&ttl_after_expire, eq(&CommandReply::Integer(-2)));
+    }
+
+    #[rstest]
+    fn dispatch_expiretime_reports_missing_persistent_and_expiring_keys() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let missing = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"missing".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&missing, eq(&CommandReply::Integer(-2)));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"persist".to_vec(), b"v".to_vec()]),
+            &mut state,
+        );
+        let persistent = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"persist".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&persistent, eq(&CommandReply::Integer(-1)));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETEX",
+                vec![b"temp".to_vec(), b"60".to_vec(), b"v".to_vec()],
+            ),
+            &mut state,
+        );
+        let expiring = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(expire_at) = expiring else {
+            panic!("EXPIRETIME must return integer");
+        };
+        let now = i64::try_from(DispatchState::now_unix_seconds()).unwrap_or(i64::MAX);
+        assert_that!(expire_at >= now, eq(true));
     }
 
     #[rstest]
