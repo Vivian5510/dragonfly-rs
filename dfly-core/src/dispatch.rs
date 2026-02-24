@@ -278,6 +278,11 @@ impl CommandRegistry {
 
     fn register_expiry_commands(&mut self) {
         self.register(CommandSpec {
+            name: "PSETEX",
+            arity: CommandArity::Exact(3),
+            handler: handle_psetex,
+        });
+        self.register(CommandSpec {
             name: "SETEX",
             arity: CommandArity::Exact(3),
             handler: handle_setex,
@@ -647,6 +652,32 @@ fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
         ValueEntry {
             value: frame.args[2].clone(),
             expire_at_unix_secs: Some(expire_at),
+        },
+    );
+    state.bump_key_version(db, &key);
+    CommandReply::SimpleString("OK".to_owned())
+}
+
+fn handle_psetex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let Ok(milliseconds) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    if milliseconds <= 0 {
+        return CommandReply::Error("invalid expire time in 'PSETEX' command".to_owned());
+    }
+    let Ok(expire_delta_millis) = u64::try_from(milliseconds) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let now_millis = DispatchState::now_unix_millis();
+    let expire_at_millis = now_millis.saturating_add(expire_delta_millis);
+    let expire_at_secs = expire_at_millis.saturating_add(999) / 1000;
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value: frame.args[2].clone(),
+            expire_at_unix_secs: Some(expire_at_secs),
         },
     );
     state.bump_key_version(db, &key);
@@ -1703,6 +1734,39 @@ mod tests {
     }
 
     #[rstest]
+    fn dispatch_psetex_sets_value_and_pttl() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let psetex = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PSETEX",
+                vec![b"session".to_vec(), b"1500".to_vec(), b"alive".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&psetex, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"session".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"alive".to_vec())));
+
+        let pttl = registry.dispatch(
+            0,
+            &CommandFrame::new("PTTL", vec![b"session".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(pttl_ms) = pttl else {
+            panic!("PTTL must return integer");
+        };
+        assert_that!(pttl_ms > 0, eq(true));
+    }
+
+    #[rstest]
     fn dispatch_setex_rejects_non_positive_expire_values() {
         let registry = CommandRegistry::with_builtin_commands();
         let mut state = DispatchState::default();
@@ -1719,6 +1783,27 @@ mod tests {
             &reply,
             eq(&CommandReply::Error(
                 "invalid expire time in 'SETEX' command".to_owned()
+            ))
+        );
+    }
+
+    #[rstest]
+    fn dispatch_psetex_rejects_non_positive_expire_values() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let reply = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PSETEX",
+                vec![b"session".to_vec(), b"0".to_vec(), b"alive".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &reply,
+            eq(&CommandReply::Error(
+                "invalid expire time in 'PSETEX' command".to_owned()
             ))
         );
     }
