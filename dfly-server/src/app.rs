@@ -1256,7 +1256,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(required_text) = std::str::from_utf8(&frame.args[0]) else {
             return CommandReply::Error("WAIT numreplicas must be valid UTF-8".to_owned());
         };
-        let Ok(required) = required_text.parse::<u64>() else {
+        let Ok(_required) = required_text.parse::<u64>() else {
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
         let Ok(timeout_text) = std::str::from_utf8(&frame.args[1]) else {
@@ -1266,13 +1266,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
 
+        // WAIT returns "replicas reached" count, not "requested replicas" count.
+        // Timeout/blocking is not modeled yet, but the return semantics match Redis/Dragonfly.
         let replicated = u64::try_from(
             self.replication
                 .acked_replica_count_at_or_above(self.replication.replication_offset()),
         )
         .unwrap_or(u64::MAX);
-        let confirmed = replicated.min(required);
-        CommandReply::Integer(i64::try_from(confirmed).unwrap_or(i64::MAX))
+        CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX))
     }
 
     fn execute_dfly_flow(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -5894,6 +5895,41 @@ mod tests {
             .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
             .expect("WAIT should execute");
         assert_that!(&wait_two, eq(&vec![b":2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_wait_reports_actual_acked_replica_count_even_when_requested_is_lower() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica2,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+            )
+            .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica1 ACK should parse");
+        let _ = app
+            .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica2 ACK should parse");
+
+        let wait = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait, eq(&vec![b":2\r\n".to_vec()]));
     }
 
     #[rstest]
