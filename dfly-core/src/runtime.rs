@@ -96,6 +96,23 @@ impl InMemoryShardRuntime {
         Ok(std::mem::take(&mut *guard))
     }
 
+    /// Returns current number of processed envelopes for one shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range or when
+    /// the shard log mutex is poisoned.
+    pub fn processed_count(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(bucket) = self.executed_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let guard = bucket
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(guard.len())
+    }
+
     /// Waits until one shard has processed at least `minimum` envelopes.
     ///
     /// # Errors
@@ -257,5 +274,31 @@ mod tests {
             .expect("drain should succeed");
         assert_that!(&first, eq(&vec![shard_zero]));
         assert_that!(&second, eq(&vec![shard_one]));
+    }
+
+    #[rstest]
+    fn runtime_reports_processed_count_per_shard() {
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
+        let first = RuntimeEnvelope {
+            target_shard: 0,
+            command: CommandFrame::new("GET", vec![b"a".to_vec()]),
+        };
+        let second = RuntimeEnvelope {
+            target_shard: 0,
+            command: CommandFrame::new("GET", vec![b"b".to_vec()]),
+        };
+
+        assert_that!(runtime.submit(first).is_ok(), eq(true));
+        assert_that!(runtime.submit(second).is_ok(), eq(true));
+        assert_that!(
+            runtime
+                .wait_for_processed_count(0, 2, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            runtime.processed_count(0).expect("count should succeed"),
+            eq(2)
+        );
     }
 }
