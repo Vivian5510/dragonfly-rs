@@ -5,7 +5,6 @@ use dfly_common::config::RuntimeConfig;
 use dfly_common::error::DflyResult;
 use dfly_core::CoreModule;
 use dfly_core::command::CommandFrame;
-use dfly_core::dispatch::DispatchState;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::ClientProtocol;
@@ -27,8 +26,6 @@ pub struct ServerApp {
     pub facade: FacadeModule,
     /// Core routing and command model layer.
     pub core: CoreModule,
-    /// Mutable execution state backing command handlers.
-    pub dispatch_state: DispatchState,
     /// Transaction planner/scheduler layer.
     pub transaction: TransactionModule,
     /// Storage layer.
@@ -49,7 +46,6 @@ impl ServerApp {
     pub fn new(config: RuntimeConfig) -> Self {
         let facade = FacadeModule::from_config(&config);
         let core = CoreModule::new(config.shard_count);
-        let dispatch_state = DispatchState::default();
         let transaction = TransactionModule::new();
         let storage = StorageModule::new();
         let replication = ReplicationModule::new(false);
@@ -61,7 +57,6 @@ impl ServerApp {
             config,
             facade,
             core,
-            dispatch_state,
             transaction,
             storage,
             replication,
@@ -129,10 +124,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             // Protocol parser has already normalized command shape, so dispatcher can operate
             // on a stable frame independent from socket/wire details.
             let frame = CommandFrame::new(parsed.name, parsed.args);
-            let reply = self
-                .core
-                .command_registry
-                .dispatch(&frame, &mut self.dispatch_state);
+            let reply = self.core.execute(&frame);
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
