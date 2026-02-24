@@ -155,6 +155,12 @@ impl SharedCore {
         self.with_core(|core| core.keys_in_slot(db, slot))
     }
 
+    /// Returns live key count in selected logical DB for one cluster slot.
+    #[must_use]
+    pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
+        self.with_core(|core| core.count_keys_in_slot(db, slot))
+    }
+
     /// Runs one active-expiration pass on every shard.
     ///
     /// `limit_per_shard` bounds the number of expired keys deleted by each shard
@@ -620,6 +626,37 @@ impl CoreModule {
         keys.sort_unstable();
         keys.dedup();
         keys
+    }
+
+    /// Returns live key count in selected logical DB for one cluster slot.
+    #[must_use]
+    pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let mut total = 0_usize;
+
+        for state in &self.shard_states {
+            let Some(table) = state.db_tables.get(&db) else {
+                continue;
+            };
+            let Some(slot_keys) = table.slot_keys.get(&slot) else {
+                continue;
+            };
+            total = total.saturating_add(
+                slot_keys
+                    .iter()
+                    .filter(|key| {
+                        table.prime.get(*key).is_some_and(|value| {
+                            value
+                                .expire_at_unix_secs
+                                .is_none_or(|expire_at| expire_at > now)
+                        })
+                    })
+                    .count(),
+            );
+        }
+        total
     }
 
     /// Runs one active-expiration pass on each shard state.
@@ -1320,6 +1357,43 @@ mod tests {
         assert_that!(&slot_keys, eq(&vec![first_key.clone(), second_key.clone()]));
         assert_that!(slot_keys.contains(&expired_key), eq(false));
         assert_that!(slot_keys.contains(&other_slot_key), eq(false));
+    }
+
+    #[rstest]
+    fn core_count_keys_in_slot_ignores_expired_entries() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let first_key = b"slot:count:{alpha}:1".to_vec();
+        let second_key = b"slot:count:{alpha}:2".to_vec();
+        let other_slot_key = b"slot:count:{beta}:1".to_vec();
+        let expired_key = b"slot:count:{alpha}:expired".to_vec();
+        let slot = key_slot(&first_key);
+        assert_that!(key_slot(&second_key), eq(slot));
+        assert_that!(key_slot(&expired_key), eq(slot));
+        assert_that!(key_slot(&other_slot_key) != slot, eq(true));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![first_key.clone(), b"one".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![second_key.clone(), b"two".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![other_slot_key.clone(), b"x".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![expired_key.clone(), b"gone".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("EXPIRE", vec![expired_key.clone(), b"0".to_vec()]),
+        );
+
+        assert_that!(core.count_keys_in_slot(0, slot), eq(2_usize));
     }
 
     #[rstest]

@@ -1445,6 +1445,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         match subcommand.to_ascii_uppercase().as_str() {
             "HELP" => Self::execute_cluster_help(frame),
+            "COUNTKEYSINSLOT" => self.execute_cluster_countkeysinslot(db, frame),
             "GETKEYSINSLOT" => self.execute_cluster_getkeysinslot(db, frame),
             "INFO" => self.execute_cluster_info(frame),
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
@@ -1504,6 +1505,29 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         )
     }
 
+    fn execute_cluster_countkeysinslot(&self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER COUNTKEYSINSLOT' command".to_owned(),
+            );
+        }
+
+        let Ok(slot_text) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error(
+                "CLUSTER COUNTKEYSINSLOT slot must be valid UTF-8".to_owned(),
+            );
+        };
+        let Ok(slot) = slot_text.parse::<u16>() else {
+            return CommandReply::Error("value is not an integer or out of range".to_owned());
+        };
+        if slot > 16_383 {
+            return CommandReply::Error("slot is out of range".to_owned());
+        }
+
+        let count = self.core.count_keys_in_slot(db, slot);
+        CommandReply::Integer(i64::try_from(count).unwrap_or(i64::MAX))
+    }
+
     fn execute_cluster_help(frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 1 {
             return CommandReply::Error(
@@ -1515,6 +1539,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "SLOTS",
             "   Return information about slots range mappings. Each range is made of:",
             "   start, end, master and replicas IP addresses, ports and ids.",
+            "COUNTKEYSINSLOT <slot>",
+            "   Return the number of keys in one hash slot.",
             "GETKEYSINSLOT <slot> <count>",
             "   Return up to <count> keys for one hash slot.",
             "NODES",

@@ -4955,8 +4955,9 @@ fn resp_cluster_help_returns_help_entries() {
         .expect("CLUSTER HELP should execute");
     assert_that!(reply.len(), eq(1_usize));
     let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
-    assert_that!(payload.starts_with("*13\r\n"), eq(true));
+    assert_that!(payload.starts_with("*15\r\n"), eq(true));
     assert_that!(payload.contains("$5\r\nSLOTS\r\n"), eq(true));
+    assert_that!(payload.contains("COUNTKEYSINSLOT <slot>\r\n"), eq(true));
     assert_that!(
         payload.contains("GETKEYSINSLOT <slot> <count>\r\n"),
         eq(true)
@@ -5106,6 +5107,106 @@ fn resp_cluster_getkeysinslot_validates_arguments() {
         eq(&vec![
             b"-ERR value is not an integer or out of range\r\n".to_vec()
         ])
+    );
+}
+
+#[rstest]
+fn resp_cluster_countkeysinslot_returns_live_cardinality() {
+    let config = RuntimeConfig {
+        cluster_mode: ClusterMode::Emulated,
+        ..RuntimeConfig::default()
+    };
+    let mut app = ServerApp::new(config);
+    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    let first_key = b"{7}:a".to_vec();
+    let second_key = b"{7}:b".to_vec();
+    let expired_key = b"{7}:z".to_vec();
+    let other_slot_key = b"{8}:x".to_vec();
+    let slot = key_slot(&first_key);
+
+    let _ = app
+        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", &first_key, b"v1"]))
+        .expect("SET should succeed");
+    let _ = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"SET", &second_key, b"v2"]),
+        )
+        .expect("SET should succeed");
+    let _ = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"SET", &other_slot_key, b"x"]),
+        )
+        .expect("SET should succeed");
+    let _ = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"SET", &expired_key, b"gone"]),
+        )
+        .expect("SET should succeed");
+    let _ = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"EXPIRE", &expired_key, b"0"]),
+        )
+        .expect("EXPIRE should succeed");
+
+    let slot_text = slot.to_string().into_bytes();
+    let reply = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", &slot_text]),
+        )
+        .expect("CLUSTER COUNTKEYSINSLOT should execute");
+    assert_that!(&reply, eq(&vec![b":2\r\n".to_vec()]));
+}
+
+#[rstest]
+fn resp_cluster_countkeysinslot_validates_arguments() {
+    let config = RuntimeConfig {
+        cluster_mode: ClusterMode::Emulated,
+        ..RuntimeConfig::default()
+    };
+    let mut app = ServerApp::new(config);
+    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    let arity = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT"]),
+        )
+        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    assert_that!(
+        &arity,
+        eq(&vec![
+            b"-ERR wrong number of arguments for 'CLUSTER COUNTKEYSINSLOT' command\r\n".to_vec()
+        ])
+    );
+
+    let invalid_slot = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"abc"]),
+        )
+        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    assert_that!(
+        &invalid_slot,
+        eq(&vec![
+            b"-ERR value is not an integer or out of range\r\n".to_vec()
+        ])
+    );
+
+    let out_of_range = app
+        .feed_connection_bytes(
+            &mut connection,
+            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"20000"]),
+        )
+        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    assert_that!(
+        &out_of_range,
+        eq(&vec![b"-ERR slot is out of range\r\n".to_vec()])
     );
 }
 
