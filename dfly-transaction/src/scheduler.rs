@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{ShardId, TxId};
+use dfly_core::{SingleKeyAccess, classify_single_key_access};
 
 use crate::plan::{TransactionMode, TransactionPlan};
 
@@ -53,7 +54,7 @@ struct SchedulerState {
 }
 
 type KeyId = (ShardId, Vec<u8>);
-type KeyAccessList = Vec<(KeyId, KeyAccess)>;
+type KeyAccessList = Vec<(KeyId, SingleKeyAccess)>;
 
 #[derive(Debug, Default)]
 struct KeyLockState {
@@ -63,16 +64,10 @@ struct KeyLockState {
     writer: Option<TxId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyAccess {
-    Read,
-    Write,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyLease {
     key_id: KeyId,
-    access: KeyAccess,
+    access: SingleKeyAccess,
 }
 
 #[derive(Debug, Default)]
@@ -201,7 +196,7 @@ fn validate_plan_shape(plan: &TransactionPlan) -> DflyResult<()> {
 fn validate_non_atomic_mode(plan: &TransactionPlan) -> DflyResult<()> {
     for hop in &plan.hops {
         for (_, command) in &hop.per_shard {
-            if classify_single_key_access(command) != Some(KeyAccess::Read) {
+            if classify_single_key_access(command) != Some(SingleKeyAccess::Read) {
                 return Err(DflyError::InvalidState(
                     "non-atomic mode requires read-only single-key commands",
                 ));
@@ -212,7 +207,7 @@ fn validate_non_atomic_mode(plan: &TransactionPlan) -> DflyResult<()> {
 }
 
 fn collect_lock_ahead_accesses(plan: &TransactionPlan) -> DflyResult<KeyAccessList> {
-    let mut by_key = HashMap::<KeyId, KeyAccess>::new();
+    let mut by_key = HashMap::<KeyId, SingleKeyAccess>::new();
     for hop in &plan.hops {
         for (shard, command) in &hop.per_shard {
             let Some(access) = classify_single_key_access(command) else {
@@ -228,8 +223,8 @@ fn collect_lock_ahead_accesses(plan: &TransactionPlan) -> DflyResult<KeyAccessLi
             by_key
                 .entry((*shard, primary_key.clone()))
                 .and_modify(|current| {
-                    if *current == KeyAccess::Read && access == KeyAccess::Write {
-                        *current = KeyAccess::Write;
+                    if *current == SingleKeyAccess::Read && access == SingleKeyAccess::Write {
+                        *current = SingleKeyAccess::Write;
                     }
                 })
                 .or_insert(access);
@@ -246,39 +241,20 @@ fn collect_lock_ahead_accesses(plan: &TransactionPlan) -> DflyResult<KeyAccessLi
     Ok(accesses)
 }
 
-fn classify_single_key_access(command: &dfly_core::command::CommandFrame) -> Option<KeyAccess> {
-    let has_exactly_one_key_arg = command.args.len() == 1;
-    let has_primary_key = !command.args.is_empty();
-
-    match command.name.as_str() {
-        "GET" | "TYPE" | "STRLEN" | "GETRANGE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME"
-            if has_exactly_one_key_arg =>
-        {
-            Some(KeyAccess::Read)
-        }
-        "EXISTS" | "TOUCH" if has_exactly_one_key_arg => Some(KeyAccess::Read),
-        "SET" | "GETSET" | "GETDEL" | "APPEND" | "MOVE" | "SETRANGE" | "SETEX" | "PSETEX"
-        | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "INCR" | "DECR"
-        | "INCRBY" | "DECRBY" | "SETNX"
-            if has_primary_key =>
-        {
-            Some(KeyAccess::Write)
-        }
-        "DEL" | "UNLINK" if has_exactly_one_key_arg => Some(KeyAccess::Write),
-        _ => None,
-    }
-}
-
-fn try_acquire_key_lock(lock_state: &mut KeyLockState, txid: TxId, access: KeyAccess) -> bool {
+fn try_acquire_key_lock(
+    lock_state: &mut KeyLockState,
+    txid: TxId,
+    access: SingleKeyAccess,
+) -> bool {
     match access {
-        KeyAccess::Read => {
+        SingleKeyAccess::Read => {
             if lock_state.writer.is_some_and(|owner| owner != txid) {
                 return false;
             }
             let _ = lock_state.readers.insert(txid);
             true
         }
-        KeyAccess::Write => {
+        SingleKeyAccess::Write => {
             if lock_state.writer.is_some_and(|owner| owner != txid) {
                 return false;
             }
@@ -295,10 +271,10 @@ fn release_key_lease(state: &mut SchedulerState, txid: TxId, lease: &KeyLease) {
     let mut remove_state = false;
     if let Some(lock_state) = state.key_locks.get_mut(&lease.key_id) {
         match lease.access {
-            KeyAccess::Read => {
+            SingleKeyAccess::Read => {
                 let _ = lock_state.readers.remove(&txid);
             }
-            KeyAccess::Write => {
+            SingleKeyAccess::Write => {
                 if lock_state.writer == Some(txid) {
                     lock_state.writer = None;
                 }
@@ -447,6 +423,32 @@ mod tests {
 
         let result = scheduler.schedule(&plan);
         assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_accepts_lockahead_set_with_extra_options() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new(
+                        "SET",
+                        vec![
+                            b"k".to_vec(),
+                            b"v".to_vec(),
+                            b"NX".to_vec(),
+                            b"GET".to_vec(),
+                        ],
+                    ),
+                )],
+            }],
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_ok(), eq(true));
     }
 
     #[rstest]

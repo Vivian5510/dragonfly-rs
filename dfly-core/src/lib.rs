@@ -26,6 +26,77 @@ pub enum CommandRouting {
     NonKey,
 }
 
+/// Single-key access class used by planner/scheduler lock semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleKeyAccess {
+    /// Read-only access on one key.
+    Read,
+    /// Mutating access on one key.
+    Write,
+}
+
+/// Classifies whether one command has a single-key access shape and access type.
+///
+/// Dragonfly's transaction planner relies on this classification to decide:
+/// - can the command participate in lock-ahead mode?
+/// - is `NonAtomic` mode safe (read-only)?
+///
+/// The function intentionally focuses on *shape* and *access intent* only.
+/// Arity validation still belongs to the command table validation path.
+#[must_use]
+pub fn classify_single_key_access(frame: &CommandFrame) -> Option<SingleKeyAccess> {
+    let name = frame.name.as_str();
+    let has_exactly_one_key_arg = frame.args.len() == 1;
+    let has_primary_key = !frame.args.is_empty();
+
+    if has_exactly_one_key_arg
+        && matches!(
+            name,
+            "GET"
+                | "TYPE"
+                | "STRLEN"
+                | "GETRANGE"
+                | "TTL"
+                | "PTTL"
+                | "EXPIRETIME"
+                | "PEXPIRETIME"
+                | "EXISTS"
+                | "TOUCH"
+        )
+    {
+        return Some(SingleKeyAccess::Read);
+    }
+
+    if (has_primary_key
+        && matches!(
+            name,
+            "SET"
+                | "GETSET"
+                | "GETDEL"
+                | "APPEND"
+                | "MOVE"
+                | "SETRANGE"
+                | "SETEX"
+                | "PSETEX"
+                | "EXPIRE"
+                | "PEXPIRE"
+                | "EXPIREAT"
+                | "PEXPIREAT"
+                | "PERSIST"
+                | "INCR"
+                | "DECR"
+                | "INCRBY"
+                | "DECRBY"
+                | "SETNX"
+        ))
+        || (has_exactly_one_key_arg && matches!(name, "DEL" | "UNLINK"))
+    {
+        return Some(SingleKeyAccess::Write);
+    }
+
+    None
+}
+
 /// Core module bootstrap object.
 ///
 /// In Unit 0 this struct only wires shard resolver policy. Later units add process-wide registries
@@ -376,56 +447,11 @@ impl CoreModule {
     /// Returns transaction-planning routing class for one command frame.
     #[must_use]
     pub fn command_routing(&self, frame: &CommandFrame) -> CommandRouting {
-        let name = frame.name.as_str();
-        let has_exactly_one_key_arg = frame.args.len() == 1;
-        let has_primary_key = !frame.args.is_empty();
-
-        if has_exactly_one_key_arg
-            && matches!(
-                name,
-                "GET"
-                    | "TYPE"
-                    | "STRLEN"
-                    | "GETRANGE"
-                    | "TTL"
-                    | "PTTL"
-                    | "EXPIRETIME"
-                    | "PEXPIRETIME"
-                    | "EXISTS"
-                    | "TOUCH"
-            )
-        {
-            return CommandRouting::SingleKey { is_write: false };
+        match classify_single_key_access(frame) {
+            Some(SingleKeyAccess::Read) => CommandRouting::SingleKey { is_write: false },
+            Some(SingleKeyAccess::Write) => CommandRouting::SingleKey { is_write: true },
+            None => CommandRouting::NonKey,
         }
-
-        if (has_primary_key
-            && matches!(
-                name,
-                "SET"
-                    | "GETSET"
-                    | "GETDEL"
-                    | "APPEND"
-                    | "MOVE"
-                    | "SETRANGE"
-                    | "SETEX"
-                    | "PSETEX"
-                    | "EXPIRE"
-                    | "PEXPIRE"
-                    | "EXPIREAT"
-                    | "PEXPIREAT"
-                    | "PERSIST"
-                    | "INCR"
-                    | "DECR"
-                    | "INCRBY"
-                    | "DECRBY"
-                    | "SETNX"
-            ))
-            || (has_exactly_one_key_arg && matches!(name, "DEL" | "UNLINK"))
-        {
-            return CommandRouting::SingleKey { is_write: true };
-        }
-
-        CommandRouting::NonKey
     }
 
     /// Returns whether command can participate in single-key lock-ahead planning.
@@ -565,7 +591,7 @@ fn parse_class_atom(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandRouting, CoreModule};
+    use super::{CommandRouting, CoreModule, SingleKeyAccess, classify_single_key_access};
     use crate::command::{CommandFrame, CommandReply};
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
@@ -634,6 +660,36 @@ mod tests {
         let ping = CommandFrame::new("PING", Vec::new());
         assert_that!(core.is_single_key_command(&ping), eq(false));
         assert_that!(core.command_routing(&ping), eq(CommandRouting::NonKey));
+    }
+
+    #[rstest]
+    fn core_classify_single_key_access_handles_command_shapes() {
+        let get = CommandFrame::new("GET", vec![b"k".to_vec()]);
+        assert_that!(
+            classify_single_key_access(&get),
+            eq(Some(SingleKeyAccess::Read))
+        );
+
+        // `SET` still targets one key although it carries extra option arguments.
+        let set_with_options = CommandFrame::new(
+            "SET",
+            vec![
+                b"k".to_vec(),
+                b"v".to_vec(),
+                b"NX".to_vec(),
+                b"GET".to_vec(),
+            ],
+        );
+        assert_that!(
+            classify_single_key_access(&set_with_options),
+            eq(Some(SingleKeyAccess::Write))
+        );
+
+        let del_multi = CommandFrame::new("DEL", vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert_that!(classify_single_key_access(&del_multi), eq(None));
+
+        let rename = CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]);
+        assert_that!(classify_single_key_access(&rename), eq(None));
     }
 
     #[rstest]
