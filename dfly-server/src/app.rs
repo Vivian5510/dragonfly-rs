@@ -516,6 +516,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     Ok(())
                 }
             }
+            "MSETNX" => {
+                if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+                    Err(wrong_arity_message("MSETNX"))
+                } else {
+                    Ok(())
+                }
+            }
             "REPLCONF" => {
                 if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
                     Err("syntax error".to_owned())
@@ -592,6 +599,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "EXISTS" => self.execute_exists(db, frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
+            "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "EXPIRE" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY"
             | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
@@ -1389,6 +1397,36 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
+    fn execute_msetnx(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+            return CommandReply::Error(
+                "wrong number of arguments for 'MSETNX' command".to_owned(),
+            );
+        }
+        if let Some(error_reply) = self.ensure_cluster_multi_key_constraints(
+            frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()),
+        ) {
+            return error_reply;
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let exists_frame = CommandFrame::new("EXISTS", vec![pair[0].clone()]);
+            if self.core.execute_in_db(db, &exists_frame) == CommandReply::Integer(1) {
+                return CommandReply::Integer(0);
+            }
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
+            let reply = self.core.execute_in_db(db, &set_frame);
+            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
+                return CommandReply::Error("MSETNX failed while setting key".to_owned());
+            }
+        }
+
+        CommandReply::Integer(1)
+    }
+
     fn ensure_cluster_multi_key_constraints<'a, I>(&self, keys: I) -> Option<CommandReply>
     where
         I: IntoIterator<Item = &'a [u8]>,
@@ -1545,7 +1583,7 @@ fn parse_flow_lsn_vector_for_flow(
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("SETNX", CommandReply::Integer(1)) => Some(JournalOp::Command),
+        ("SETNX" | "MSETNX", CommandReply::Integer(1)) => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -1758,6 +1796,53 @@ mod tests {
             &reply,
             eq(&vec![
                 b"-ERR wrong number of arguments for 'MSET' command\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_msetnx_sets_all_or_none() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
+            )
+            .expect("first MSETNX should execute");
+        assert_that!(&first, eq(&vec![b":1\r\n".to_vec()]));
+
+        let second = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
+            )
+            .expect("second MSETNX should execute");
+        assert_that!(&second, eq(&vec![b":0\r\n".to_vec()]));
+
+        let values = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MGET", b"a", b"b", b"c"]))
+            .expect("MGET should execute");
+        assert_that!(
+            &values,
+            eq(&vec![b"*3\r\n$1\r\n1\r\n$1\r\n2\r\n$-1\r\n".to_vec()])
+        );
+    }
+
+    #[rstest]
+    fn resp_msetnx_rejects_odd_arity() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let invalid = resp_command(&[b"MSETNX", b"a", b"1", b"b"]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &invalid)
+            .expect("MSETNX should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'MSETNX' command\r\n".to_vec()
             ])
         );
     }
@@ -2443,6 +2528,32 @@ mod tests {
         assert_that!(entries[0].op, eq(JournalOp::Command));
         assert_that!(
             String::from_utf8_lossy(&entries[0].payload).contains("MSET"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_msetnx_only_on_successful_insert_batch() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
+            )
+            .expect("first MSETNX should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
+            )
+            .expect("second MSETNX should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(1_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("MSETNX"),
             eq(true)
         );
     }
