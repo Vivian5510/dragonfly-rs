@@ -754,11 +754,7 @@ impl CoreModule {
                 state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .db_tables
-                    .get(&db)
-                    .and_then(|table| table.slot_stats.get(&slot))
-                    .copied()
-                    .unwrap_or(0)
+                    .count_live_keys_in_slot(db, slot)
             })
             .sum()
     }
@@ -1629,6 +1625,52 @@ mod tests {
         );
 
         assert_that!(core.count_keys_in_slot(0, slot), eq(2_usize));
+    }
+
+    #[rstest]
+    fn core_count_keys_in_slot_lazily_purges_expired_snapshot_entries() {
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let expired_key = b"slot:count:{lazy}:expired".to_vec();
+        let live_key = b"slot:count:{lazy}:live".to_vec();
+        let slot = key_slot(&expired_key);
+        assert_that!(key_slot(&live_key), eq(slot));
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: expired_key.clone(),
+                    value: b"gone".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: live_key.clone(),
+                    value: b"alive".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_add(3600)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        assert_that!(core.db_size(0), eq(2_usize));
+        assert_that!(core.count_keys_in_slot(0, slot), eq(1_usize));
+        assert_that!(core.db_size(0), eq(1_usize));
+        assert_that!(core.key_version(0, &expired_key), eq(2_u64));
+
+        let expired_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![expired_key.clone()]));
+        let live_value = core.execute_in_db(0, &CommandFrame::new("GET", vec![live_key.clone()]));
+        assert_that!(&expired_value, eq(&CommandReply::Null));
+        assert_that!(
+            &live_value,
+            eq(&CommandReply::BulkString(b"alive".to_vec()))
+        );
     }
 
     #[rstest]
