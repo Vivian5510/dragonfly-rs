@@ -7,8 +7,8 @@ use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
-use dfly_core::CoreModule;
 use dfly_core::CoreSnapshot;
+use dfly_core::SharedCore;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::{InMemoryShardRuntime, RuntimeEnvelope};
 use dfly_facade::FacadeModule;
@@ -38,7 +38,7 @@ pub struct ServerApp {
     /// Connection/protocol entry layer.
     pub facade: FacadeModule,
     /// Core routing and command model layer.
-    pub core: CoreModule,
+    pub core: SharedCore,
     /// Shard-thread runtime queue layer.
     pub runtime: InMemoryShardRuntime,
     /// Transaction planner/scheduler layer.
@@ -64,8 +64,12 @@ impl ServerApp {
     #[must_use]
     pub fn new(config: RuntimeConfig) -> Self {
         let facade = FacadeModule::from_config(&config);
-        let core = CoreModule::new(config.shard_count);
-        let runtime = InMemoryShardRuntime::new(config.shard_count);
+        let core = SharedCore::new(config.shard_count);
+        let runtime_core = core.clone();
+        let runtime =
+            InMemoryShardRuntime::new_with_executor(config.shard_count, move |envelope| {
+                runtime_core.execute_in_db(envelope.db, &envelope.command)
+            });
         let transaction = TransactionModule::new();
         let storage = StorageModule::new();
         let replication = ReplicationModule::new(true);
@@ -722,7 +726,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let target_shards =
                 self.runtime_target_shards_for_scheduled_command(*shard_hint, command);
             for target_shard in target_shards {
-                match self.submit_runtime_envelope_with_sequence(target_shard, command) {
+                match self.submit_runtime_envelope_with_sequence(target_shard, db, command, false) {
                     Ok(sequence) => {
                         target_sequence_by_shard
                             .entry(target_shard)
@@ -788,12 +792,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     fn submit_runtime_envelope_with_sequence(
         &self,
         shard: u16,
+        db: u16,
         command: &CommandFrame,
+        execute_on_worker: bool,
     ) -> DflyResult<u64> {
         // Dragonfly routes each hop command to its owner shard queue before execution.
-        // This learning path keeps execution local for now, while still modeling queue ingress.
         self.runtime.submit_with_sequence(RuntimeEnvelope {
             target_shard: shard,
+            db,
+            execute_on_worker,
             command: command.clone(),
         })
     }
@@ -805,7 +812,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         txid: Option<TxId>,
     ) -> CommandReply {
         if txid.is_none() {
-            match self.dispatch_direct_command_runtime(frame) {
+            if matches!(
+                self.core.command_routing(frame),
+                CommandRouting::SingleKey { .. }
+            ) {
+                let reply = self.execute_single_shard_command_via_runtime(db, frame);
+                self.maybe_append_journal_for_command(txid, db, frame, &reply);
+                return reply;
+            }
+
+            match self.dispatch_direct_command_runtime(db, frame) {
                 Ok(()) => {}
                 Err(error) => {
                     return CommandReply::Error(format!("runtime dispatch failed: {error}"));
@@ -818,19 +834,64 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         reply
     }
 
-    fn dispatch_direct_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
-        self.dispatch_runtime_for_command(frame, true)
+    fn execute_single_shard_command_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> CommandReply {
+        let Some(key) = frame.args.first() else {
+            return self.execute_command_without_side_effects(db, frame);
+        };
+        if let Some(moved) = self.cluster_moved_reply_for_key(key) {
+            return moved;
+        }
+
+        let shard = self.core.resolve_target_shard(frame);
+        if let Err(error) = self.transaction.scheduler.ensure_shards_available(&[shard]) {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+        }
+
+        let sequence = match self.submit_runtime_envelope_with_sequence(shard, db, frame, true) {
+            Ok(sequence) => sequence,
+            Err(error) => return CommandReply::Error(format!("runtime dispatch failed: {error}")),
+        };
+
+        match self
+            .runtime
+            .wait_for_processed_sequence(shard, sequence, Duration::from_millis(200))
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return CommandReply::Error(
+                    "runtime dispatch failed: runtime dispatch timed out".to_owned(),
+                );
+            }
+            Err(error) => return CommandReply::Error(format!("runtime dispatch failed: {error}")),
+        }
+
+        match self.runtime.take_processed_reply(shard, sequence) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                CommandReply::Error("runtime dispatch failed: missing worker reply".to_owned())
+            }
+            Err(error) => CommandReply::Error(format!("runtime dispatch failed: {error}")),
+        }
     }
 
-    fn dispatch_replay_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
+    fn dispatch_direct_command_runtime(&self, db: u16, frame: &CommandFrame) -> DflyResult<()> {
+        self.dispatch_runtime_for_command(db, frame, true)
+    }
+
+    fn dispatch_replay_command_runtime(&self, db: u16, frame: &CommandFrame) -> DflyResult<()> {
         // Recovery replay must stay independent from live transaction queue ownership checks.
         // During restore we rebuild state from persisted journal entries and should not depend
         // on transient in-memory scheduler leases.
-        self.dispatch_runtime_for_command(frame, false)
+        self.dispatch_runtime_for_command(db, frame, false)
     }
 
     fn dispatch_runtime_for_command(
         &self,
+        db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
     ) -> DflyResult<()> {
@@ -850,7 +911,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         // 2) wait until all shard workers report they consumed the envelope.
         let mut barriers = Vec::with_capacity(target_shards.len());
         for shard in target_shards {
-            let sequence = self.submit_runtime_envelope_with_sequence(shard, frame)?;
+            let sequence = self.submit_runtime_envelope_with_sequence(shard, db, frame, false)?;
             barriers.push((shard, sequence));
         }
         for (shard, sequence) in barriers {
@@ -1993,7 +2054,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let frame = parse_journal_command_frame(&entry.payload)?;
             // Journal replay should follow the same shard-ingress ordering contract as direct
             // command execution, so restored state observes runtime barrier semantics.
-            if let Err(error) = self.dispatch_replay_command_runtime(&frame) {
+            if let Err(error) = self.dispatch_replay_command_runtime(entry.db, &frame) {
                 return Err(DflyError::Protocol(format!(
                     "journal replay runtime dispatch failed for txid {}: {error}",
                     entry.txid
@@ -4307,7 +4368,7 @@ mod tests {
 
         let blocked_command = CommandFrame::new("SET", vec![key.clone(), b"blocked".to_vec()]);
         let error = app
-            .dispatch_direct_command_runtime(&blocked_command)
+            .dispatch_direct_command_runtime(0, &blocked_command)
             .expect_err("scheduler should block conflicting direct command");
         assert_eq!(
             error,

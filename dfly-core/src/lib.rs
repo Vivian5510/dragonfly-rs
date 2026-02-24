@@ -12,6 +12,7 @@ use dispatch::{
     CommandRegistry, DispatchState, ValueEntry, copy_between_states, rename_between_states,
 };
 use sharding::{HashTagShardResolver, ShardResolver};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Coordinator-facing routing class used by transaction planning.
@@ -33,6 +34,136 @@ pub enum SingleKeyAccess {
     Read,
     /// Mutating access on one key.
     Write,
+}
+
+/// Thread-safe shared handle for one core module instance.
+///
+/// Dragonfly executes shard work from background queues/fibers. Runtime workers in this learning
+/// port need a clonable handle that can enter the same core state from different threads.
+#[derive(Debug, Clone)]
+pub struct SharedCore {
+    inner: Arc<Mutex<CoreModule>>,
+}
+
+impl SharedCore {
+    /// Creates one shared core handle with a fresh `CoreModule`.
+    #[must_use]
+    pub fn new(shard_count: ShardCount) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CoreModule::new(shard_count))),
+        }
+    }
+
+    fn with_core<R>(&self, f: impl FnOnce(&CoreModule) -> R) -> R {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&guard)
+    }
+
+    fn with_core_mut<R>(&self, f: impl FnOnce(&mut CoreModule) -> R) -> R {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
+    }
+
+    /// Executes one command frame on its selected target shard.
+    #[must_use]
+    pub fn execute(&self, frame: &CommandFrame) -> CommandReply {
+        self.with_core_mut(|core| core.execute(frame))
+    }
+
+    /// Executes one command frame in a selected logical DB.
+    #[must_use]
+    pub fn execute_in_db(&self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
+        self.with_core_mut(|core| core.execute_in_db(db, frame))
+    }
+
+    /// Validates a command against core command-table arity/existence rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns user-facing error text when command does not exist or argument count is invalid.
+    pub fn validate_command(&self, frame: &CommandFrame) -> Result<(), String> {
+        self.with_core(|core| core.validate_command(frame))
+    }
+
+    /// Exports current in-memory state as a snapshot payload.
+    #[must_use]
+    pub fn export_snapshot(&self) -> CoreSnapshot {
+        self.with_core(CoreModule::export_snapshot)
+    }
+
+    /// Replaces current in-memory state with provided snapshot payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when snapshot carries an out-of-range shard id.
+    pub fn import_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
+        self.with_core_mut(|core| core.import_snapshot(snapshot))
+    }
+
+    /// Resolves owner shard for a key using active sharding policy.
+    #[must_use]
+    pub fn resolve_shard_for_key(&self, key: &[u8]) -> u16 {
+        self.with_core(|core| core.resolve_shard_for_key(key))
+    }
+
+    /// Returns current mutation version for one key in selected logical DB.
+    #[must_use]
+    pub fn key_version(&self, db: DbIndex, key: &[u8]) -> u64 {
+        self.with_core(|core| core.key_version(db, key))
+    }
+
+    /// Removes all keys in one logical DB across all shards.
+    #[must_use]
+    pub fn flush_db(&self, db: DbIndex) -> usize {
+        self.with_core_mut(|core| core.flush_db(db))
+    }
+
+    /// Removes all keys in all logical DBs across all shards.
+    pub fn flush_all(&self) -> usize {
+        self.with_core_mut(CoreModule::flush_all)
+    }
+
+    /// Returns total key count for one logical DB across all shards.
+    #[must_use]
+    pub fn db_size(&self, db: DbIndex) -> usize {
+        self.with_core(|core| core.db_size(db))
+    }
+
+    /// Returns one random key from selected logical DB across all shards.
+    #[must_use]
+    pub fn random_key(&self, db: DbIndex) -> Option<Vec<u8>> {
+        self.with_core(|core| core.random_key(db))
+    }
+
+    /// Returns keys in selected logical DB that match one glob-style pattern.
+    #[must_use]
+    pub fn keys_matching(&self, db: DbIndex, pattern: &[u8]) -> Vec<Vec<u8>> {
+        self.with_core(|core| core.keys_matching(db, pattern))
+    }
+
+    /// Selects target shard for one command.
+    #[must_use]
+    pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
+        self.with_core(|core| core.resolve_target_shard(frame))
+    }
+
+    /// Returns transaction-planning routing class for one command frame.
+    #[must_use]
+    pub fn command_routing(&self, frame: &CommandFrame) -> CommandRouting {
+        self.with_core(|core| core.command_routing(frame))
+    }
+
+    /// Returns whether command can participate in single-key lock-ahead planning.
+    #[must_use]
+    pub fn is_single_key_command(&self, frame: &CommandFrame) -> bool {
+        self.with_core(|core| core.is_single_key_command(frame))
+    }
 }
 
 /// Classifies whether one command has a single-key access shape and access type.

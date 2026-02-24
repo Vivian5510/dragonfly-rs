@@ -7,23 +7,36 @@ use std::time::Duration;
 
 use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
-use dfly_common::ids::{ShardCount, ShardId};
+use dfly_common::ids::{DbIndex, ShardCount, ShardId};
 
-use crate::command::CommandFrame;
+use crate::command::{CommandFrame, CommandReply};
 
 /// Unit of work sent from a coordinator to a specific shard owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeEnvelope {
     /// Destination shard owning the affected keys.
     pub target_shard: ShardId,
+    /// Logical DB namespace (`SELECT`).
+    pub db: DbIndex,
+    /// Whether this envelope should execute command logic in worker context.
+    ///
+    /// Fanout envelopes used as shard barriers keep this flag `false`.
+    pub execute_on_worker: bool,
     /// Wire-equivalent command data.
     pub command: CommandFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedEnvelope {
+    sequence: u64,
+    envelope: RuntimeEnvelope,
 }
 
 #[derive(Debug, Default)]
 struct ShardExecutionInner {
     processed: Vec<RuntimeEnvelope>,
     processed_sequence: u64,
+    replies_by_sequence: std::collections::HashMap<u64, CommandReply>,
 }
 
 #[derive(Debug, Default)]
@@ -51,19 +64,47 @@ pub trait ShardRuntime: Send + Sync {
 /// The design mirrors Dragonfly's shared-nothing execution boundary:
 /// each shard owns a queue and a dedicated execution domain. This unit keeps
 /// execution payload minimal by recording envelopes into per-shard logs.
-#[derive(Debug)]
 pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
-    senders: Vec<mpsc::Sender<RuntimeEnvelope>>,
+    senders: Vec<mpsc::Sender<QueuedEnvelope>>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
     submitted_sequence_per_shard: Vec<Mutex<u64>>,
     workers: Vec<thread::JoinHandle<()>>,
+}
+
+type RuntimeExecutor = dyn Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync;
+
+impl std::fmt::Debug for InMemoryShardRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryShardRuntime")
+            .field("shard_count", &self.shard_count)
+            .field("senders", &self.senders.len())
+            .field("execution_per_shard", &self.execution_per_shard.len())
+            .field(
+                "submitted_sequence_per_shard",
+                &self.submitted_sequence_per_shard.len(),
+            )
+            .field("workers", &self.workers.len())
+            .finish()
+    }
 }
 
 impl InMemoryShardRuntime {
     /// Creates one runtime with one worker thread per shard.
     #[must_use]
     pub fn new(shard_count: ShardCount) -> Self {
+        Self::new_with_executor(shard_count, |_envelope| {
+            // Default runtime keeps compatibility with unit tests that only verify queueing.
+            CommandReply::SimpleString("QUEUED".to_owned())
+        })
+    }
+
+    /// Creates one runtime with one worker thread per shard and custom worker executor.
+    #[must_use]
+    pub fn new_with_executor<F>(shard_count: ShardCount, executor: F) -> Self
+    where
+        F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
+    {
         let shard_len = usize::from(shard_count.get());
         let execution_per_shard = Arc::new(
             (0..shard_len)
@@ -73,15 +114,19 @@ impl InMemoryShardRuntime {
         let submitted_sequence_per_shard = (0..shard_len)
             .map(|_| Mutex::new(0_u64))
             .collect::<Vec<_>>();
+        let executor = Arc::new(executor);
 
         let mut senders = Vec::with_capacity(shard_len);
         let mut workers = Vec::with_capacity(shard_len);
         for shard in 0..shard_len {
-            let (sender, receiver) = mpsc::channel::<RuntimeEnvelope>();
+            let (sender, receiver) = mpsc::channel::<QueuedEnvelope>();
             senders.push(sender);
 
             let execution = Arc::clone(&execution_per_shard);
-            let handle = thread::spawn(move || shard_worker_loop(shard, receiver, &execution));
+            let shard_executor = Arc::clone(&executor);
+            let handle = thread::spawn(move || {
+                shard_worker_loop(shard, receiver, &execution, &*shard_executor);
+            });
             workers.push(handle);
         }
 
@@ -180,11 +225,11 @@ impl InMemoryShardRuntime {
         let mut sequence_guard = sequence_counter
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime sequence mutex is poisoned"))?;
+        let sequence = (*sequence_guard).saturating_add(1);
         sender
-            .send(envelope)
+            .send(QueuedEnvelope { sequence, envelope })
             .map_err(|_| DflyError::InvalidState("shard queue is closed"))?;
-        *sequence_guard = sequence_guard.saturating_add(1);
-        let sequence = *sequence_guard;
+        *sequence_guard = sequence;
         Ok(sequence)
     }
 
@@ -213,6 +258,28 @@ impl InMemoryShardRuntime {
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
         Ok(guard.processed_sequence >= sequence)
     }
+
+    /// Returns and removes one worker reply for a specific processed sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range or when
+    /// the shard log mutex is poisoned.
+    pub fn take_processed_reply(
+        &self,
+        shard: ShardId,
+        sequence: u64,
+    ) -> DflyResult<Option<CommandReply>> {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let mut guard = state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(guard.replies_by_sequence.remove(&sequence))
+    }
 }
 
 impl ShardRuntime for InMemoryShardRuntime {
@@ -240,20 +307,29 @@ impl Drop for InMemoryShardRuntime {
 
 fn shard_worker_loop(
     shard: usize,
-    receiver: mpsc::Receiver<RuntimeEnvelope>,
+    receiver: mpsc::Receiver<QueuedEnvelope>,
     execution_per_shard: &[ShardExecutionState],
+    executor: &RuntimeExecutor,
 ) {
-    for envelope in receiver {
+    for queued in receiver {
+        let envelope = queued.envelope;
         // Keep one explicit shard check so the queue ownership contract is visible
         // and invalid routing data does not pollute another shard log.
         if usize::from(envelope.target_shard) != shard {
             continue;
         }
+
+        let reply = if envelope.execute_on_worker {
+            executor(&envelope)
+        } else {
+            CommandReply::SimpleString("QUEUED".to_owned())
+        };
         if let Some(state) = execution_per_shard.get(shard)
             && let Ok(mut guard) = state.inner.lock()
         {
             guard.processed.push(envelope);
-            guard.processed_sequence = guard.processed_sequence.saturating_add(1);
+            guard.processed_sequence = queued.sequence;
+            let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
             state.changed.notify_all();
         }
     }
@@ -262,7 +338,7 @@ fn shard_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::{InMemoryShardRuntime, RuntimeEnvelope, ShardRuntime};
-    use crate::command::CommandFrame;
+    use crate::command::{CommandFrame, CommandReply};
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -273,6 +349,8 @@ mod tests {
         let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
         let envelope = RuntimeEnvelope {
             target_shard: 2,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("PING", Vec::new()),
         };
 
@@ -285,6 +363,8 @@ mod tests {
         let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
         let envelope = RuntimeEnvelope {
             target_shard: 1,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"k".to_vec()]),
         };
 
@@ -308,10 +388,14 @@ mod tests {
 
         let shard_zero = RuntimeEnvelope {
             target_shard: 0,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"a".to_vec()]),
         };
         let shard_one = RuntimeEnvelope {
             target_shard: 1,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"b".to_vec()]),
         };
 
@@ -345,10 +429,14 @@ mod tests {
         let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
         let first = RuntimeEnvelope {
             target_shard: 0,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"a".to_vec()]),
         };
         let second = RuntimeEnvelope {
             target_shard: 0,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"b".to_vec()]),
         };
 
@@ -372,10 +460,14 @@ mod tests {
 
         let first = RuntimeEnvelope {
             target_shard: 0,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"a".to_vec()]),
         };
         let second = RuntimeEnvelope {
             target_shard: 0,
+            db: 0,
+            execute_on_worker: false,
             command: CommandFrame::new("GET", vec![b"b".to_vec()]),
         };
 
@@ -406,18 +498,24 @@ mod tests {
         let first = runtime
             .submit_with_sequence(RuntimeEnvelope {
                 target_shard: 1,
+                db: 0,
+                execute_on_worker: false,
                 command: CommandFrame::new("GET", vec![b"a".to_vec()]),
             })
             .expect("submission should succeed");
         let second = runtime
             .submit_with_sequence(RuntimeEnvelope {
                 target_shard: 1,
+                db: 0,
+                execute_on_worker: false,
                 command: CommandFrame::new("GET", vec![b"b".to_vec()]),
             })
             .expect("submission should succeed");
         let third = runtime
             .submit_with_sequence(RuntimeEnvelope {
                 target_shard: 1,
+                db: 0,
+                execute_on_worker: false,
                 command: CommandFrame::new("GET", vec![b"c".to_vec()]),
             })
             .expect("submission should succeed");
@@ -425,5 +523,44 @@ mod tests {
         assert_that!(first, eq(1_u64));
         assert_that!(second, eq(2_u64));
         assert_that!(third, eq(3_u64));
+    }
+
+    #[rstest]
+    fn runtime_worker_executor_publishes_reply_for_sequence() {
+        let runtime = InMemoryShardRuntime::new_with_executor(
+            ShardCount::new(2).expect("count should be valid"),
+            |envelope| {
+                CommandReply::BulkString(
+                    format!(
+                        "db{}:{}:{}",
+                        envelope.db, envelope.target_shard, envelope.command.name
+                    )
+                    .into_bytes(),
+                )
+            },
+        );
+
+        let sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                db: 7,
+                execute_on_worker: true,
+                command: CommandFrame::new("GET", vec![b"k".to_vec()]),
+            })
+            .expect("submission should succeed");
+        assert_that!(
+            runtime
+                .wait_for_processed_sequence(1, sequence, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let reply = runtime
+            .take_processed_reply(1, sequence)
+            .expect("reply fetch should succeed");
+        assert_that!(
+            &reply,
+            eq(&Some(CommandReply::BulkString(b"db7:1:GET".to_vec())))
+        );
     }
 }
