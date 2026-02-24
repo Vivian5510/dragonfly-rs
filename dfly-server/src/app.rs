@@ -73,7 +73,13 @@ impl ServerApp {
         let maintenance_core = core.clone();
         let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance(
             config.shard_count,
-            move |envelope| runtime_core.execute_in_db(envelope.db, &envelope.command),
+            move |envelope| {
+                runtime_core.execute_on_shard_in_db(
+                    envelope.target_shard,
+                    envelope.db,
+                    &envelope.command,
+                )
+            },
             move |shard| {
                 let _ = maintenance_core
                     .active_expire_pass_on_shard(shard, ACTIVE_EXPIRE_KEYS_PER_TICK);

@@ -82,6 +82,17 @@ impl SharedCore {
         self.with_core_mut(|core| core.execute_in_db(db, frame))
     }
 
+    /// Executes one single-key command directly on one target shard.
+    #[must_use]
+    pub fn execute_on_shard_in_db(
+        &self,
+        shard: u16,
+        db: DbIndex,
+        frame: &CommandFrame,
+    ) -> CommandReply {
+        self.with_core_mut(|core| core.execute_on_shard_in_db(shard, db, frame))
+    }
+
     /// Validates a command against core command-table arity/existence rules.
     ///
     /// # Errors
@@ -329,6 +340,42 @@ impl CoreModule {
         let target_index = usize::from(target_shard);
         let Some(target_state) = self.shard_states.get_mut(target_index) else {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
+        };
+        self.command_registry.dispatch(db, frame, target_state)
+    }
+
+    /// Executes one command frame on one explicit shard.
+    ///
+    /// Runtime worker fibers already own their destination shard queue. This
+    /// entrypoint keeps that ownership contract explicit by rejecting
+    /// non-single-key and cross-shard command shapes.
+    #[must_use]
+    pub fn execute_on_shard_in_db(
+        &mut self,
+        shard: u16,
+        db: DbIndex,
+        frame: &CommandFrame,
+    ) -> CommandReply {
+        if !matches!(
+            self.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return CommandReply::Error(
+                "runtime worker only supports single-key commands".to_owned(),
+            );
+        }
+        let Some(key) = frame.args.first() else {
+            return CommandReply::Error("runtime worker requires one key argument".to_owned());
+        };
+        let resolved = self.resolve_shard_for_key(key);
+        if resolved != shard {
+            return CommandReply::Error(format!(
+                "runtime worker shard mismatch: envelope={shard}, key={resolved}",
+            ));
+        }
+
+        let Some(target_state) = self.shard_states.get_mut(usize::from(shard)) else {
+            return CommandReply::Error(format!("invalid target shard {shard}"));
         };
         self.command_registry.dispatch(db, frame, target_state)
     }
@@ -945,6 +992,52 @@ mod tests {
 
         let rename = CommandFrame::new("RENAME", vec![b"src".to_vec(), b"dst".to_vec()]);
         assert_that!(classify_single_key_access(&rename), eq(None));
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_runs_single_key_command_on_owner() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let key = b"runtime:owner:key".to_vec();
+        let shard = core.resolve_shard_for_key(&key);
+
+        let set = core.execute_on_shard_in_db(
+            shard,
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let get = core.execute_on_shard_in_db(shard, 0, &CommandFrame::new("GET", vec![key]));
+        assert_that!(&get, eq(&CommandReply::BulkString(b"value".to_vec())));
+    }
+
+    #[rstest]
+    fn core_execute_on_shard_in_db_rejects_mismatch_and_non_single_key() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let key = b"runtime:mismatch:key".to_vec();
+        let owner = core.resolve_shard_for_key(&key);
+        let wrong = (owner + 1) % 4;
+
+        let mismatch = core.execute_on_shard_in_db(
+            wrong,
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"v".to_vec()]),
+        );
+        let CommandReply::Error(mismatch_error) = mismatch else {
+            panic!("mismatch must fail");
+        };
+        assert_that!(
+            mismatch_error.contains("runtime worker shard mismatch"),
+            eq(true)
+        );
+
+        let non_single_key = core.execute_on_shard_in_db(0, 0, &CommandFrame::new("PING", vec![]));
+        assert_that!(
+            &non_single_key,
+            eq(&CommandReply::Error(
+                "runtime worker only supports single-key commands".to_owned()
+            ))
+        );
     }
 
     #[rstest]
