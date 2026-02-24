@@ -200,6 +200,11 @@ impl CommandRegistry {
             handler: handle_set,
         });
         registry.register(CommandSpec {
+            name: "SETNX",
+            arity: CommandArity::Exact(2),
+            handler: handle_setnx,
+        });
+        registry.register(CommandSpec {
             name: "GET",
             arity: CommandArity::Exact(1),
             handler: handle_get,
@@ -327,6 +332,26 @@ fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
     );
     state.bump_key_version(db, &key);
     CommandReply::SimpleString("OK".to_owned())
+}
+
+fn handle_setnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let value = frame.args[1].clone();
+    state.purge_expired_key(db, &key);
+
+    if state.db_map(db).is_some_and(|map| map.contains_key(&key)) {
+        return CommandReply::Integer(0);
+    }
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value,
+            expire_at_unix_secs: None,
+        },
+    );
+    state.bump_key_version(db, &key);
+    CommandReply::Integer(1)
 }
 
 fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -563,6 +588,33 @@ mod tests {
             &mut state,
         );
         assert_that!(&get_reply, eq(&CommandReply::BulkString(b"alice".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_setnx_sets_only_when_key_is_missing() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new("SETNX", vec![b"k".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::Integer(1)));
+
+        let second = registry.dispatch(
+            0,
+            &CommandFrame::new("SETNX", vec![b"k".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&second, eq(&CommandReply::Integer(0)));
+
+        let value = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&value, eq(&CommandReply::BulkString(b"v1".to_vec())));
     }
 
     #[rstest]

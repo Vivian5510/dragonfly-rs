@@ -593,7 +593,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "GET" | "SET" | "EXPIRE" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY"
-            | "DECRBY" => self.execute_key_command(db, frame),
+            | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1545,6 +1545,7 @@ fn parse_flow_lsn_vector_for_flow(
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("SETNX", CommandReply::Integer(1)) => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -1883,6 +1884,27 @@ mod tests {
                 b"-ERR value is not an integer or out of range\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn resp_setnx_sets_only_missing_keys() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"only", b"v1"]))
+            .expect("first SETNX should execute");
+        assert_that!(&first, eq(&vec![b":1\r\n".to_vec()]));
+
+        let second = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"only", b"v2"]))
+            .expect("second SETNX should execute");
+        assert_that!(&second, eq(&vec![b":0\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"only"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2503,6 +2525,26 @@ mod tests {
         );
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("INCRBY"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_setnx_only_when_insert_happens() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"k", b"v1"]))
+            .expect("first SETNX should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"k", b"v2"]))
+            .expect("second SETNX should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(1_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("SETNX"),
             eq(true)
         );
     }
