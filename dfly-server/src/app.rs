@@ -1,7 +1,8 @@
 //! Process composition root for `dfly-server`.
 
 use dfly_cluster::ClusterModule;
-use dfly_common::config::RuntimeConfig;
+use dfly_cluster::slot::key_slot;
+use dfly_common::config::{ClusterMode, RuntimeConfig};
 use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
 use dfly_core::CoreModule;
@@ -318,15 +319,46 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         frame: &CommandFrame,
     ) -> CommandReply {
         match frame.name.as_str() {
+            "CLUSTER" => Self::execute_cluster(frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
 
+    fn execute_cluster(frame: &CommandFrame) -> CommandReply {
+        let Some(subcommand_raw) = frame.args.first() else {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER' command".to_owned(),
+            );
+        };
+        let Ok(subcommand) = std::str::from_utf8(subcommand_raw) else {
+            return CommandReply::Error("CLUSTER subcommand must be valid UTF-8".to_owned());
+        };
+
+        match subcommand.to_ascii_uppercase().as_str() {
+            "KEYSLOT" => Self::execute_cluster_keyslot(frame),
+            _ => CommandReply::Error(format!("unknown CLUSTER subcommand '{subcommand}'")),
+        }
+    }
+
+    fn execute_cluster_keyslot(frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER KEYSLOT' command".to_owned(),
+            );
+        }
+        CommandReply::Integer(i64::from(key_slot(&frame.args[1])))
+    }
+
     fn execute_mget(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
         if frame.args.is_empty() {
             return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
+        }
+        if let Some(error_reply) =
+            self.ensure_cluster_single_slot(frame.args.iter().map(Vec::as_slice))
+        {
+            return error_reply;
         }
 
         let replies = frame
@@ -344,6 +376,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
         }
+        if let Some(error_reply) = self
+            .ensure_cluster_single_slot(frame.args.chunks_exact(2).map(|pair| pair[0].as_slice()))
+        {
+            return error_reply;
+        }
 
         for pair in frame.args.chunks_exact(2) {
             let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
@@ -353,6 +390,25 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
         }
         CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn ensure_cluster_single_slot<'a, I>(&self, keys: I) -> Option<CommandReply>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        if self.cluster.mode == ClusterMode::Disabled {
+            return None;
+        }
+
+        let mut key_iter = keys.into_iter();
+        let first_key = key_iter.next()?;
+        let first_slot = key_slot(first_key);
+        if key_iter.any(|key| key_slot(key) != first_slot) {
+            return Some(CommandReply::Error(
+                "CROSSSLOT Keys in request don't hash to the same slot".to_owned(),
+            ));
+        }
+        None
     }
 
     fn allocate_txid(&mut self) -> TxId {
@@ -515,7 +571,8 @@ pub fn run() -> DflyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::ServerApp;
-    use dfly_common::config::RuntimeConfig;
+    use dfly_cluster::slot::key_slot;
+    use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::JournalOp;
@@ -919,6 +976,49 @@ mod tests {
             panic!("expected protocol error");
         };
         assert_that!(message.contains("snapshot payload error"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_cluster_keyslot_returns_redis_slot() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let key = b"user:{42}:meta";
+        let command = resp_command(&[b"CLUSTER", b"KEYSLOT", key]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &command)
+            .expect("CLUSTER KEYSLOT should execute");
+        let expected = vec![format!(":{}\r\n", key_slot(key)).into_bytes()];
+        assert_that!(&reply, eq(&expected));
+    }
+
+    #[rstest]
+    fn cluster_mode_rejects_crossslot_mset() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first_key = b"acct:{100}".to_vec();
+        let mut second_key = b"acct:{200}".to_vec();
+        let mut suffix = 0_u32;
+        while key_slot(&second_key) == key_slot(&first_key) {
+            suffix += 1;
+            second_key = format!("acct:{{200}}:{suffix}").into_bytes();
+        }
+
+        let request = resp_command(&[b"MSET", &first_key, b"v1", &second_key, b"v2"]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &request)
+            .expect("MSET should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+            ])
+        );
     }
 
     fn resp_command(parts: &[&[u8]]) -> Vec<u8> {
