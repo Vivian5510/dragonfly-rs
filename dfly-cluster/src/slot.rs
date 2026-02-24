@@ -1,6 +1,6 @@
 //! Slot routing model.
 
-use dfly_common::ids::{SlotId, MAX_SLOT_ID};
+use dfly_common::ids::{MAX_SLOT_ID, SlotId};
 
 /// Closed slot range `[start, end]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,10 @@ mod tests {
     #[case(50)]
     #[case(201)]
     fn router_rejects_unowned_slots(#[case] slot: u16) {
-        let router = SlotRouter::new(vec![SlotRange { start: 100, end: 200 }]);
+        let router = SlotRouter::new(vec![SlotRange {
+            start: 100,
+            end: 200,
+        }]);
         assert_that!(router.owns_slot(slot), eq(false));
     }
 }

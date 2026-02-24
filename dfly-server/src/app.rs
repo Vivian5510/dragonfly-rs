@@ -3,12 +3,12 @@
 use dfly_cluster::ClusterModule;
 use dfly_common::config::RuntimeConfig;
 use dfly_common::error::DflyResult;
+use dfly_core::CoreModule;
 use dfly_core::command::CommandFrame;
 use dfly_core::dispatch::DispatchState;
-use dfly_core::CoreModule;
+use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
 use dfly_facade::protocol::ClientProtocol;
-use dfly_facade::FacadeModule;
 use dfly_replication::ReplicationModule;
 use dfly_search::SearchModule;
 use dfly_storage::StorageModule;
@@ -95,7 +95,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// A real server would attach this state to a socket file descriptor. Here we keep it as
     /// an explicit object to make parser/dispatcher flow easy to test.
     #[must_use]
-    pub fn new_connection(&self, protocol: ClientProtocol) -> ServerConnection {
+    pub fn new_connection(protocol: ClientProtocol) -> ServerConnection {
         ServerConnection {
             parser: ConnectionState::new(ConnectionContext {
                 protocol,
@@ -108,6 +108,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Feeds network bytes into one connection and executes all newly completed commands.
     ///
     /// The return vector contains one protocol-encoded reply per decoded command.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when connection input bytes violate the active
+    /// wire protocol framing rules.
     pub fn feed_connection_bytes(
         &mut self,
         connection: &mut ServerConnection,
@@ -147,7 +152,10 @@ pub struct ServerConnection {
 }
 
 /// Encodes a canonical reply according to the target client protocol.
-fn encode_reply_for_protocol(protocol: ClientProtocol, reply: dfly_core::command::CommandReply) -> Vec<u8> {
+fn encode_reply_for_protocol(
+    protocol: ClientProtocol,
+    reply: dfly_core::command::CommandReply,
+) -> Vec<u8> {
     match protocol {
         ClientProtocol::Resp => reply.to_resp_bytes(),
         ClientProtocol::Memcache => match reply {
@@ -168,8 +176,18 @@ fn encode_reply_for_protocol(protocol: ClientProtocol, reply: dfly_core::command
 }
 
 /// Starts `dfly-server` process bootstrap.
+///
+/// # Errors
+///
+/// Returns `DflyError::Protocol` if the bootstrap probe command cannot be parsed.
 pub fn run() -> DflyResult<()> {
-    let app = ServerApp::new(RuntimeConfig::default());
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let mut bootstrap_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    // Keep one minimal end-to-end bootstrap probe so command pipeline code is part of
+    // regular binary execution path, not only test-only dead code.
+    let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
+
     println!("{}", app.startup_summary());
     Ok(())
 }
@@ -185,7 +203,7 @@ mod tests {
     #[rstest]
     fn resp_connection_executes_set_then_get() {
         let mut app = ServerApp::new(RuntimeConfig::default());
-        let mut connection = app.new_connection(ClientProtocol::Resp);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
         let set_responses = app
             .feed_connection_bytes(
@@ -197,10 +215,7 @@ mod tests {
         assert_that!(&set_responses, eq(&expected_set));
 
         let get_responses = app
-            .feed_connection_bytes(
-                &mut connection,
-                b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
-            )
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
             .expect("GET command should execute");
         let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
         assert_that!(&get_responses, eq(&expected_get));
@@ -209,13 +224,10 @@ mod tests {
     #[rstest]
     fn resp_connection_handles_partial_input() {
         let mut app = ServerApp::new(RuntimeConfig::default());
-        let mut connection = app.new_connection(ClientProtocol::Resp);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
         let partial_responses = app
-            .feed_connection_bytes(
-                &mut connection,
-                b"*2\r\n$4\r\nECHO\r\n$5\r\nhe",
-            )
+            .feed_connection_bytes(&mut connection, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
             .expect("partial input should not fail");
         assert_that!(partial_responses.is_empty(), eq(true));
 

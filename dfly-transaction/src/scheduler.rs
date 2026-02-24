@@ -7,6 +7,11 @@ use crate::plan::TransactionPlan;
 /// Transaction scheduler abstraction.
 pub trait TransactionScheduler: Send + Sync {
     /// Schedules a transaction for execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provided plan is invalid for scheduling
+    /// or when runtime scheduling resources are unavailable.
     fn schedule(&self, plan: &TransactionPlan) -> DflyResult<()>;
 }
 

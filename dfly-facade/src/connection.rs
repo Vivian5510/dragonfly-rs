@@ -3,7 +3,7 @@
 use dfly_common::error::DflyResult;
 
 use crate::protocol::ClientProtocol;
-use crate::protocol::{ParsedCommand, ParseStatus, parse_next_command};
+use crate::protocol::{ParseStatus, ParsedCommand, parse_next_command};
 
 /// Per-connection execution context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,11 @@ impl ConnectionState {
     /// Tries to decode one command from buffered bytes.
     ///
     /// Returns `Ok(None)` when more bytes are required.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when buffered bytes violate the selected
+    /// client protocol framing rules.
     pub fn try_pop_command(&mut self) -> DflyResult<Option<ParsedCommand>> {
         match parse_next_command(self.context.protocol, &self.read_buffer)? {
             ParseStatus::Incomplete => Ok(None),
@@ -102,9 +107,7 @@ mod tests {
     #[rstest]
     fn connection_keeps_remaining_bytes_for_next_command() {
         let mut connection = make_resp_connection();
-        connection.feed_bytes(
-            b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n",
-        );
+        connection.feed_bytes(b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n");
 
         let first = connection
             .try_pop_command()

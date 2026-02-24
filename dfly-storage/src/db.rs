@@ -11,5 +11,10 @@ pub trait DbSlice: Send + Sync {
     fn shard_id(&self) -> ShardId;
 
     /// Applies one command into this shard-local slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when command application fails due to invalid DB index,
+    /// unsupported operation, or storage runtime constraints.
     fn apply(&self, db: DbIndex, command: &CommandFrame) -> DflyResult<()>;
 }

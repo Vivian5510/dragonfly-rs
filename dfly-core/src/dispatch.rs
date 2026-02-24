@@ -177,19 +177,13 @@ mod tests {
             &CommandFrame::new("SET", vec![b"user:1".to_vec(), b"alice".to_vec()]),
             &mut state,
         );
-        assert_that!(
-            &set_reply,
-            eq(&CommandReply::SimpleString("OK".to_owned()))
-        );
+        assert_that!(&set_reply, eq(&CommandReply::SimpleString("OK".to_owned())));
 
         let get_reply = registry.dispatch(
             &CommandFrame::new("GET", vec![b"user:1".to_vec()]),
             &mut state,
         );
-        assert_that!(
-            &get_reply,
-            eq(&CommandReply::BulkString(b"alice".to_vec()))
-        );
+        assert_that!(&get_reply, eq(&CommandReply::BulkString(b"alice".to_vec())));
     }
 
     #[rstest]

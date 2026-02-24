@@ -20,5 +20,10 @@ pub trait ShardRuntime: Send + Sync {
     fn shard_count(&self) -> ShardCount;
 
     /// Submits one envelope to a destination shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when runtime state cannot accept this envelope
+    /// (for example shard is unavailable or queue is closed).
     fn submit(&self, envelope: RuntimeEnvelope) -> DflyResult<()>;
 }

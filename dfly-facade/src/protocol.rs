@@ -45,6 +45,11 @@ pub enum ParseStatus {
 ///
 /// The function never mutates input and is safe for repeated calls on a growing buffer.
 /// Callers should remove `consumed` bytes only when `ParseStatus::Complete` is returned.
+///
+/// # Errors
+///
+/// Returns `DflyError::Protocol` when the input contains a protocol violation
+/// (for example malformed RESP framing or invalid UTF-8 command name).
 pub fn parse_next_command(protocol: ClientProtocol, input: &[u8]) -> DflyResult<ParseStatus> {
     match protocol {
         ClientProtocol::Resp => parse_next_resp_command(input),
@@ -75,8 +80,11 @@ fn parse_next_resp_command(input: &[u8]) -> DflyResult<ParseStatus> {
             "RESP command array length must be positive".to_owned(),
         ));
     }
+    let array_len = usize::try_from(array_len).map_err(|_| {
+        DflyError::Protocol("RESP array length exceeds supported platform usize".to_owned())
+    })?;
 
-    let mut items = Vec::with_capacity(array_len as usize);
+    let mut items = Vec::with_capacity(array_len);
     for _ in 0..array_len {
         if cursor >= input.len() {
             return Ok(ParseStatus::Incomplete);
@@ -99,7 +107,9 @@ fn parse_next_resp_command(input: &[u8]) -> DflyResult<ParseStatus> {
                 "RESP command bulk length cannot be negative".to_owned(),
             ));
         }
-        let bulk_len = bulk_len as usize;
+        let bulk_len = usize::try_from(bulk_len).map_err(|_| {
+            DflyError::Protocol("RESP bulk length exceeds supported platform usize".to_owned())
+        })?;
 
         // Need `bulk_len` data bytes plus trailing CRLF.
         if input.len().saturating_sub(cursor) < bulk_len + 2 {

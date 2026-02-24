@@ -34,7 +34,10 @@ impl ShardResolver for HashTagShardResolver {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let shard = hasher.finish() % u64::from(self.shard_count.get());
-        shard as ShardId
+        match ShardId::try_from(shard) {
+            Ok(shard_id) => shard_id,
+            Err(_) => unreachable!("modulo shard_count ensures shard id fits into u16"),
+        }
     }
 }
 
