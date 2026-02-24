@@ -175,6 +175,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }),
             transaction: TransactionSession::default(),
             replica_endpoint: None,
+            replica_client_id: None,
+            replica_client_version: None,
         }
     }
 
@@ -538,6 +540,35 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 }
                 continue;
             }
+            if option.eq_ignore_ascii_case(b"CLIENT-ID") {
+                if frame.args.len() != 2 {
+                    return CommandReply::Error("syntax error".to_owned());
+                }
+                let Ok(text) = std::str::from_utf8(value) else {
+                    return CommandReply::Error(
+                        "REPLCONF CLIENT-ID must be valid UTF-8".to_owned(),
+                    );
+                };
+                connection.replica_client_id = Some(text.to_owned());
+                continue;
+            }
+            if option.eq_ignore_ascii_case(b"CLIENT-VERSION") {
+                if frame.args.len() != 2 {
+                    return CommandReply::Error("syntax error".to_owned());
+                }
+                let Ok(text) = std::str::from_utf8(value) else {
+                    return CommandReply::Error(
+                        "REPLCONF CLIENT-VERSION must be valid UTF-8".to_owned(),
+                    );
+                };
+                let Ok(version) = text.parse::<u64>() else {
+                    return CommandReply::Error(
+                        "value is not an integer or out of range".to_owned(),
+                    );
+                };
+                connection.replica_client_version = Some(version);
+                continue;
+            }
             if option.eq_ignore_ascii_case(b"LISTENING-PORT") {
                 let Ok(text) = std::str::from_utf8(value) else {
                     return CommandReply::Error(
@@ -561,10 +592,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 announced_ip = Some(text.to_owned());
                 continue;
             }
-            if option.eq_ignore_ascii_case(b"CAPA")
-                || option.eq_ignore_ascii_case(b"CLIENT-ID")
-                || option.eq_ignore_ascii_case(b"CLIENT-VERSION")
-            {
+            if option.eq_ignore_ascii_case(b"CAPA") {
                 continue;
             }
             return CommandReply::Error("syntax error".to_owned());
@@ -1121,6 +1149,10 @@ pub struct ServerConnection {
     pub transaction: TransactionSession,
     /// Replica endpoint identity announced on this connection via `REPLCONF`.
     pub replica_endpoint: Option<ReplicaEndpointIdentity>,
+    /// Optional Dragonfly replica id announced via `REPLCONF CLIENT-ID`.
+    pub replica_client_id: Option<String>,
+    /// Optional Dragonfly replica version announced via `REPLCONF CLIENT-VERSION`.
+    pub replica_client_version: Option<u64>,
 }
 
 /// One replica endpoint attached to a client connection.
@@ -1857,6 +1889,80 @@ mod tests {
             .expect("REPLCONF ACK should parse");
         assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
         assert_that!(app.replication.last_acked_lsn(), eq(0_u64));
+    }
+
+    #[rstest]
+    fn resp_replconf_client_id_is_stored_and_requires_standalone_pair() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let ok_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CLIENT-ID", b"replica-1"]),
+            )
+            .expect("REPLCONF CLIENT-ID should succeed");
+        assert_that!(&ok_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+        assert_that!(
+            &connection.replica_client_id,
+            eq(&Some("replica-1".to_owned()))
+        );
+
+        let error_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[
+                    b"REPLCONF",
+                    b"CLIENT-ID",
+                    b"replica-2",
+                    b"LISTENING-PORT",
+                    b"7001",
+                ]),
+            )
+            .expect("invalid REPLCONF CLIENT-ID shape should parse");
+        assert_that!(&error_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_replconf_client_version_requires_integer_and_standalone_pair() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let bad_int_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"abc"]),
+            )
+            .expect("invalid REPLCONF CLIENT-VERSION should parse");
+        assert_that!(
+            &bad_int_reply,
+            eq(&vec![
+                b"-ERR value is not an integer or out of range\r\n".to_vec()
+            ])
+        );
+
+        let mixed_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[
+                    b"REPLCONF",
+                    b"CLIENT-VERSION",
+                    b"1",
+                    b"LISTENING-PORT",
+                    b"7001",
+                ]),
+            )
+            .expect("invalid REPLCONF CLIENT-VERSION shape should parse");
+        assert_that!(&mixed_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
+
+        let ok_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"3"]),
+            )
+            .expect("REPLCONF CLIENT-VERSION should succeed");
+        assert_that!(&ok_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+        assert_that!(&connection.replica_client_version, eq(&Some(3_u64)));
     }
 
     #[rstest]
