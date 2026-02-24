@@ -164,6 +164,14 @@ impl SharedCore {
         self.with_core_mut(|core| core.active_expire_pass(limit_per_shard))
     }
 
+    /// Runs one active-expiration pass on one target shard.
+    ///
+    /// Returns the number of removed keys in that shard.
+    #[must_use]
+    pub fn active_expire_pass_on_shard(&self, shard: u16, limit: usize) -> usize {
+        self.with_core_mut(|core| core.active_expire_pass_on_shard(shard, limit))
+    }
+
     /// Selects target shard for one command.
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
@@ -622,6 +630,15 @@ impl CoreModule {
             .iter_mut()
             .map(|state| state.active_expire_pass(limit_per_shard))
             .sum()
+    }
+
+    /// Runs one active-expiration pass on one shard state.
+    ///
+    /// Returns the number of removed keys in that shard.
+    pub fn active_expire_pass_on_shard(&mut self, shard: u16, limit: usize) -> usize {
+        self.shard_states
+            .get_mut(usize::from(shard))
+            .map_or(0_usize, |state| state.active_expire_pass(limit))
     }
 
     /// Selects target shard for one command.
@@ -1399,5 +1416,52 @@ mod tests {
         let second_removed = core.active_expire_pass(1);
         assert_that!(second_removed, eq(1_usize));
         assert_that!(core.db_size(0), eq(0_usize));
+    }
+
+    #[rstest]
+    fn core_active_expire_pass_on_shard_scopes_cleanup() {
+        let mut core = CoreModule::new(ShardCount::new(2).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let shard0_key = b"active-expire:shard0".to_vec();
+        let shard1_key = b"active-expire:shard1".to_vec();
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: shard0_key.clone(),
+                    value: b"s0".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 1,
+                    db: 0,
+                    key: shard1_key.clone(),
+                    value: b"s1".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        let removed_shard0 = core.active_expire_pass_on_shard(0, 16);
+        assert_that!(removed_shard0, eq(1_usize));
+        assert_that!(
+            core.shard_states[0]
+                .db_tables
+                .get(&0)
+                .is_some_and(|table| table.prime.contains_key(&shard0_key)),
+            eq(false)
+        );
+        assert_that!(
+            core.shard_states[1]
+                .db_tables
+                .get(&0)
+                .is_some_and(|table| table.prime.contains_key(&shard1_key)),
+            eq(true)
+        );
     }
 }

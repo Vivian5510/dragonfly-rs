@@ -8,7 +8,7 @@ use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::{DbIndex, ShardCount, ShardId};
 use tokio::runtime::Builder as TokioBuilder;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::LocalSet;
 
 use crate::command::{CommandFrame, CommandReply};
@@ -79,7 +79,9 @@ pub struct InMemoryShardRuntime {
 }
 
 type RuntimeExecutor = dyn Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync;
+type RuntimeMaintenance = dyn Fn(ShardId) + Send + Sync;
 const SHARD_WORKER_YIELD_INTERVAL: usize = 64;
+const SHARD_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
 
 impl std::fmt::Debug for InMemoryShardRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,6 +114,55 @@ impl InMemoryShardRuntime {
     where
         F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
     {
+        let executor: Arc<RuntimeExecutor> = Arc::new(executor);
+        Self::new_internal(shard_count, &executor, None, SHARD_MAINTENANCE_INTERVAL)
+    }
+
+    /// Creates one runtime with custom worker executor and shard maintenance callback.
+    #[must_use]
+    pub fn new_with_executor_and_maintenance<F, M>(
+        shard_count: ShardCount,
+        executor: F,
+        maintenance: M,
+    ) -> Self
+    where
+        F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
+        M: Fn(ShardId) + Send + Sync + 'static,
+    {
+        Self::new_with_executor_and_maintenance_interval(
+            shard_count,
+            executor,
+            maintenance,
+            SHARD_MAINTENANCE_INTERVAL,
+        )
+    }
+
+    fn new_with_executor_and_maintenance_interval<F, M>(
+        shard_count: ShardCount,
+        executor: F,
+        maintenance: M,
+        maintenance_interval: Duration,
+    ) -> Self
+    where
+        F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
+        M: Fn(ShardId) + Send + Sync + 'static,
+    {
+        let executor: Arc<RuntimeExecutor> = Arc::new(executor);
+        let maintenance: Arc<RuntimeMaintenance> = Arc::new(maintenance);
+        Self::new_internal(
+            shard_count,
+            &executor,
+            Some(&maintenance),
+            maintenance_interval,
+        )
+    }
+
+    fn new_internal(
+        shard_count: ShardCount,
+        executor: &Arc<RuntimeExecutor>,
+        maintenance: Option<&Arc<RuntimeMaintenance>>,
+        maintenance_interval: Duration,
+    ) -> Self {
         let shard_len = usize::from(shard_count.get());
         let execution_per_shard = Arc::new(
             (0..shard_len)
@@ -121,7 +172,6 @@ impl InMemoryShardRuntime {
         let submitted_sequence_per_shard = (0..shard_len)
             .map(|_| Mutex::new(0_u64))
             .collect::<Vec<_>>();
-        let executor = Arc::new(executor);
 
         let mut senders = Vec::with_capacity(shard_len);
         let mut workers = Vec::with_capacity(shard_len);
@@ -132,9 +182,17 @@ impl InMemoryShardRuntime {
             senders.push(sender);
 
             let execution = Arc::clone(&execution_per_shard);
-            let shard_executor = Arc::clone(&executor);
+            let shard_executor = Arc::clone(executor);
+            let shard_maintenance = maintenance.map(Arc::clone);
             let handle = thread::spawn(move || {
-                shard_worker_thread_main(shard, receiver, execution, shard_executor);
+                shard_worker_thread_main(
+                    shard,
+                    receiver,
+                    execution,
+                    shard_executor,
+                    shard_maintenance,
+                    maintenance_interval,
+                );
             });
             workers.push(handle);
         }
@@ -344,8 +402,10 @@ fn shard_worker_thread_main(
     receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
     executor: Arc<RuntimeExecutor>,
+    maintenance: Option<Arc<RuntimeMaintenance>>,
+    maintenance_interval: Duration,
 ) {
-    let Ok(runtime) = TokioBuilder::new_current_thread().build() else {
+    let Ok(runtime) = TokioBuilder::new_current_thread().enable_time().build() else {
         // Keep failure mode contained to this worker thread. Producers will
         // observe a closed queue through `submit_with_sequence`.
         return;
@@ -353,8 +413,9 @@ fn shard_worker_thread_main(
     let local_set = LocalSet::new();
     runtime.block_on(local_set.run_until(async move {
         // Dragonfly uses multiple fibers per shard thread (queueing + execution).
-        // We mirror that shape with one ingress fiber and one execution fiber.
+        // We mirror that shape with ingress/execution fibers and one maintenance fiber.
         let (execution_sender, execution_receiver) = mpsc::unbounded_channel::<QueuedEnvelope>();
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
         let ingress_fiber =
             tokio::task::spawn_local(shard_ingress_fiber(receiver, execution_sender));
@@ -364,8 +425,20 @@ fn shard_worker_thread_main(
             execution_per_shard,
             executor,
         ));
+        let maintenance_fiber = maintenance.map(|maintenance| {
+            tokio::task::spawn_local(shard_maintenance_fiber(
+                shard,
+                maintenance_interval,
+                maintenance,
+                shutdown_receiver,
+            ))
+        });
         let _ = ingress_fiber.await;
         let _ = execution_fiber.await;
+        let _ = shutdown_sender.send(true);
+        if let Some(maintenance_fiber) = maintenance_fiber {
+            let _ = maintenance_fiber.await;
+        }
     }));
 }
 
@@ -422,6 +495,30 @@ async fn shard_execution_fiber(
     }
 }
 
+async fn shard_maintenance_fiber(
+    shard: usize,
+    interval: Duration,
+    maintenance: Arc<RuntimeMaintenance>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let Ok(shard_id) = u16::try_from(shard) else {
+        return;
+    };
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(interval) => {
+                maintenance(shard_id);
+            }
+        }
+    }
+}
+
 async fn execute_envelope_in_worker_fiber(
     executor: &Arc<RuntimeExecutor>,
     envelope: &RuntimeEnvelope,
@@ -441,6 +538,9 @@ mod tests {
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     #[rstest]
@@ -753,5 +853,39 @@ mod tests {
             runtime.processed_count(0).expect("count should succeed"),
             eq(batch)
         );
+    }
+
+    #[rstest]
+    fn runtime_maintenance_fiber_executes_on_each_shard() {
+        let counters = Arc::new(
+            (0..2)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<AtomicUsize>>(),
+        );
+        let counters_for_maintenance = Arc::clone(&counters);
+        let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance_interval(
+            ShardCount::new(2).expect("count should be valid"),
+            |_envelope| CommandReply::SimpleString("QUEUED".to_owned()),
+            move |shard| {
+                if let Some(counter) = counters_for_maintenance.get(usize::from(shard)) {
+                    let _ = counter.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            Duration::from_millis(5),
+        );
+
+        let mut observed = false;
+        for _ in 0..40 {
+            if counters
+                .iter()
+                .all(|counter| counter.load(Ordering::Relaxed) > 0)
+            {
+                observed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_that!(observed, eq(true));
+        drop(runtime);
     }
 }

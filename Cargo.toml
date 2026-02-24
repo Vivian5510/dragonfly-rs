@@ -22,7 +22,7 @@ license = "Apache-2.0"
 thiserror = "2.0.17"
 googletest = "0.14.2"
 rstest = "0.26.1"
-tokio = { version = "1.48.0", features = ["rt", "sync"] }
+tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

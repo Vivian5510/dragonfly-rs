@@ -29,6 +29,8 @@ use dfly_transaction::session::TransactionSession;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+const ACTIVE_EXPIRE_KEYS_PER_TICK: usize = 64;
+
 /// Unit 0 composition container.
 ///
 /// The fields intentionally mirror Dragonfly's major subsystem boundaries so later units can
@@ -68,10 +70,15 @@ impl ServerApp {
         let facade = FacadeModule::from_config(&config);
         let core = SharedCore::new(config.shard_count);
         let runtime_core = core.clone();
-        let runtime =
-            InMemoryShardRuntime::new_with_executor(config.shard_count, move |envelope| {
-                runtime_core.execute_in_db(envelope.db, &envelope.command)
-            });
+        let maintenance_core = core.clone();
+        let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance(
+            config.shard_count,
+            move |envelope| runtime_core.execute_in_db(envelope.db, &envelope.command),
+            move |shard| {
+                let _ = maintenance_core
+                    .active_expire_pass_on_shard(shard, ACTIVE_EXPIRE_KEYS_PER_TICK);
+            },
+        );
         let transaction = TransactionModule::new();
         let storage = StorageModule::new();
         let replication = ReplicationModule::new(true);
