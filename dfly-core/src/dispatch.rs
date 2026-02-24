@@ -5,7 +5,7 @@
 //! protocol parsing produces a canonical command frame, then a registry resolves and executes
 //! the matching handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,7 +42,8 @@ pub struct CommandSpec {
 /// This shape mirrors Dragonfly's `DbTable` layering:
 /// - `prime`: main key/value dictionary (`PrimeTable` concept),
 /// - `expire`: expiration index (`ExpireTable` concept),
-/// - `slot_stats`: per-slot key cardinality used by slot-aware operations.
+/// - `slot_stats`: per-slot key cardinality used by slot-aware operations,
+/// - `slot_keys`: per-slot key membership index used by slot-local scans/migrations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbTable {
     /// Main key/value dictionary.
@@ -51,6 +52,8 @@ pub struct DbTable {
     pub expire: HashMap<Vec<u8>, u64>,
     /// Key cardinality by Redis cluster slot.
     pub slot_stats: HashMap<u16, usize>,
+    /// Key membership by Redis cluster slot.
+    pub slot_keys: HashMap<u16, HashSet<Vec<u8>>>,
 }
 
 /// Mutable execution state used by command handlers.
@@ -113,7 +116,7 @@ impl DispatchState {
         self.db_table(db).map(|table| &table.prime)
     }
 
-    /// Rebuilds expiration index and per-slot cardinality for one DB table.
+    /// Rebuilds expiration index and slot indexes for one DB table.
     ///
     /// This keeps the layered table model consistent even while command handlers are still
     /// written in terms of `prime` map updates.
@@ -124,6 +127,7 @@ impl DispatchState {
 
         table.expire.clear();
         table.slot_stats.clear();
+        table.slot_keys.clear();
         for (key, entry) in &table.prime {
             if let Some(expire_at) = entry.expire_at_unix_secs {
                 let _ = table.expire.insert(key.clone(), expire_at);
@@ -131,10 +135,11 @@ impl DispatchState {
             let slot = key_slot(key);
             let cardinality = table.slot_stats.entry(slot).or_default();
             *cardinality = cardinality.saturating_add(1);
+            let _ = table.slot_keys.entry(slot).or_default().insert(key.clone());
         }
     }
 
-    /// Rebuilds all DB table secondary indexes (`expire`, `slot_stats`).
+    /// Rebuilds all DB table secondary indexes (`expire`, `slot_stats`, `slot_keys`).
     fn rebuild_all_table_indexes(&mut self) {
         let dbs = self.db_tables.keys().copied().collect::<Vec<_>>();
         for db in dbs {
@@ -149,9 +154,26 @@ impl DispatchState {
             *cardinality = cardinality.saturating_sub(1);
             should_remove = *cardinality == 0;
         }
+        if let Some(keys) = table.slot_keys.get_mut(&slot) {
+            let _ = keys.remove(key);
+            should_remove |= keys.is_empty();
+        }
         if should_remove {
             let _ = table.slot_stats.remove(&slot);
+            let _ = table.slot_keys.remove(&slot);
         }
+    }
+
+    /// Returns all keys tracked for one cluster slot in one logical DB.
+    #[must_use]
+    pub fn slot_keys(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
+        let mut keys = self
+            .db_table(db)
+            .and_then(|table| table.slot_keys.get(&slot))
+            .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        keys.sort();
+        keys
     }
 
     /// Returns tracked version for one key.
@@ -1705,6 +1727,7 @@ mod tests {
     use dfly_cluster::slot::key_slot;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::collections::HashSet;
 
     #[rstest]
     fn dispatch_rebuilds_expire_index_for_layered_db_table() {
@@ -1755,12 +1778,19 @@ mod tests {
             panic!("db table must exist after SET");
         };
         assert_that!(table.slot_stats.get(&slot).copied(), eq(Some(1_usize)));
+        assert_that!(
+            table.slot_keys.get(&slot).map(HashSet::len),
+            eq(Some(1_usize))
+        );
+        assert_that!(&state.slot_keys(0, slot), eq(&vec![key.clone()]));
 
         let _ = registry.dispatch(0, &CommandFrame::new("DEL", vec![key.clone()]), &mut state);
         let Some(table) = state.db_tables.get(&0) else {
             panic!("db table should be kept after key deletion");
         };
         assert_that!(table.slot_stats.get(&slot).copied(), eq(None));
+        assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
+        assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
     }
 
     #[rstest]
