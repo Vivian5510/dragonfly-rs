@@ -478,9 +478,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn validate_non_core_queued_command(frame: &CommandFrame) -> Result<(), String> {
         match frame.name.as_str() {
-            "INFO" => (frame.args.len() <= 1)
-                .then_some(())
-                .ok_or_else(|| wrong_arity_message("INFO")),
+            "INFO" => Ok(()),
             "KEYS" => (frame.args.len() == 1)
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message("KEYS")),
@@ -867,39 +865,52 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     fn execute_info(&self, frame: &CommandFrame) -> CommandReply {
         use std::fmt::Write as _;
 
-        if frame.args.len() > 1 {
-            return CommandReply::Error("wrong number of arguments for 'INFO' command".to_owned());
-        }
+        let mut include_replication = frame.args.is_empty();
+        let mut include_persistence = false;
+        for raw in &frame.args {
+            let Ok(section_raw) = std::str::from_utf8(raw) else {
+                return CommandReply::Error("INFO section must be valid UTF-8".to_owned());
+            };
 
-        let section = match frame.args.first() {
-            None => "REPLICATION".to_owned(),
-            Some(raw) => match std::str::from_utf8(raw) {
-                Ok(value) => value.to_ascii_uppercase(),
-                Err(_) => {
-                    return CommandReply::Error("INFO section must be valid UTF-8".to_owned());
+            for token in section_raw.split(',') {
+                let section = token.trim().to_ascii_uppercase();
+                match section.as_str() {
+                    "ALL" | "DEFAULT" => {
+                        include_replication = true;
+                        include_persistence = true;
+                    }
+                    "REPLICATION" => include_replication = true,
+                    "PERSISTENCE" => include_persistence = true,
+                    _ => {}
                 }
-            },
-        };
-
-        if !(section == "REPLICATION" || section == "ALL" || section == "DEFAULT") {
-            return CommandReply::Error(format!("unsupported INFO section '{section}'"));
+            }
         }
 
-        let mut info = format!(
-            "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\nlast_ack_lsn:{}\r\n",
-            self.replication.connected_replicas(),
-            self.replication.master_replid(),
-            self.replication.replication_offset(),
-            self.replication.last_acked_lsn(),
-        );
-        for (index, (address, port, state, lag)) in
-            self.replication.replica_info_rows().into_iter().enumerate()
-        {
+        let mut info = String::new();
+        if include_replication {
             write!(
                 info,
-                "slave{index}:ip={address},port={port},state={state},lag={lag}\r\n"
+                "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\nlast_ack_lsn:{}\r\n",
+                self.replication.connected_replicas(),
+                self.replication.master_replid(),
+                self.replication.replication_offset(),
+                self.replication.last_acked_lsn(),
             )
             .expect("writing to String should not fail");
+            for (index, (address, port, state, lag)) in
+                self.replication.replica_info_rows().into_iter().enumerate()
+            {
+                write!(
+                    info,
+                    "slave{index}:ip={address},port={port},state={state},lag={lag}\r\n"
+                )
+                .expect("writing to String should not fail");
+            }
+        }
+        if include_persistence {
+            // Snapshot internals are intentionally simple in this learning path, but INFO shape
+            // keeps Dragonfly-compatible section naming so section routing remains faithful.
+            info.push_str("# Persistence\r\nloading:0\r\n");
         }
         CommandReply::BulkString(info.into_bytes())
     }
@@ -5714,6 +5725,48 @@ mod tests {
         assert_that!(body.contains("master_replid:"), eq(true));
         assert_that!(body.contains("master_repl_offset:1\r\n"), eq(true));
         assert_that!(body.contains("last_ack_lsn:0\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_info_supports_multiple_sections_and_includes_persistence() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"info:multi:key", b"value"]),
+            )
+            .expect("SET should succeed");
+
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"INFO", b"REPLICATION", b"PERSISTENCE"]),
+            )
+            .expect("INFO should succeed");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("# Replication\r\n"), eq(true));
+        assert_that!(body.contains("# Persistence\r\n"), eq(true));
+        assert_that!(body.contains("loading:0\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_info_ignores_unknown_sections_when_valid_section_is_present() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"INFO", b"REPLICATION", b"INVALIDSECTION"]),
+            )
+            .expect("INFO should succeed");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("# Replication\r\n"), eq(true));
+        assert_that!(body.contains("INVALIDSECTION"), eq(false));
     }
 
     #[rstest]
