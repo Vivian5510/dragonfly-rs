@@ -1,0 +1,18 @@
+[package]
+name = "dfly-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dfly-cluster = { path = "../dfly-cluster" }
+dfly-common = { path = "../dfly-common" }
+dfly-core = { path = "../dfly-core" }
+dfly-facade = { path = "../dfly-facade" }
+dfly-replication = { path = "../dfly-replication" }
+dfly-search = { path = "../dfly-search" }
+dfly-storage = { path = "../dfly-storage" }
+dfly-tiering = { path = "../dfly-tiering" }
+dfly-transaction = { path = "../dfly-transaction" }
+
+[lints]
+workspace = true

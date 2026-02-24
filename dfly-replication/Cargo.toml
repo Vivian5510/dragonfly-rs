@@ -1,0 +1,11 @@
+[package]
+name = "dfly-replication"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dfly-common = { path = "../dfly-common" }
+dfly-transaction = { path = "../dfly-transaction" }
+
+[lints]
+workspace = true

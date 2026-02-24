@@ -1,0 +1,12 @@
+[package]
+name = "dfly-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dfly-common = { path = "../dfly-common" }
+dfly-core = { path = "../dfly-core" }
+dfly-transaction = { path = "../dfly-transaction" }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "dfly-tiering"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dfly-common = { path = "../dfly-common" }
+
+[lints]
+workspace = true

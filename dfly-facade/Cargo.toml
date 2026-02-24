@@ -1,0 +1,10 @@
+[package]
+name = "dfly-facade"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dfly-common = { path = "../dfly-common" }
+
+[lints]
+workspace = true
