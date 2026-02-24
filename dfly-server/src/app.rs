@@ -557,14 +557,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             };
         }
 
-        // Global fallback keeps strict one-command-per-hop sequencing for mixed workloads.
-        let hops = queued_commands
-            .iter()
-            .cloned()
-            .map(|command| TransactionHop {
-                per_shard: vec![(self.core.resolve_target_shard(&command), command)],
-            })
-            .collect::<Vec<_>>();
+        let hops = self.build_global_hops(queued_commands);
         TransactionPlan {
             txid,
             mode: TransactionMode::Global,
@@ -574,12 +567,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn collect_plan_touched_shards(&self, queued_commands: &[CommandFrame]) -> Vec<u16> {
-        // Scheduler reservation must follow the runtime fanout footprint instead of
-        // planner-local shard hints, otherwise multi-shard commands in Global mode
-        // can bypass queue isolation on non-hinted shards.
+        // Scheduler reservation follows planner dependency footprints. For known multi-shard
+        // commands this is the exact runtime fanout; for non-key commands with unknown routing
+        // we conservatively reserve all shards to preserve global ordering barriers.
         let mut touched = queued_commands
             .iter()
-            .flat_map(|command| self.runtime_target_shards_for_command(command))
+            .flat_map(|command| self.planner_dependency_shards_for_command(command))
             .collect::<Vec<_>>();
         touched.sort_unstable();
         touched.dedup();
@@ -611,6 +604,68 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             hops.push(current_hop);
         }
         hops
+    }
+
+    fn build_global_hops(&self, queued_commands: &[CommandFrame]) -> Vec<TransactionHop> {
+        // Dependency-aware hop layering for mixed workloads.
+        //
+        // Each command contributes a shard footprint. The command is placed in the earliest hop
+        // that satisfies:
+        // 1) all conflicting shard footprints from earlier commands are in previous hops;
+        // 2) hop indices never decrease, so reply order remains identical to input order.
+        //
+        // This is a stable topological layering over shard-conflict edges.
+        let mut hops = Vec::<TransactionHop>::new();
+        let mut last_hop_by_shard = HashMap::<u16, usize>::new();
+        let mut last_assigned_hop = 0_usize;
+
+        for (command_index, command) in queued_commands.iter().cloned().enumerate() {
+            let dependency_shards = self.planner_dependency_shards_for_command(&command);
+
+            let dependency_hop = dependency_shards
+                .iter()
+                .filter_map(|shard| last_hop_by_shard.get(shard).copied())
+                .max()
+                .map_or(0_usize, |hop| hop.saturating_add(1));
+            let hop_index = if command_index == 0 {
+                dependency_hop
+            } else {
+                dependency_hop.max(last_assigned_hop)
+            };
+
+            while hops.len() <= hop_index {
+                hops.push(TransactionHop {
+                    per_shard: Vec::new(),
+                });
+            }
+
+            hops[hop_index]
+                .per_shard
+                .push((self.core.resolve_target_shard(&command), command));
+            for shard in dependency_shards {
+                let _ = last_hop_by_shard.insert(shard, hop_index);
+            }
+            last_assigned_hop = hop_index;
+        }
+
+        hops
+    }
+
+    fn planner_dependency_shards_for_command(&self, frame: &CommandFrame) -> Vec<u16> {
+        let runtime_targets = self.runtime_target_shards_for_command(frame);
+        if !runtime_targets.is_empty() {
+            return runtime_targets;
+        }
+
+        if matches!(
+            self.core.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return vec![self.core.resolve_target_shard(frame)];
+        }
+
+        // Non-key command with no explicit runtime fanout hint: treat as global barrier.
+        self.all_runtime_shards()
     }
 
     fn execute_transaction_plan(&mut self, db: u16, plan: &TransactionPlan) -> Vec<CommandReply> {
@@ -3981,7 +4036,7 @@ mod tests {
             CommandFrame::new("SET", vec![b"plan:key".to_vec(), b"value".to_vec()]),
             CommandFrame::new("TIME", Vec::new()),
         ];
-        let set_shard = app.core.resolve_shard_for_key(b"plan:key");
+        let expected_touched = app.all_runtime_shards();
 
         let plan = app.build_exec_plan(&queued);
         assert_that!(plan.mode, eq(TransactionMode::Global));
@@ -3990,7 +4045,62 @@ mod tests {
             plan.hops.iter().all(|hop| hop.per_shard.len() == 1),
             eq(true)
         );
-        assert_that!(&plan.touched_shards, eq(&vec![set_shard]));
+        assert_that!(&plan.touched_shards, eq(&expected_touched));
+
+        let flattened = plan
+            .hops
+            .iter()
+            .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
+            .collect::<Vec<_>>();
+        assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
+    fn exec_plan_global_mode_layers_by_runtime_shard_dependencies() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+
+        let first_key = b"plan:global:mset:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+
+        let mut second_key = b"plan:global:mset:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("plan:global:mset:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let mut third_key = b"plan:global:set:3".to_vec();
+        let mut third_shard = app.core.resolve_shard_for_key(&third_key);
+        while third_shard == first_shard || third_shard == second_shard {
+            suffix = suffix.saturating_add(1);
+            third_key = format!("plan:global:set:3:{suffix}").into_bytes();
+            third_shard = app.core.resolve_shard_for_key(&third_key);
+        }
+
+        let queued = vec![
+            CommandFrame::new(
+                "MSET",
+                vec![
+                    first_key.clone(),
+                    b"a".to_vec(),
+                    second_key.clone(),
+                    b"b".to_vec(),
+                ],
+            ),
+            CommandFrame::new("SET", vec![third_key.clone(), b"c".to_vec()]),
+            CommandFrame::new("GET", vec![first_key.clone()]),
+        ];
+
+        let plan = app.build_exec_plan(&queued);
+        assert_that!(plan.mode, eq(TransactionMode::Global));
+        assert_that!(plan.hops.len(), eq(2_usize));
+        assert_that!(plan.hops[0].per_shard.len(), eq(2_usize));
+        assert_that!(plan.hops[1].per_shard.len(), eq(1_usize));
+        assert_that!(plan.touched_shards.contains(&first_shard), eq(true));
+        assert_that!(plan.touched_shards.contains(&second_shard), eq(true));
+        assert_that!(plan.touched_shards.contains(&third_shard), eq(true));
 
         let flattened = plan
             .hops
