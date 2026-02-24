@@ -28,6 +28,20 @@ pub trait TransactionScheduler: Send + Sync {
         let _ = txid;
         Ok(())
     }
+
+    /// Ensures the provided shards are not currently held by any pending transaction.
+    ///
+    /// Direct command execution uses this hook to avoid racing with in-flight transactions
+    /// that already reserved the same shards. The default implementation is a no-op so
+    /// schedulers don't have to implement it when they do not carry shard ownership state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scheduler implementation can prove one or more shards are
+    /// currently busy and cannot accept direct command execution.
+    fn ensure_shards_available(&self, _shards: &[ShardId]) -> DflyResult<()> {
+        Ok(())
+    }
 }
 
 /// In-memory scheduler with minimal Dragonfly-like queue/lock lifecycle.
@@ -169,6 +183,26 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
         };
 
         rollback_leases(&mut state, txid, &lease.reserved_shards, &lease.key_leases);
+        Ok(())
+    }
+
+    fn ensure_shards_available(&self, shards: &[ShardId]) -> DflyResult<()> {
+        if shards.is_empty() {
+            return Ok(());
+        }
+
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
+
+        for shard in shards {
+            if let Some(queue) = state.shard_queues.get(shard)
+                && !queue.is_empty()
+            {
+                return Err(DflyError::InvalidState("transaction shard queue is busy"));
+            }
+        }
         Ok(())
     }
 }
@@ -323,6 +357,7 @@ fn rollback_leases(
 mod tests {
     use super::{InMemoryTransactionScheduler, TransactionScheduler};
     use crate::plan::{TransactionHop, TransactionMode, TransactionPlan};
+    use dfly_common::error::DflyError;
     use dfly_core::command::CommandFrame;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -569,5 +604,38 @@ mod tests {
         assert_that!(scheduler.schedule(&shard_one_writer).is_err(), eq(true));
         assert_that!(scheduler.conclude(global.txid).is_ok(), eq(true));
         assert_that!(scheduler.schedule(&shard_one_writer).is_ok(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_detects_busy_shard_queue_in_ensure() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 33,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![0],
+        };
+
+        assert_that!(scheduler.schedule(&plan).is_ok(), eq(true));
+        let Err(error) = scheduler.ensure_shards_available(&plan.touched_shards) else {
+            panic!("expected shard to stay busy while transaction is active");
+        };
+        assert_eq!(
+            error,
+            DflyError::InvalidState("transaction shard queue is busy")
+        );
+
+        assert_that!(scheduler.conclude(plan.txid).is_ok(), eq(true));
+        assert_that!(
+            scheduler
+                .ensure_shards_available(&plan.touched_shards)
+                .is_ok(),
+            eq(true)
+        );
     }
 }

@@ -762,6 +762,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return Ok(());
         }
 
+        self.transaction
+            .scheduler
+            .ensure_shards_available(&target_shards)?;
+
         // Direct command path mirrors Dragonfly's coordinator ingress:
         // 1) push one envelope to each touched shard queue,
         // 2) wait until all shard workers report they consumed the envelope.
@@ -2289,6 +2293,7 @@ mod tests {
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
     use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
+    use dfly_transaction::scheduler::TransactionScheduler;
     use googletest::prelude::*;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -4134,6 +4139,40 @@ mod tests {
                 .expect("drain should succeed");
             assert_that!(runtime.is_empty(), eq(true));
         }
+    }
+
+    #[rstest]
+    fn direct_command_respects_scheduler_barrier() {
+        let app = ServerApp::new(RuntimeConfig::default());
+        let key = b"direct:rt:block".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 1000,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    shard,
+                    CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![shard],
+        };
+
+        assert_that!(app.transaction.scheduler.schedule(&plan).is_ok(), eq(true));
+
+        let blocked_command = CommandFrame::new("SET", vec![key.clone(), b"blocked".to_vec()]);
+        let error = app
+            .dispatch_direct_command_runtime(&blocked_command)
+            .expect_err("scheduler should block conflicting direct command");
+        assert_eq!(
+            error,
+            DflyError::InvalidState("transaction shard queue is busy")
+        );
+
+        assert_that!(
+            app.transaction.scheduler.conclude(plan.txid).is_ok(),
+            eq(true)
+        );
     }
 
     #[rstest]
