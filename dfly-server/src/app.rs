@@ -548,6 +548,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "DEL" => self.execute_del(db, frame),
             "UNLINK" => self.execute_unlink(db, frame),
             "EXISTS" => self.execute_exists(db, frame),
+            "TOUCH" => self.execute_touch(db, frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
@@ -678,6 +679,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn execute_exists(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "EXISTS")
+    }
+
+    fn execute_touch(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        self.execute_counting_key_command(db, frame, "TOUCH")
     }
 
     fn execute_counting_key_command(
@@ -2059,6 +2064,27 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
             .expect("EXISTS should execute");
         assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_touch_counts_existing_keys() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
+            .expect("SET k1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
+            .expect("SET k2 should succeed");
+
+        let touched = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"TOUCH", b"k1", b"k2", b"missing", b"k1"]),
+            )
+            .expect("TOUCH should execute");
+        assert_that!(&touched, eq(&vec![b":3\r\n".to_vec()]));
     }
 
     #[rstest]

@@ -280,6 +280,11 @@ impl CommandRegistry {
             handler: handle_exists,
         });
         self.register(CommandSpec {
+            name: "TOUCH",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_exists,
+        });
+        self.register(CommandSpec {
             name: "MOVE",
             arity: CommandArity::Exact(2),
             handler: handle_move,
@@ -1460,6 +1465,38 @@ mod tests {
             &mut state,
         );
         assert_that!(&exists_after, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_touch_counts_existing_keys_like_exists() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let touched = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "TOUCH",
+                vec![
+                    b"k1".to_vec(),
+                    b"k2".to_vec(),
+                    b"missing".to_vec(),
+                    b"k1".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&touched, eq(&CommandReply::Integer(3)));
     }
 
     #[rstest]
