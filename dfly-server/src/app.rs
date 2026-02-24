@@ -8,6 +8,7 @@ use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
 use dfly_core::CoreModule;
+use dfly_core::CoreSnapshot;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::{InMemoryShardRuntime, RuntimeEnvelope};
 use dfly_facade::FacadeModule;
@@ -124,7 +125,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Returns `DflyError::Protocol` when payload cannot be decoded or contains invalid shard ids.
     pub fn load_snapshot_bytes(&mut self, payload: &[u8]) -> DflyResult<()> {
         let snapshot = self.storage.deserialize_snapshot(payload)?;
-        self.core.import_snapshot(&snapshot)
+        self.install_snapshot(&snapshot)
+    }
+
+    fn install_snapshot(&mut self, snapshot: &CoreSnapshot) -> DflyResult<()> {
+        self.core.import_snapshot(snapshot)?;
+        self.replication.reset_after_snapshot_load();
+        Ok(())
     }
 
     /// Replays currently buffered replication journal entries into the in-memory core state.
@@ -1568,10 +1575,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             Ok(snapshot) => snapshot,
             Err(error) => return CommandReply::Error(format!("DFLY LOAD failed: {error}")),
         };
-        match self.core.import_snapshot(&snapshot) {
-            Ok(()) => CommandReply::SimpleString("OK".to_owned()),
-            Err(error) => CommandReply::Error(format!("DFLY LOAD failed: {error}")),
+        if let Err(error) = self.install_snapshot(&snapshot) {
+            return CommandReply::Error(format!("DFLY LOAD failed: {error}"));
         }
+        CommandReply::SimpleString("OK".to_owned())
     }
 
     fn execute_key_command(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
@@ -7436,6 +7443,53 @@ mod tests {
             reply[0].starts_with(b"-ERR DFLY LOAD failed: io error:"),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn resp_dfly_load_resets_replication_state() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"load:reset:key", b"initial"]),
+            )
+            .expect("initial SET should succeed");
+        assert_that!(app.replication.replication_offset(), gt(0_u64));
+
+        let path = unique_test_snapshot_path("dfly-load-reset");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+
+        let save_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
+            )
+            .expect("DFLY SAVE should execute");
+        assert_that!(&save_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"load:reset:key", b"new"]),
+            )
+            .expect("second SET should succeed");
+        assert_that!(app.replication.replication_offset(), gt(1_u64));
+
+        let load_reply = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+            )
+            .expect("DFLY LOAD should execute");
+        assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        assert_that!(app.replication.replication_offset(), eq(0_u64));
+        assert_that!(app.replication.journal_entries().is_empty(), eq(true));
+        assert_that!(app.replication.journal_lsn(), eq(1_u64));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[rstest]

@@ -399,6 +399,19 @@ impl ReplicationState {
         self.next_eof_token_seed = self.next_eof_token_seed.saturating_add(1);
         token
     }
+
+    /// Resets mutable replication metadata after loading a snapshot payload.
+    pub fn reset_after_snapshot_load(&mut self) {
+        self.full_sync_done = false;
+        self.full_sync_in_progress = false;
+        self.last_lsn = 0;
+        self.last_acked_lsn = 0;
+        self.connected_replicas = 0;
+        self.replicas.clear();
+        self.sync_sessions.clear();
+        self.next_sync_session_id = 1;
+        self.next_eof_token_seed = 1;
+    }
 }
 
 /// Generates one pseudo-random looking replication id.

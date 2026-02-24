@@ -160,6 +160,12 @@ impl InMemoryJournal {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Clears buffered entries and resets the LSN cursor to the initial state.
+    pub fn reset(&mut self) {
+        self.records.clear();
+        self.next_lsn = 1;
+    }
 }
 
 #[cfg(test)]

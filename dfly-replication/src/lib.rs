@@ -266,6 +266,12 @@ impl ReplicationModule {
             }
         }
     }
+
+    /// Resets journal buffer and replication metadata after restoring state from a snapshot.
+    pub fn reset_after_snapshot_load(&mut self) {
+        self.journal.reset();
+        self.state.reset_after_snapshot_load();
+    }
 }
 
 #[cfg(test)]
