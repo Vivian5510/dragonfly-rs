@@ -600,8 +600,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
-            "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "EXPIRE" | "TTL"
-            | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
+            "GET" | "SET" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "GETRANGE" | "SETRANGE"
+            | "EXPIRE" | "TTL" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
                 self.execute_key_command(db, frame)
             }
             _ => self.core.execute_in_db(db, frame),
@@ -1589,6 +1589,11 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
         | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
         | ("GETDEL", CommandReply::BulkString(_))
         | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
+        ("SETRANGE", CommandReply::Integer(_))
+            if frame.args.get(2).is_some_and(|arg| !arg.is_empty()) =>
+        {
+            Some(JournalOp::Command)
+        }
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -2061,6 +2066,36 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
             .expect("GET should execute");
         assert_that!(&value, eq(&vec![b"$5\r\nhello\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_getrange_and_setrange_follow_redis_offset_rules() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"hello"]))
+            .expect("SET should execute");
+        let range = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"GETRANGE", b"k", b"1", b"3"]),
+            )
+            .expect("GETRANGE should execute");
+        assert_that!(&range, eq(&vec![b"$3\r\nell\r\n".to_vec()]));
+
+        let setrange = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETRANGE", b"k", b"1", b"i"]),
+            )
+            .expect("SETRANGE should execute");
+        assert_that!(&setrange, eq(&vec![b":5\r\n".to_vec()]));
+
+        let value = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should execute");
+        assert_that!(&value, eq(&vec![b"$5\r\nhillo\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2785,6 +2820,32 @@ mod tests {
         );
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("APPEND"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_setrange_only_when_payload_is_non_empty() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETRANGE", b"k", b"0", b""]),
+            )
+            .expect("SETRANGE with empty payload should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETRANGE", b"k", b"0", b"xy"]),
+            )
+            .expect("SETRANGE with payload should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(1_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("SETRANGE"),
             eq(true)
         );
     }

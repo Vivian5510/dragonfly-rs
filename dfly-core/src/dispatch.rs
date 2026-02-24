@@ -184,97 +184,123 @@ impl CommandRegistry {
     #[must_use]
     pub fn with_builtin_commands() -> Self {
         let mut registry = Self::new();
-        registry.register(CommandSpec {
+        registry.register_connection_commands();
+        registry.register_string_commands();
+        registry.register_expiry_commands();
+        registry.register_counter_commands();
+        registry
+    }
+
+    fn register_connection_commands(&mut self) {
+        self.register(CommandSpec {
             name: "PING",
             arity: CommandArity::AtLeast(0),
             handler: handle_ping,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "ECHO",
             arity: CommandArity::Exact(1),
             handler: handle_echo,
         });
-        registry.register(CommandSpec {
+    }
+
+    fn register_string_commands(&mut self) {
+        self.register(CommandSpec {
             name: "SET",
             arity: CommandArity::Exact(2),
             handler: handle_set,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "SETNX",
             arity: CommandArity::Exact(2),
             handler: handle_setnx,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "GET",
             arity: CommandArity::Exact(1),
             handler: handle_get,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "GETSET",
             arity: CommandArity::Exact(2),
             handler: handle_getset,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "GETDEL",
             arity: CommandArity::Exact(1),
             handler: handle_getdel,
         });
-        registry.register(CommandSpec {
-            name: "DEL",
-            arity: CommandArity::AtLeast(1),
-            handler: handle_del,
-        });
-        registry.register(CommandSpec {
-            name: "EXISTS",
-            arity: CommandArity::AtLeast(1),
-            handler: handle_exists,
-        });
-        registry.register(CommandSpec {
-            name: "EXPIRE",
-            arity: CommandArity::Exact(2),
-            handler: handle_expire,
-        });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "APPEND",
             arity: CommandArity::Exact(2),
             handler: handle_append,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "STRLEN",
             arity: CommandArity::Exact(1),
             handler: handle_strlen,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
+            name: "GETRANGE",
+            arity: CommandArity::Exact(3),
+            handler: handle_getrange,
+        });
+        self.register(CommandSpec {
+            name: "SETRANGE",
+            arity: CommandArity::Exact(3),
+            handler: handle_setrange,
+        });
+        self.register(CommandSpec {
+            name: "DEL",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_del,
+        });
+        self.register(CommandSpec {
+            name: "EXISTS",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_exists,
+        });
+    }
+
+    fn register_expiry_commands(&mut self) {
+        self.register(CommandSpec {
+            name: "EXPIRE",
+            arity: CommandArity::Exact(2),
+            handler: handle_expire,
+        });
+        self.register(CommandSpec {
             name: "TTL",
             arity: CommandArity::Exact(1),
             handler: handle_ttl,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "PERSIST",
             arity: CommandArity::Exact(1),
             handler: handle_persist,
         });
-        registry.register(CommandSpec {
+    }
+
+    fn register_counter_commands(&mut self) {
+        self.register(CommandSpec {
             name: "INCR",
             arity: CommandArity::Exact(1),
             handler: handle_incr,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "DECR",
             arity: CommandArity::Exact(1),
             handler: handle_decr,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "INCRBY",
             arity: CommandArity::Exact(2),
             handler: handle_incrby,
         });
-        registry.register(CommandSpec {
+        self.register(CommandSpec {
             name: "DECRBY",
             arity: CommandArity::Exact(2),
             handler: handle_decrby,
         });
-        registry
     }
 
     /// Registers or replaces one command in the table.
@@ -449,6 +475,73 @@ fn handle_strlen(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
         .and_then(|map| map.get(key))
         .map_or(0_usize, |entry| entry.value.len());
     CommandReply::Integer(i64::try_from(length).unwrap_or(i64::MAX))
+}
+
+fn handle_getrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let Some(value) = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.value.as_slice())
+    else {
+        return CommandReply::BulkString(Vec::new());
+    };
+
+    let Ok(start) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let Ok(end) = parse_redis_i64(&frame.args[2]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+
+    let Some((start_index, end_index)) = normalize_redis_range(start, end, value.len()) else {
+        return CommandReply::BulkString(Vec::new());
+    };
+    CommandReply::BulkString(value[start_index..=end_index].to_vec())
+}
+
+fn handle_setrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = frame.args[0].clone();
+    let Ok(offset_u64) = parse_redis_u64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let Ok(offset) = usize::try_from(offset_u64) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let payload = &frame.args[2];
+    state.purge_expired_key(db, &key);
+
+    let (mut value, expire_at_unix_secs) =
+        if let Some(existing) = state.db_map(db).and_then(|map| map.get(&key)) {
+            (existing.value.clone(), existing.expire_at_unix_secs)
+        } else {
+            (Vec::new(), None)
+        };
+
+    if payload.is_empty() {
+        return CommandReply::Integer(i64::try_from(value.len()).unwrap_or(i64::MAX));
+    }
+
+    if offset > value.len() {
+        value.resize(offset, 0_u8);
+    }
+    let needed_len = offset.saturating_add(payload.len());
+    if needed_len > value.len() {
+        value.resize(needed_len, 0_u8);
+    }
+    value[offset..offset + payload.len()].copy_from_slice(payload);
+
+    state.db_map_mut(db).insert(
+        key.clone(),
+        ValueEntry {
+            value: value.clone(),
+            expire_at_unix_secs,
+        },
+    );
+    state.bump_key_version(db, &key);
+    CommandReply::Integer(i64::try_from(value.len()).unwrap_or(i64::MAX))
 }
 
 fn handle_del(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -635,6 +728,55 @@ fn parse_redis_i64(payload: &[u8]) -> Result<i64, ()> {
     text.parse::<i64>().map_err(|_| ())
 }
 
+fn parse_redis_u64(payload: &[u8]) -> Result<u64, ()> {
+    let Ok(text) = str::from_utf8(payload) else {
+        return Err(());
+    };
+    text.parse::<u64>().map_err(|_| ())
+}
+
+fn normalize_redis_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+
+    let len_i64 = i64::try_from(len).unwrap_or(i64::MAX);
+    let mut start = if start < 0 {
+        len_i64.saturating_add(start)
+    } else {
+        start
+    };
+    let mut end = if end < 0 {
+        len_i64.saturating_add(end)
+    } else {
+        end
+    };
+
+    if start < 0 {
+        start = 0;
+    }
+    if end < 0 {
+        return None;
+    }
+    if start >= len_i64 {
+        return None;
+    }
+    if end >= len_i64 {
+        end = len_i64.saturating_sub(1);
+    }
+    if start > end {
+        return None;
+    }
+
+    let Ok(start_index) = usize::try_from(start) else {
+        return None;
+    };
+    let Ok(end_index) = usize::try_from(end) else {
+        return None;
+    };
+    Some((start_index, end_index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CommandRegistry, DispatchState};
@@ -789,6 +931,85 @@ mod tests {
             &mut state,
         );
         assert_that!(&value, eq(&CommandReply::BulkString(b"hello".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_getrange_returns_slice_with_redis_index_rules() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k".to_vec(), b"hello".to_vec()]),
+            &mut state,
+        );
+
+        let middle = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "GETRANGE",
+                vec![b"k".to_vec(), b"1".to_vec(), b"3".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&middle, eq(&CommandReply::BulkString(b"ell".to_vec())));
+
+        let tail = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "GETRANGE",
+                vec![b"k".to_vec(), b"-2".to_vec(), b"-1".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&tail, eq(&CommandReply::BulkString(b"lo".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_setrange_updates_offset_and_zero_pads_missing_bytes() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k".to_vec(), b"hello".to_vec()]),
+            &mut state,
+        );
+        let updated = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETRANGE",
+                vec![b"k".to_vec(), b"1".to_vec(), b"i".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&updated, eq(&CommandReply::Integer(5)));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SETRANGE",
+                vec![b"k2".to_vec(), b"3".to_vec(), b"ab".to_vec()],
+            ),
+            &mut state,
+        );
+
+        let key1 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&key1, eq(&CommandReply::BulkString(b"hillo".to_vec())));
+
+        let key2 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &key2,
+            eq(&CommandReply::BulkString(vec![0, 0, 0, b'a', b'b']))
+        );
     }
 
     #[rstest]
