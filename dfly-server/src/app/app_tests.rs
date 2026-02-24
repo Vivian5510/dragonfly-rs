@@ -1,4 +1,3 @@
-
 use super::ServerApp;
 use dfly_cluster::slot::{SlotRange, key_slot};
 use dfly_common::config::{ClusterMode, RuntimeConfig};
