@@ -221,6 +221,11 @@ impl CommandRegistry {
             handler: handle_get,
         });
         self.register(CommandSpec {
+            name: "TYPE",
+            arity: CommandArity::Exact(1),
+            handler: handle_type,
+        });
+        self.register(CommandSpec {
             name: "GETSET",
             arity: CommandArity::Exact(2),
             handler: handle_getset,
@@ -422,6 +427,15 @@ fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         Some(value) => CommandReply::BulkString(value.value.clone()),
         None => CommandReply::Null,
     }
+}
+
+fn handle_type(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+    if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+        return CommandReply::SimpleString("string".to_owned());
+    }
+    CommandReply::SimpleString("none".to_owned())
 }
 
 fn handle_getset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -910,6 +924,34 @@ mod tests {
             &mut state,
         );
         assert_that!(&get_reply, eq(&CommandReply::BulkString(b"alice".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_type_reports_none_or_string() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let missing = registry.dispatch(
+            0,
+            &CommandFrame::new("TYPE", vec![b"nope".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&missing, eq(&CommandReply::SimpleString("none".to_owned())));
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+            &mut state,
+        );
+        let existing = registry.dispatch(
+            0,
+            &CommandFrame::new("TYPE", vec![b"k".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &existing,
+            eq(&CommandReply::SimpleString("string".to_owned()))
+        );
     }
 
     #[rstest]

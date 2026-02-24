@@ -600,9 +600,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
-            "GET" | "SET" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN" | "GETRANGE"
-            | "SETRANGE" | "EXPIRE" | "EXPIREAT" | "TTL" | "EXPIRETIME" | "PERSIST" | "INCR"
-            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
+            "GET" | "SET" | "TYPE" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN"
+            | "GETRANGE" | "SETRANGE" | "EXPIRE" | "EXPIREAT" | "TTL" | "EXPIRETIME"
+            | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
+                self.execute_key_command(db, frame)
+            }
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -1793,6 +1795,25 @@ mod tests {
             .expect("GET command should execute");
         let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
         assert_that!(&get_responses, eq(&expected_get));
+    }
+
+    #[rstest]
+    fn resp_type_reports_none_or_string() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let missing = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"missing"]))
+            .expect("TYPE should execute");
+        assert_that!(&missing, eq(&vec![b"+none\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should execute");
+        let existing = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"k"]))
+            .expect("TYPE should execute");
+        assert_that!(&existing, eq(&vec![b"+string\r\n".to_vec()]));
     }
 
     #[rstest]
