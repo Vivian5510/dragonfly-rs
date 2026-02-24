@@ -229,6 +229,26 @@ impl CommandRegistry {
             arity: CommandArity::Exact(1),
             handler: handle_persist,
         });
+        registry.register(CommandSpec {
+            name: "INCR",
+            arity: CommandArity::Exact(1),
+            handler: handle_incr,
+        });
+        registry.register(CommandSpec {
+            name: "DECR",
+            arity: CommandArity::Exact(1),
+            handler: handle_decr,
+        });
+        registry.register(CommandSpec {
+            name: "INCRBY",
+            arity: CommandArity::Exact(2),
+            handler: handle_incrby,
+        });
+        registry.register(CommandSpec {
+            name: "DECRBY",
+            arity: CommandArity::Exact(2),
+            handler: handle_decrby,
+        });
         registry
     }
 
@@ -428,10 +448,78 @@ fn handle_persist(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
     CommandReply::Integer(0)
 }
 
+fn handle_incr(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    mutate_counter_by(db, &frame.args[0], 1, state)
+}
+
+fn handle_decr(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    mutate_counter_by(db, &frame.args[0], -1, state)
+}
+
+fn handle_incrby(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let Ok(delta) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    mutate_counter_by(db, &frame.args[0], delta, state)
+}
+
+fn handle_decrby(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let Ok(amount) = parse_redis_i64(&frame.args[1]) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    let Some(delta) = amount.checked_neg() else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+    mutate_counter_by(db, &frame.args[0], delta, state)
+}
+
+/// Applies one signed integer delta to a key using Redis-compatible counter semantics.
+///
+/// Missing keys are treated as zero and created. Existing TTL metadata is preserved.
+fn mutate_counter_by(
+    db: DbIndex,
+    key: &[u8],
+    delta: i64,
+    state: &mut DispatchState,
+) -> CommandReply {
+    state.purge_expired_key(db, key);
+
+    let (current, expire_at_unix_secs) =
+        if let Some(existing) = state.db_map(db).and_then(|map| map.get(key)) {
+            let Ok(current) = parse_redis_i64(&existing.value) else {
+                return CommandReply::Error("value is not an integer or out of range".to_owned());
+            };
+            (current, existing.expire_at_unix_secs)
+        } else {
+            (0_i64, None)
+        };
+
+    let Some(next) = current.checked_add(delta) else {
+        return CommandReply::Error("value is not an integer or out of range".to_owned());
+    };
+
+    state.db_map_mut(db).insert(
+        key.to_vec(),
+        ValueEntry {
+            value: next.to_string().into_bytes(),
+            expire_at_unix_secs,
+        },
+    );
+    state.bump_key_version(db, key);
+    CommandReply::Integer(next)
+}
+
 fn parse_i64_arg(arg: &[u8], field_name: &str) -> Result<i64, String> {
     let text = str::from_utf8(arg).map_err(|_| format!("{field_name} must be valid UTF-8"))?;
     text.parse::<i64>()
         .map_err(|_| format!("{field_name} must be an integer"))
+}
+
+fn parse_redis_i64(payload: &[u8]) -> Result<i64, ()> {
+    let Ok(text) = str::from_utf8(payload) else {
+        return Err(());
+    };
+    text.parse::<i64>().map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -619,6 +707,83 @@ mod tests {
             &mut state,
         );
         assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_incr_family_updates_counter_with_redis_semantics() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let incr = registry.dispatch(
+            0,
+            &CommandFrame::new("INCR", vec![b"counter".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&incr, eq(&CommandReply::Integer(1)));
+
+        let incrby = registry.dispatch(
+            0,
+            &CommandFrame::new("INCRBY", vec![b"counter".to_vec(), b"9".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&incrby, eq(&CommandReply::Integer(10)));
+
+        let decr = registry.dispatch(
+            0,
+            &CommandFrame::new("DECR", vec![b"counter".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&decr, eq(&CommandReply::Integer(9)));
+
+        let decrby = registry.dispatch(
+            0,
+            &CommandFrame::new("DECRBY", vec![b"counter".to_vec(), b"4".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&decrby, eq(&CommandReply::Integer(5)));
+    }
+
+    #[rstest]
+    fn dispatch_incr_family_rejects_non_integer_or_overflow_values() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"counter".to_vec(), b"abc".to_vec()]),
+            &mut state,
+        );
+        let non_integer = registry.dispatch(
+            0,
+            &CommandFrame::new("INCR", vec![b"counter".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &non_integer,
+            eq(&CommandReply::Error(
+                "value is not an integer or out of range".to_owned()
+            ))
+        );
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "SET",
+                vec![b"counter".to_vec(), i64::MAX.to_string().into_bytes()],
+            ),
+            &mut state,
+        );
+        let overflow = registry.dispatch(
+            0,
+            &CommandFrame::new("INCR", vec![b"counter".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &overflow,
+            eq(&CommandReply::Error(
+                "value is not an integer or out of range".to_owned()
+            ))
+        );
     }
 
     #[rstest]
