@@ -922,6 +922,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_cluster(&self, frame: &CommandFrame) -> CommandReply {
+        if self.cluster.mode == ClusterMode::Disabled {
+            return CommandReply::Error(
+                "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
+            );
+        }
+
         let Some(subcommand_raw) = frame.args.first() else {
             return CommandReply::Error(
                 "wrong number of arguments for 'CLUSTER' command".to_owned(),
@@ -2662,7 +2668,11 @@ mod tests {
 
     #[rstest]
     fn resp_cluster_keyslot_returns_redis_slot() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
         let key = b"user:{42}:meta";
@@ -2676,7 +2686,11 @@ mod tests {
 
     #[rstest]
     fn resp_cluster_myid_returns_local_node_id() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
         let reply = app
@@ -2685,6 +2699,22 @@ mod tests {
         assert_that!(reply.len(), eq(1_usize));
         let body = decode_resp_bulk_payload(&reply[0]);
         assert_that!(body.as_str(), eq(app.cluster.node_id.as_str()));
+    }
+
+    #[rstest]
+    fn resp_cluster_commands_are_rejected_when_cluster_mode_is_disabled() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"INFO"]))
+            .expect("CLUSTER INFO should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR Cluster is disabled. Use --cluster_mode=yes to enable.\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]
