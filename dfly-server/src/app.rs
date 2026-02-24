@@ -464,65 +464,23 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn validate_non_core_queued_command(frame: &CommandFrame) -> Result<(), String> {
         match frame.name.as_str() {
-            "INFO" => {
-                if frame.args.len() <= 1 {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("INFO"))
-                }
-            }
-            "ROLE" => {
-                if frame.args.is_empty() {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("ROLE"))
-                }
-            }
-            "PSYNC" => {
-                if frame.args.len() == 2 {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("PSYNC"))
-                }
-            }
-            "WAIT" => {
-                if frame.args.len() == 2 {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("WAIT"))
-                }
-            }
-            "CLUSTER" => {
-                if frame.args.is_empty() {
-                    Err(wrong_arity_message("CLUSTER"))
-                } else {
-                    Ok(())
-                }
-            }
-            "DFLY" => {
-                if frame.args.is_empty() {
-                    Err(wrong_arity_message("DFLY"))
-                } else {
-                    Ok(())
-                }
-            }
-            "MGET" => {
-                if frame.args.is_empty() {
-                    Err(wrong_arity_message("MGET"))
-                } else {
-                    Ok(())
-                }
-            }
-            "MSET" => {
+            "INFO" => (frame.args.len() <= 1)
+                .then_some(())
+                .ok_or_else(|| wrong_arity_message("INFO")),
+            "TIME" | "ROLE" | "READONLY" | "READWRITE" | "DBSIZE" => frame
+                .args
+                .is_empty()
+                .then_some(())
+                .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
+            "PSYNC" | "WAIT" => (frame.args.len() == 2)
+                .then_some(())
+                .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
+            "CLUSTER" | "DFLY" | "MGET" => (!frame.args.is_empty())
+                .then_some(())
+                .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
+            "MSET" | "MSETNX" => {
                 if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
-                    Err(wrong_arity_message("MSET"))
-                } else {
-                    Ok(())
-                }
-            }
-            "MSETNX" => {
-                if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
-                    Err(wrong_arity_message("MSETNX"))
+                    Err(wrong_arity_message(frame.name.as_str()))
                 } else {
                     Ok(())
                 }
@@ -532,27 +490,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     Err("syntax error".to_owned())
                 } else {
                     Ok(())
-                }
-            }
-            "READONLY" => {
-                if frame.args.is_empty() {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("READONLY"))
-                }
-            }
-            "READWRITE" => {
-                if frame.args.is_empty() {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("READWRITE"))
-                }
-            }
-            "DBSIZE" => {
-                if frame.args.is_empty() {
-                    Ok(())
-                } else {
-                    Err(wrong_arity_message("DBSIZE"))
                 }
             }
             _ => Err(format!("unknown command '{}'", frame.name)),
@@ -597,6 +534,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ) -> CommandReply {
         match frame.name.as_str() {
             "INFO" => self.execute_info(frame),
+            "TIME" => Self::execute_time(frame),
             "ROLE" => self.execute_role(frame),
             "READONLY" => Self::execute_readonly(frame),
             "READWRITE" => self.execute_readwrite(frame),
@@ -658,6 +596,22 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             .expect("writing to String should not fail");
         }
         CommandReply::BulkString(info.into_bytes())
+    }
+
+    fn execute_time(frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error("wrong number of arguments for 'TIME' command".to_owned());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or((0_u64, 0_u32), |duration| {
+                (duration.as_secs(), duration.subsec_micros())
+            });
+        CommandReply::Array(vec![
+            CommandReply::BulkString(now.0.to_string().into_bytes()),
+            CommandReply::BulkString(now.1.to_string().into_bytes()),
+        ])
     }
 
     fn execute_readonly(frame: &CommandFrame) -> CommandReply {
@@ -1915,6 +1869,44 @@ mod tests {
             &reply,
             eq(&vec![
                 b"-ERR wrong number of arguments for 'DBSIZE' command\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_time_returns_unix_seconds_and_microseconds() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TIME"]))
+            .expect("TIME should execute");
+        assert_that!(reply.len(), eq(1_usize));
+        let text = std::str::from_utf8(&reply[0]).expect("TIME reply should be UTF-8");
+        let lines = text.split("\r\n").collect::<Vec<_>>();
+        assert_that!(lines.first(), eq(Some(&"*2")));
+        assert_that!(
+            lines.get(2).is_some_and(|value| !value.is_empty()),
+            eq(true)
+        );
+        assert_that!(
+            lines.get(4).is_some_and(|value| !value.is_empty()),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn resp_time_rejects_arguments() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TIME", b"extra"]))
+            .expect("TIME should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'TIME' command\r\n".to_vec()
             ])
         );
     }
