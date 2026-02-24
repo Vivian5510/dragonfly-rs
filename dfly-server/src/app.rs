@@ -724,12 +724,27 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         match subcommand.to_ascii_uppercase().as_str() {
             "FLOW" => self.execute_dfly_flow(frame),
+            "REPLICAOFFSET" => self.execute_dfly_replicaoffset(frame),
             "SAVE" => self.execute_dfly_save(frame),
             "SYNC" => self.execute_dfly_sync(frame),
             "STARTSTABLE" => self.execute_dfly_startstable(frame),
             "LOAD" => self.execute_dfly_load(frame),
             _ => CommandReply::Error(format!("unknown DFLY subcommand '{subcommand}'")),
         }
+    }
+
+    fn execute_dfly_replicaoffset(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'DFLY REPLICAOFFSET' command".to_owned(),
+            );
+        }
+
+        let offset = self.replication.replication_offset();
+        let offsets = (0..usize::from(self.config.shard_count.get()))
+            .map(|_| CommandReply::Integer(i64::try_from(offset).unwrap_or(i64::MAX)))
+            .collect::<Vec<_>>();
+        CommandReply::Array(offsets)
     }
 
     fn execute_dfly_save(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1912,6 +1927,31 @@ mod tests {
             )
             .expect("DFLY SYNC should parse");
         assert_that!(&sync_reply, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_dfly_replicaoffset_reports_offsets_for_all_shards() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ro:key", b"v1"]))
+            .expect("first SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ro:key", b"v2"]))
+            .expect("second SET should succeed");
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DFLY", b"REPLICAOFFSET"]))
+            .expect("DFLY REPLICAOFFSET should execute");
+        let expected_entry = format!(":{}\r\n", app.replication.replication_offset());
+        let expected = format!(
+            "*{}\r\n{}",
+            app.config.shard_count.get(),
+            expected_entry.repeat(usize::from(app.config.shard_count.get()))
+        )
+        .into_bytes();
+        assert_that!(&reply, eq(&vec![expected]));
     }
 
     #[rstest]
