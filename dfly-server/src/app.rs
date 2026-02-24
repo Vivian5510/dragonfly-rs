@@ -602,9 +602,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN"
             | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "TTL" | "PTTL"
-            | "EXPIRETIME" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
-                self.execute_key_command(db, frame)
-            }
+            | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
+            | "SETNX" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
         }
     }
@@ -2088,6 +2087,48 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0_i64, |duration| {
                 i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+            });
+        assert_that!(expire_at >= now, eq(true));
+    }
+
+    #[rstest]
+    fn resp_pexpiretime_reports_missing_persistent_and_expiring_keys() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let missing = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIRETIME", b"missing"]),
+            )
+            .expect("PEXPIRETIME should execute");
+        assert_that!(&missing, eq(&vec![b":-2\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"persist", b"v"]))
+            .expect("SET should execute");
+        let persistent = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIRETIME", b"persist"]),
+            )
+            .expect("PEXPIRETIME should execute");
+        assert_that!(&persistent, eq(&vec![b":-1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SETEX", b"temp", b"60", b"v"]),
+            )
+            .expect("SETEX should execute");
+        let expiring = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRETIME", b"temp"]))
+            .expect("PEXPIRETIME should execute");
+        let expire_at = parse_resp_integer(&expiring[0]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_i64, |duration| {
+                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
             });
         assert_that!(expire_at >= now, eq(true));
     }
