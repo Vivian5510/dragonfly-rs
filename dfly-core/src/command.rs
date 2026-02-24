@@ -34,6 +34,8 @@ pub enum CommandReply {
     Null,
     /// RESP integer reply (`:<n>`).
     Integer(i64),
+    /// RESP array reply (`*<n> ...`).
+    Array(Vec<CommandReply>),
     /// `-ERR ...` style error.
     Error(String),
 }
@@ -59,6 +61,13 @@ impl CommandReply {
             }
             Self::Null => b"$-1\r\n".to_vec(),
             Self::Integer(value) => format!(":{value}\r\n").into_bytes(),
+            Self::Array(items) => {
+                let mut output = format!("*{}\r\n", items.len()).into_bytes();
+                for item in items {
+                    output.extend_from_slice(&item.to_resp_bytes());
+                }
+                output
+            }
             Self::Error(message) => {
                 let mut output = Vec::with_capacity(message.len() + 6);
                 output.extend_from_slice(b"-ERR ");

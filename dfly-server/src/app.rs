@@ -165,8 +165,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
 
             let db = connection.parser.context.db_index;
-            let reply = self.core.execute_in_db(db, &frame);
-            self.maybe_append_journal_for_command(None, db, &frame, &reply);
+            let reply = self.execute_user_command(db, &frame, None);
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
@@ -256,12 +255,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             .into_iter()
             .map(|queued| {
                 let db = connection.parser.context.db_index;
-                let reply = self.core.execute_in_db(db, &queued);
-                self.maybe_append_journal_for_command(Some(plan.txid), db, &queued, &reply);
-                reply
+                self.execute_user_command(db, &queued, Some(plan.txid))
             })
             .collect::<Vec<_>>();
-        encode_resp_array(&replies)
+        CommandReply::Array(replies).to_resp_bytes()
     }
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
@@ -282,6 +279,60 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             mode: TransactionMode::Global,
             hops,
         }
+    }
+
+    fn execute_user_command(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        txid: Option<TxId>,
+    ) -> CommandReply {
+        let reply = self.execute_command_without_side_effects(db, frame);
+        self.maybe_append_journal_for_command(txid, db, frame, &reply);
+        reply
+    }
+
+    fn execute_command_without_side_effects(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+    ) -> CommandReply {
+        match frame.name.as_str() {
+            "MGET" => self.execute_mget(db, frame),
+            "MSET" => self.execute_mset(db, frame),
+            _ => self.core.execute_in_db(db, frame),
+        }
+    }
+
+    fn execute_mget(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() {
+            return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
+        }
+
+        let replies = frame
+            .args
+            .iter()
+            .map(|key| {
+                let get_frame = CommandFrame::new("GET", vec![key.clone()]);
+                self.core.execute_in_db(db, &get_frame)
+            })
+            .collect::<Vec<_>>();
+        CommandReply::Array(replies)
+    }
+
+    fn execute_mset(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+            return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
+        }
+
+        for pair in frame.args.chunks_exact(2) {
+            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
+            let reply = self.core.execute_in_db(db, &set_frame);
+            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
+                return reply;
+            }
+        }
+        CommandReply::SimpleString("OK".to_owned())
     }
 
     fn allocate_txid(&mut self) -> TxId {
@@ -333,6 +384,7 @@ fn wrong_arity(command_name: &str) -> Vec<u8> {
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("EXPIRE", CommandReply::Integer(1)) => {
             if expire_is_delete(frame) {
                 Some(JournalOp::Expired)
@@ -415,18 +467,10 @@ fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
             output.extend_from_slice(b"\r\n");
             output
         }
+        (_, CommandReply::Array(_)) => b"ERROR unsupported array reply\r\n".to_vec(),
         (_, CommandReply::Null) => b"END\r\n".to_vec(),
         (_, CommandReply::Error(message)) => format!("ERROR {message}\r\n").into_bytes(),
     }
-}
-
-/// Encodes `EXEC` result as one RESP array.
-fn encode_resp_array(replies: &[CommandReply]) -> Vec<u8> {
-    let mut output = format!("*{}\r\n", replies.len()).into_bytes();
-    for reply in replies {
-        output.extend_from_slice(&reply.to_resp_bytes());
-    }
-    output
 }
 
 /// Starts `dfly-server` process bootstrap.
@@ -474,6 +518,71 @@ mod tests {
             .expect("GET command should execute");
         let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
         assert_that!(&get_responses, eq(&expected_get));
+    }
+
+    #[rstest]
+    fn resp_mset_then_mget_roundtrip() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let mset = resp_command(&[b"MSET", b"foo", b"bar", b"baz", b"qux"]);
+        let mset_reply = app
+            .feed_connection_bytes(&mut connection, &mset)
+            .expect("MSET should execute");
+        assert_that!(&mset_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let mget = resp_command(&[b"MGET", b"foo", b"baz"]);
+        let mget_reply = app
+            .feed_connection_bytes(&mut connection, &mget)
+            .expect("MGET should execute");
+        let expected = vec![b"*2\r\n$3\r\nbar\r\n$3\r\nqux\r\n".to_vec()];
+        assert_that!(&mget_reply, eq(&expected));
+    }
+
+    #[rstest]
+    fn resp_mset_rejects_odd_arity() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let invalid = resp_command(&[b"MSET", b"foo", b"bar", b"baz"]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &invalid)
+            .expect("MSET should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'MSET' command\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_mget_preserves_key_order_across_shards() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let first_key = b"user:1001".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"user:2002".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix += 1;
+            second_key = format!("user:2002:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let mset = resp_command(&[b"MSET", &first_key, b"alpha", &second_key, b"beta"]);
+        let _ = app
+            .feed_connection_bytes(&mut connection, &mset)
+            .expect("MSET should execute");
+
+        let mget = resp_command(&[b"MGET", &second_key, &first_key, b"missing"]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &mget)
+            .expect("MGET should execute");
+        let expected = vec![b"*3\r\n$4\r\nbeta\r\n$5\r\nalpha\r\n$-1\r\n".to_vec()];
+        assert_that!(&reply, eq(&expected));
     }
 
     #[rstest]
@@ -617,6 +726,25 @@ mod tests {
     }
 
     #[rstest]
+    fn journal_records_mset_as_single_write_command() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let mset = resp_command(&[b"MSET", b"a", b"1", b"b", b"2"]);
+        let _ = app
+            .feed_connection_bytes(&mut connection, &mset)
+            .expect("MSET should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(1_usize));
+        assert_that!(entries[0].op, eq(JournalOp::Command));
+        assert_that!(
+            String::from_utf8_lossy(&entries[0].payload).contains("MSET"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
     fn journal_uses_same_txid_for_exec_batch_entries() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -701,5 +829,15 @@ mod tests {
             &select,
             eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
         );
+    }
+
+    fn resp_command(parts: &[&[u8]]) -> Vec<u8> {
+        let mut payload = format!("*{}\r\n", parts.len()).into_bytes();
+        for part in parts {
+            payload.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            payload.extend_from_slice(part);
+            payload.extend_from_slice(b"\r\n");
+        }
+        payload
     }
 }
