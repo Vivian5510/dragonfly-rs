@@ -12,7 +12,7 @@ use dispatch::{
     CommandRegistry, DispatchState, ValueEntry, copy_between_states, rename_between_states,
 };
 use sharding::{HashTagShardResolver, ShardResolver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Coordinator-facing routing class used by transaction planning.
@@ -42,7 +42,7 @@ pub enum SingleKeyAccess {
 /// port need a clonable handle that can enter the same core state from different threads.
 #[derive(Debug, Clone)]
 pub struct SharedCore {
-    inner: Arc<Mutex<CoreModule>>,
+    inner: Arc<CoreModule>,
 }
 
 impl SharedCore {
@@ -50,36 +50,20 @@ impl SharedCore {
     #[must_use]
     pub fn new(shard_count: ShardCount) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(CoreModule::new(shard_count))),
+            inner: Arc::new(CoreModule::new(shard_count)),
         }
-    }
-
-    fn with_core<R>(&self, f: impl FnOnce(&CoreModule) -> R) -> R {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&guard)
-    }
-
-    fn with_core_mut<R>(&self, f: impl FnOnce(&mut CoreModule) -> R) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut guard)
     }
 
     /// Executes one command frame on its selected target shard.
     #[must_use]
     pub fn execute(&self, frame: &CommandFrame) -> CommandReply {
-        self.with_core_mut(|core| core.execute(frame))
+        self.inner.execute(frame)
     }
 
     /// Executes one command frame in a selected logical DB.
     #[must_use]
     pub fn execute_in_db(&self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
-        self.with_core_mut(|core| core.execute_in_db(db, frame))
+        self.inner.execute_in_db(db, frame)
     }
 
     /// Executes one single-key command directly on one target shard.
@@ -90,7 +74,7 @@ impl SharedCore {
         db: DbIndex,
         frame: &CommandFrame,
     ) -> CommandReply {
-        self.with_core_mut(|core| core.execute_on_shard_in_db(shard, db, frame))
+        self.inner.execute_on_shard_in_db(shard, db, frame)
     }
 
     /// Validates a command against core command-table arity/existence rules.
@@ -99,13 +83,13 @@ impl SharedCore {
     ///
     /// Returns user-facing error text when command does not exist or argument count is invalid.
     pub fn validate_command(&self, frame: &CommandFrame) -> Result<(), String> {
-        self.with_core(|core| core.validate_command(frame))
+        self.inner.validate_command(frame)
     }
 
     /// Exports current in-memory state as a snapshot payload.
     #[must_use]
     pub fn export_snapshot(&self) -> CoreSnapshot {
-        self.with_core(CoreModule::export_snapshot)
+        self.inner.export_snapshot()
     }
 
     /// Replaces current in-memory state with provided snapshot payload.
@@ -114,48 +98,49 @@ impl SharedCore {
     ///
     /// Returns `DflyError::Protocol` when snapshot carries an out-of-range shard id.
     pub fn import_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
-        self.with_core_mut(|core| core.import_snapshot(snapshot))
+        self.inner.import_snapshot(snapshot)
     }
 
     /// Resolves owner shard for a key using active sharding policy.
     #[must_use]
     pub fn resolve_shard_for_key(&self, key: &[u8]) -> u16 {
-        self.with_core(|core| core.resolve_shard_for_key(key))
+        self.inner.resolve_shard_for_key(key)
     }
 
     /// Returns current mutation version for one key in selected logical DB.
     #[must_use]
     pub fn key_version(&self, db: DbIndex, key: &[u8]) -> u64 {
-        self.with_core(|core| core.key_version(db, key))
+        self.inner.key_version(db, key)
     }
 
     /// Removes all keys in one logical DB across all shards.
     #[must_use]
     pub fn flush_db(&self, db: DbIndex) -> usize {
-        self.with_core_mut(|core| core.flush_db(db))
+        self.inner.flush_db(db)
     }
 
     /// Removes all keys in all logical DBs across all shards.
+    #[must_use]
     pub fn flush_all(&self) -> usize {
-        self.with_core_mut(CoreModule::flush_all)
+        self.inner.flush_all()
     }
 
     /// Returns total key count for one logical DB across all shards.
     #[must_use]
     pub fn db_size(&self, db: DbIndex) -> usize {
-        self.with_core(|core| core.db_size(db))
+        self.inner.db_size(db)
     }
 
     /// Returns one random key from selected logical DB across all shards.
     #[must_use]
     pub fn random_key(&self, db: DbIndex) -> Option<Vec<u8>> {
-        self.with_core(|core| core.random_key(db))
+        self.inner.random_key(db)
     }
 
     /// Returns keys in selected logical DB that match one glob-style pattern.
     #[must_use]
     pub fn keys_matching(&self, db: DbIndex, pattern: &[u8]) -> Vec<Vec<u8>> {
-        self.with_core(|core| core.keys_matching(db, pattern))
+        self.inner.keys_matching(db, pattern)
     }
 
     /// Returns live keys in selected logical DB that belong to one cluster slot.
@@ -163,13 +148,13 @@ impl SharedCore {
     /// Keys are aggregated across all shards and sorted for deterministic callers.
     #[must_use]
     pub fn keys_in_slot(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
-        self.with_core(|core| core.keys_in_slot(db, slot))
+        self.inner.keys_in_slot(db, slot)
     }
 
     /// Returns live key count in selected logical DB for one cluster slot.
     #[must_use]
     pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
-        self.with_core(|core| core.count_keys_in_slot(db, slot))
+        self.inner.count_keys_in_slot(db, slot)
     }
 
     /// Runs one active-expiration pass on every shard.
@@ -178,7 +163,7 @@ impl SharedCore {
     /// in this pass. Returns the total number of removed keys across all shards.
     #[must_use]
     pub fn active_expire_pass(&self, limit_per_shard: usize) -> usize {
-        self.with_core_mut(|core| core.active_expire_pass(limit_per_shard))
+        self.inner.active_expire_pass(limit_per_shard)
     }
 
     /// Runs one active-expiration pass on one target shard.
@@ -186,25 +171,25 @@ impl SharedCore {
     /// Returns the number of removed keys in that shard.
     #[must_use]
     pub fn active_expire_pass_on_shard(&self, shard: u16, limit: usize) -> usize {
-        self.with_core_mut(|core| core.active_expire_pass_on_shard(shard, limit))
+        self.inner.active_expire_pass_on_shard(shard, limit)
     }
 
     /// Selects target shard for one command.
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
-        self.with_core(|core| core.resolve_target_shard(frame))
+        self.inner.resolve_target_shard(frame)
     }
 
     /// Returns transaction-planning routing class for one command frame.
     #[must_use]
     pub fn command_routing(&self, frame: &CommandFrame) -> CommandRouting {
-        self.with_core(|core| core.command_routing(frame))
+        self.inner.command_routing(frame)
     }
 
     /// Returns whether command can participate in single-key lock-ahead planning.
     #[must_use]
     pub fn is_single_key_command(&self, frame: &CommandFrame) -> bool {
-        self.with_core(|core| core.is_single_key_command(frame))
+        self.inner.is_single_key_command(frame)
     }
 }
 
@@ -274,7 +259,7 @@ pub fn classify_single_key_access(frame: &CommandFrame) -> Option<SingleKeyAcces
 ///
 /// In Unit 0 this struct only wires shard resolver policy. Later units add process-wide registries
 /// and cross-shard execution orchestration.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CoreModule {
     /// Resolver used to map keys into owning shards.
     pub resolver: HashTagShardResolver,
@@ -284,7 +269,7 @@ pub struct CoreModule {
     ///
     /// Dragonfly isolates key ownership per shard thread. This vector models that ownership
     /// boundary in the learning implementation by keeping one independent keyspace per shard.
-    shard_states: Vec<DispatchState>,
+    shard_states: Vec<Mutex<DispatchState>>,
 }
 
 /// One logical KV entry in snapshot form.
@@ -316,19 +301,37 @@ impl CoreModule {
         Self {
             resolver: HashTagShardResolver::new(shard_count),
             command_registry: CommandRegistry::with_builtin_commands(),
-            shard_states: vec![DispatchState::default(); usize::from(shard_count.get())],
+            shard_states: (0..usize::from(shard_count.get()))
+                .map(|_| Mutex::new(DispatchState::default()))
+                .collect(),
         }
+    }
+
+    fn lock_shard(&self, shard: u16) -> Option<MutexGuard<'_, DispatchState>> {
+        self.shard_states.get(usize::from(shard)).map(|state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+    }
+
+    fn lock_shard_index(&self, shard: usize) -> Option<MutexGuard<'_, DispatchState>> {
+        self.shard_states.get(shard).map(|state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
     }
 
     /// Executes one command frame on its selected target shard.
     #[must_use]
-    pub fn execute(&mut self, frame: &CommandFrame) -> CommandReply {
+    pub fn execute(&self, frame: &CommandFrame) -> CommandReply {
         self.execute_in_db(0, frame)
     }
 
     /// Executes one command frame in a selected logical DB.
     #[must_use]
-    pub fn execute_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
+    pub fn execute_in_db(&self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
         match frame.name.as_str() {
             "COPY" => return self.execute_copy_in_db(db, frame),
             "RENAME" => return self.execute_rename_in_db(db, frame, false),
@@ -337,11 +340,10 @@ impl CoreModule {
         }
 
         let target_shard = self.resolve_target_shard(frame);
-        let target_index = usize::from(target_shard);
-        let Some(target_state) = self.shard_states.get_mut(target_index) else {
+        let Some(mut target_state) = self.lock_shard(target_shard) else {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
         };
-        self.command_registry.dispatch(db, frame, target_state)
+        self.command_registry.dispatch(db, frame, &mut target_state)
     }
 
     /// Executes one command frame on one explicit shard.
@@ -351,7 +353,7 @@ impl CoreModule {
     /// non-single-key and cross-shard command shapes.
     #[must_use]
     pub fn execute_on_shard_in_db(
-        &mut self,
+        &self,
         shard: u16,
         db: DbIndex,
         frame: &CommandFrame,
@@ -374,14 +376,14 @@ impl CoreModule {
             ));
         }
 
-        let Some(target_state) = self.shard_states.get_mut(usize::from(shard)) else {
+        let Some(mut target_state) = self.lock_shard(shard) else {
             return CommandReply::Error(format!("invalid target shard {shard}"));
         };
-        self.command_registry.dispatch(db, frame, target_state)
+        self.command_registry.dispatch(db, frame, &mut target_state)
     }
 
     fn execute_rename_in_db(
-        &mut self,
+        &self,
         db: DbIndex,
         frame: &CommandFrame,
         destination_should_not_exist: bool,
@@ -404,14 +406,14 @@ impl CoreModule {
         let destination_shard = usize::from(self.resolve_shard_for_key(destination_key));
 
         if source_shard == destination_shard {
-            let Some(target_state) = self.shard_states.get_mut(source_shard) else {
+            let Some(mut target_state) = self.lock_shard_index(source_shard) else {
                 return CommandReply::Error(format!("invalid target shard {source_shard}"));
             };
-            return self.command_registry.dispatch(db, frame, target_state);
+            return self.command_registry.dispatch(db, frame, &mut target_state);
         }
 
-        let Some((source_state, destination_state)) =
-            shard_pair_mut(&mut self.shard_states, source_shard, destination_shard)
+        let Some((mut source_state, mut destination_state)) =
+            lock_shard_pair(&self.shard_states, source_shard, destination_shard)
         else {
             return CommandReply::Error(format!(
                 "invalid rename shard pair {source_shard}->{destination_shard}"
@@ -423,12 +425,12 @@ impl CoreModule {
             source_key,
             destination_key,
             destination_should_not_exist,
-            source_state,
-            destination_state,
+            &mut source_state,
+            &mut destination_state,
         )
     }
 
-    fn execute_copy_in_db(&mut self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
+    fn execute_copy_in_db(&self, db: DbIndex, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() < 2 {
             return CommandReply::Error("wrong number of arguments for 'COPY' command".to_owned());
         }
@@ -440,21 +442,21 @@ impl CoreModule {
         let destination_shard = usize::from(self.resolve_shard_for_key(destination_key));
 
         if source_shard == destination_shard {
-            let Some(target_state) = self.shard_states.get_mut(source_shard) else {
+            let Some(mut target_state) = self.lock_shard_index(source_shard) else {
                 return CommandReply::Error(format!("invalid target shard {source_shard}"));
             };
-            return self.command_registry.dispatch(db, frame, target_state);
+            return self.command_registry.dispatch(db, frame, &mut target_state);
         }
 
-        let Some((source_state, destination_state)) =
-            shard_pair_mut(&mut self.shard_states, source_shard, destination_shard)
+        let Some((mut source_state, mut destination_state)) =
+            lock_shard_pair(&self.shard_states, source_shard, destination_shard)
         else {
             return CommandReply::Error(format!(
                 "invalid copy shard pair {source_shard}->{destination_shard}"
             ));
         };
 
-        copy_between_states(db, &frame.args, source_state, destination_state)
+        copy_between_states(db, &frame.args, &mut source_state, &mut destination_state)
     }
 
     /// Validates a command against core command-table arity/existence rules.
@@ -474,6 +476,9 @@ impl CoreModule {
             let Ok(shard) = u16::try_from(shard_index) else {
                 continue;
             };
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (db, table) in &state.db_tables {
                 for (key, value_entry) in &table.prime {
                     entries.push(SnapshotEntry {
@@ -500,18 +505,24 @@ impl CoreModule {
     /// # Errors
     ///
     /// Returns `DflyError::Protocol` when snapshot carries an out-of-range shard id.
-    pub fn import_snapshot(&mut self, snapshot: &CoreSnapshot) -> DflyResult<()> {
-        for state in &mut self.shard_states {
+    pub fn import_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
+        for state in &self.shard_states {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *state = DispatchState::default();
         }
 
         for entry in &snapshot.entries {
-            let Some(state) = self.shard_states.get_mut(usize::from(entry.shard)) else {
+            let Some(state) = self.shard_states.get(usize::from(entry.shard)) else {
                 return Err(DflyError::Protocol(format!(
                     "snapshot entry targets unknown shard {}",
                     entry.shard
                 )));
             };
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.db_tables.entry(entry.db).or_default().prime.insert(
                 entry.key.clone(),
                 ValueEntry {
@@ -536,33 +547,58 @@ impl CoreModule {
         let shard = self.resolve_shard_for_key(key);
         self.shard_states
             .get(usize::from(shard))
-            .map_or(0, |state| state.key_version(db, key))
+            .map_or(0, |state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .key_version(db, key)
+            })
     }
 
     /// Removes all keys in one logical DB across all shards.
     ///
     /// Returns the number of removed keys.
-    pub fn flush_db(&mut self, db: DbIndex) -> usize {
+    #[must_use]
+    pub fn flush_db(&self, db: DbIndex) -> usize {
         self.shard_states
-            .iter_mut()
-            .map(|state| state.flush_db(db))
+            .iter()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush_db(db)
+            })
             .sum()
     }
 
     /// Removes all keys in all logical DBs across all shards.
     ///
     /// Returns the number of removed keys.
-    pub fn flush_all(&mut self) -> usize {
+    #[must_use]
+    pub fn flush_all(&self) -> usize {
         self.shard_states
-            .iter_mut()
-            .map(dispatch::DispatchState::flush_all)
+            .iter()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush_all()
+            })
             .sum()
     }
 
     /// Returns total key count for one logical DB across all shards.
     #[must_use]
     pub fn db_size(&self, db: DbIndex) -> usize {
-        self.shard_states.iter().map(|state| state.db_len(db)).sum()
+        self.shard_states
+            .iter()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .db_len(db)
+            })
+            .sum()
     }
 
     /// Returns one random key from selected logical DB across all shards.
@@ -576,6 +612,9 @@ impl CoreModule {
 
         let mut candidates = Vec::new();
         for state in &self.shard_states {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(keyspace) = state.db_tables.get(&db).map(|table| &table.prime) else {
                 continue;
             };
@@ -617,6 +656,9 @@ impl CoreModule {
         let mut matched = Vec::new();
 
         for state in &self.shard_states {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(keyspace) = state.db_tables.get(&db).map(|table| &table.prime) else {
                 continue;
             };
@@ -650,6 +692,9 @@ impl CoreModule {
         let mut keys = Vec::new();
 
         for state in &self.shard_states {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(table) = state.db_tables.get(&db) else {
                 continue;
             };
@@ -682,6 +727,8 @@ impl CoreModule {
             .iter()
             .map(|state| {
                 state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .db_tables
                     .get(&db)
                     .and_then(|table| table.slot_stats.get(&slot))
@@ -694,20 +741,32 @@ impl CoreModule {
     /// Runs one active-expiration pass on each shard state.
     ///
     /// Returns the total number of keys removed across all shards.
-    pub fn active_expire_pass(&mut self, limit_per_shard: usize) -> usize {
+    #[must_use]
+    pub fn active_expire_pass(&self, limit_per_shard: usize) -> usize {
         self.shard_states
-            .iter_mut()
-            .map(|state| state.active_expire_pass(limit_per_shard))
+            .iter()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_expire_pass(limit_per_shard)
+            })
             .sum()
     }
 
     /// Runs one active-expiration pass on one shard state.
     ///
     /// Returns the number of removed keys in that shard.
-    pub fn active_expire_pass_on_shard(&mut self, shard: u16, limit: usize) -> usize {
+    #[must_use]
+    pub fn active_expire_pass_on_shard(&self, shard: u16, limit: usize) -> usize {
         self.shard_states
-            .get_mut(usize::from(shard))
-            .map_or(0_usize, |state| state.active_expire_pass(limit))
+            .get(usize::from(shard))
+            .map_or(0_usize, |state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_expire_pass(limit)
+            })
     }
 
     /// Selects target shard for one command.
@@ -746,26 +805,35 @@ impl CoreModule {
     }
 }
 
-fn shard_pair_mut(
-    shard_states: &mut [DispatchState],
+fn lock_shard_pair(
+    shard_states: &[Mutex<DispatchState>],
     source_shard: usize,
     destination_shard: usize,
-) -> Option<(&mut DispatchState, &mut DispatchState)> {
+) -> Option<(MutexGuard<'_, DispatchState>, MutexGuard<'_, DispatchState>)> {
     if source_shard == destination_shard {
         return None;
     }
 
-    if source_shard < destination_shard {
-        let (left, right) = shard_states.split_at_mut(destination_shard);
-        let source = left.get_mut(source_shard)?;
-        let destination = right.get_mut(0)?;
-        return Some((source, destination));
-    }
+    let (first, second, source_first) = if source_shard < destination_shard {
+        (source_shard, destination_shard, true)
+    } else {
+        (destination_shard, source_shard, false)
+    };
 
-    let (left, right) = shard_states.split_at_mut(source_shard);
-    let destination = left.get_mut(destination_shard)?;
-    let source = right.get_mut(0)?;
-    Some((source, destination))
+    let first_guard = shard_states
+        .get(first)?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let second_guard = shard_states
+        .get(second)?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if source_first {
+        Some((first_guard, second_guard))
+    } else {
+        Some((second_guard, first_guard))
+    }
 }
 
 fn redis_glob_match(pattern: &[u8], text: &[u8]) -> bool {
@@ -886,7 +954,7 @@ mod tests {
 
     #[rstest]
     fn core_execute_routes_set_get_through_shard_state() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
 
         let set_reply = core.execute(&CommandFrame::new(
             "SET",
@@ -981,7 +1049,7 @@ mod tests {
 
     #[rstest]
     fn core_execute_on_shard_in_db_runs_single_key_command_on_owner() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         let key = b"runtime:owner:key".to_vec();
         let shard = core.resolve_shard_for_key(&key);
 
@@ -998,7 +1066,7 @@ mod tests {
 
     #[rstest]
     fn core_execute_on_shard_in_db_rejects_mismatch_and_non_single_key() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         let key = b"runtime:mismatch:key".to_vec();
         let owner = core.resolve_shard_for_key(&key);
         let wrong = (owner + 1) % 4;
@@ -1027,7 +1095,7 @@ mod tests {
 
     #[rstest]
     fn core_keeps_shard_state_isolated_between_two_keys() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let first_key = b"user:1001".to_vec();
         let mut second_key = b"user:2002".to_vec();
@@ -1052,19 +1120,19 @@ mod tests {
             vec![second_key.clone(), b"beta".to_vec()],
         ));
 
-        assert_that!(
-            core.shard_states[usize::from(first_shard)].db_len(0),
-            eq(1_usize),
-        );
-        assert_that!(
-            core.shard_states[usize::from(second_shard)].db_len(0),
-            eq(1_usize),
-        );
+        let first_state = core.shard_states[usize::from(first_shard)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let second_state = core.shard_states[usize::from(second_shard)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_that!(first_state.db_len(0), eq(1_usize),);
+        assert_that!(second_state.db_len(0), eq(1_usize),);
     }
 
     #[rstest]
     fn core_snapshot_roundtrip_preserves_db_state() {
-        let mut source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
 
         let _ = source.execute_in_db(
             0,
@@ -1077,7 +1145,7 @@ mod tests {
 
         let snapshot = source.export_snapshot();
 
-        let mut restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         restored
             .import_snapshot(&snapshot)
             .expect("snapshot import should succeed");
@@ -1090,7 +1158,7 @@ mod tests {
 
     #[rstest]
     fn core_snapshot_import_marks_loaded_keys_as_versioned() {
-        let mut source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         let key = b"loaded:key".to_vec();
         let _ = source.execute_in_db(
             0,
@@ -1098,7 +1166,7 @@ mod tests {
         );
         let snapshot = source.export_snapshot();
 
-        let mut restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         restored
             .import_snapshot(&snapshot)
             .expect("snapshot import should succeed");
@@ -1108,7 +1176,7 @@ mod tests {
 
     #[rstest]
     fn core_reports_key_version_for_watched_mutations() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
         let key = b"watch:1".to_vec();
 
         assert_that!(core.key_version(0, &key), eq(0_u64));
@@ -1121,7 +1189,7 @@ mod tests {
 
     #[rstest]
     fn core_flush_db_clears_only_selected_database() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
 
         let _ = core.execute_in_db(
             0,
@@ -1145,7 +1213,7 @@ mod tests {
 
     #[rstest]
     fn core_flush_all_clears_all_databases() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
 
         let _ = core.execute_in_db(
             0,
@@ -1167,7 +1235,7 @@ mod tests {
 
     #[rstest]
     fn core_db_size_counts_keys_across_shards_per_database() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let first_key = b"user:1001".to_vec();
         let first_shard = core.resolve_shard_for_key(&first_key);
@@ -1200,7 +1268,7 @@ mod tests {
 
     #[rstest]
     fn core_rename_moves_value_across_shards() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let source_key = b"rename:src".to_vec();
         let source_shard = core.resolve_shard_for_key(&source_key);
@@ -1239,7 +1307,7 @@ mod tests {
 
     #[rstest]
     fn core_renamenx_blocks_when_destination_exists_across_shards() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let source_key = b"rename:nx:src".to_vec();
         let source_shard = core.resolve_shard_for_key(&source_key);
@@ -1278,7 +1346,7 @@ mod tests {
 
     #[rstest]
     fn core_copy_duplicates_value_across_shards_without_removing_source() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let source_key = b"copy:src".to_vec();
         let source_shard = core.resolve_shard_for_key(&source_key);
@@ -1319,7 +1387,7 @@ mod tests {
 
     #[rstest]
     fn core_random_key_returns_live_key_from_selected_database() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let key_one = b"random:key:1".to_vec();
         let key_two = b"random:key:2".to_vec();
@@ -1344,7 +1412,7 @@ mod tests {
 
     #[rstest]
     fn core_keys_matching_filters_by_pattern_and_database() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let _ = core.execute_in_db(
             0,
@@ -1375,7 +1443,7 @@ mod tests {
 
     #[rstest]
     fn core_keys_matching_supports_character_classes_and_escaping() {
-        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
 
         let _ = core.execute_in_db(
             0,
@@ -1399,7 +1467,7 @@ mod tests {
 
     #[rstest]
     fn core_keys_in_slot_aggregates_live_keys_from_slot_index() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let first_key = b"slot:keys:{alpha}:1".to_vec();
         let second_key = b"slot:keys:{alpha}:2".to_vec();
@@ -1439,7 +1507,7 @@ mod tests {
 
     #[rstest]
     fn core_count_keys_in_slot_ignores_expired_entries() {
-        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
 
         let first_key = b"slot:count:{alpha}:1".to_vec();
         let second_key = b"slot:count:{alpha}:2".to_vec();
@@ -1476,7 +1544,7 @@ mod tests {
 
     #[rstest]
     fn core_active_expire_pass_removes_expired_snapshot_entries() {
-        let mut core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0_u64, |duration| duration.as_secs());
@@ -1520,7 +1588,10 @@ mod tests {
             eq(&CommandReply::BulkString(b"alive".to_vec()))
         );
 
-        let table = core.shard_states[0]
+        let shard0_state = core.shard_states[0]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let table = shard0_state
             .db_tables
             .get(&0)
             .expect("db table should still contain live key");
@@ -1536,7 +1607,7 @@ mod tests {
 
     #[rstest]
     fn core_active_expire_pass_honors_limit_per_shard() {
-        let mut core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0_u64, |duration| duration.as_secs());
@@ -1572,7 +1643,7 @@ mod tests {
 
     #[rstest]
     fn core_active_expire_pass_on_shard_scopes_cleanup() {
-        let mut core = CoreModule::new(ShardCount::new(2).expect("valid shard count"));
+        let core = CoreModule::new(ShardCount::new(2).expect("valid shard count"));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0_u64, |duration| duration.as_secs());
@@ -1601,15 +1672,21 @@ mod tests {
 
         let removed_shard0 = core.active_expire_pass_on_shard(0, 16);
         assert_that!(removed_shard0, eq(1_usize));
+        let shard0_state = core.shard_states[0]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shard1_state = core.shard_states[1]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_that!(
-            core.shard_states[0]
+            shard0_state
                 .db_tables
                 .get(&0)
                 .is_some_and(|table| table.prime.contains_key(&shard0_key)),
             eq(false)
         );
         assert_that!(
-            core.shard_states[1]
+            shard1_state
                 .db_tables
                 .get(&0)
                 .is_some_and(|table| table.prime.contains_key(&shard1_key)),
