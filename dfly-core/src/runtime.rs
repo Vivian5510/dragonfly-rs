@@ -47,7 +47,7 @@ pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
     senders: Vec<mpsc::Sender<RuntimeEnvelope>>,
     executed_per_shard: Arc<Vec<Mutex<Vec<RuntimeEnvelope>>>>,
-    submitted_sequence_per_shard: Vec<AtomicU64>,
+    submitted_sequence_per_shard: Vec<Mutex<u64>>,
     processed_sequence_per_shard: Arc<Vec<AtomicU64>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -63,7 +63,7 @@ impl InMemoryShardRuntime {
                 .collect::<Vec<_>>(),
         );
         let submitted_sequence_per_shard = (0..shard_len)
-            .map(|_| AtomicU64::new(0))
+            .map(|_| Mutex::new(0_u64))
             .collect::<Vec<_>>();
         let processed_sequence_per_shard = Arc::new(
             (0..shard_len)
@@ -179,12 +179,16 @@ impl InMemoryShardRuntime {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
-        let sequence = sequence_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
+        // Keep one per-shard submit lock so sequence assignment matches real queue ingress order.
+        // This avoids virtual sequence gaps where one producer reserves a number before enqueue.
+        let mut sequence_guard = sequence_counter
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime sequence mutex is poisoned"))?;
         sender
             .send(envelope)
             .map_err(|_| DflyError::InvalidState("shard queue is closed"))?;
+        *sequence_guard = sequence_guard.saturating_add(1);
+        let sequence = *sequence_guard;
         Ok(sequence)
     }
 
@@ -401,5 +405,33 @@ mod tests {
             runtime.processed_count(0).expect("count should succeed") >= 2,
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn runtime_submission_sequences_are_contiguous_per_shard() {
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
+
+        let first = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                command: CommandFrame::new("GET", vec![b"a".to_vec()]),
+            })
+            .expect("submission should succeed");
+        let second = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                command: CommandFrame::new("GET", vec![b"b".to_vec()]),
+            })
+            .expect("submission should succeed");
+        let third = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                command: CommandFrame::new("GET", vec![b"c".to_vec()]),
+            })
+            .expect("submission should succeed");
+
+        assert_that!(first, eq(1_u64));
+        assert_that!(second, eq(2_u64));
+        assert_that!(third, eq(3_u64));
     }
 }
