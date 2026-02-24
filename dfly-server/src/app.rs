@@ -546,6 +546,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
             "DEL" => self.execute_del(db, frame),
+            "UNLINK" => self.execute_unlink(db, frame),
             "EXISTS" => self.execute_exists(db, frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
@@ -669,6 +670,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn execute_del(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "DEL")
+    }
+
+    fn execute_unlink(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        self.execute_counting_key_command(db, frame, "UNLINK")
     }
 
     fn execute_exists(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
@@ -1595,7 +1600,7 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
             }
         }
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
+        ("DEL" | "UNLINK", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
             if *count > 0 =>
         {
@@ -2023,6 +2028,32 @@ mod tests {
             )
             .expect("DEL should execute");
         assert_that!(&deleted, eq(&vec![b":2\r\n".to_vec()]));
+
+        let exists_after = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
+            .expect("EXISTS should execute");
+        assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_unlink_follows_multi_key_count_semantics() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
+            .expect("SET k1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
+            .expect("SET k2 should succeed");
+
+        let unlinked = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"UNLINK", b"k1", b"k2", b"missing", b"k1"]),
+            )
+            .expect("UNLINK should execute");
+        assert_that!(&unlinked, eq(&vec![b":2\r\n".to_vec()]));
 
         let exists_after = app
             .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
@@ -3277,6 +3308,29 @@ mod tests {
         assert_that!(entries.len(), eq(2_usize));
         assert_that!(
             String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_unlink_only_when_keyspace_changes() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"UNLINK", b"missing"]))
+            .expect("UNLINK missing should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"UNLINK", b"k"]))
+            .expect("UNLINK existing should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("UNLINK"),
             eq(true)
         );
     }

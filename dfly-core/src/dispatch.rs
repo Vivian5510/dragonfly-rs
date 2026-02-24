@@ -270,6 +270,11 @@ impl CommandRegistry {
             handler: handle_del,
         });
         self.register(CommandSpec {
+            name: "UNLINK",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_del,
+        });
+        self.register(CommandSpec {
             name: "EXISTS",
             arity: CommandArity::AtLeast(1),
             handler: handle_exists,
@@ -1416,6 +1421,45 @@ mod tests {
             &mut state,
         );
         assert_that!(&exists_after_delete, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_unlink_removes_keys_with_del_counting_semantics() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let unlinked = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "UNLINK",
+                vec![
+                    b"k1".to_vec(),
+                    b"k2".to_vec(),
+                    b"missing".to_vec(),
+                    b"k1".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&unlinked, eq(&CommandReply::Integer(2)));
+
+        let exists_after = registry.dispatch(
+            0,
+            &CommandFrame::new("EXISTS", vec![b"k1".to_vec(), b"k2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&exists_after, eq(&CommandReply::Integer(0)));
     }
 
     #[rstest]
