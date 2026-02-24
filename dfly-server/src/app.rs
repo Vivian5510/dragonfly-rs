@@ -586,7 +586,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn execute_transaction_plan(&mut self, db: u16, plan: &TransactionPlan) -> Vec<CommandReply> {
         let mut replies = Vec::new();
-        for hop in &plan.hops {
+        for (hop_index, hop) in plan.hops.iter().enumerate() {
             match plan.mode {
                 TransactionMode::NonAtomic => {
                     for (_, command) in &hop.per_shard {
@@ -603,7 +603,22 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     }
                 }
                 TransactionMode::LockAhead | TransactionMode::Global => {
-                    replies.extend(self.execute_runtime_scheduled_hop(db, plan.txid, hop));
+                    let hop_replies = self.execute_runtime_scheduled_hop(db, plan.txid, hop);
+                    let runtime_failure = hop_replies.iter().any(is_runtime_dispatch_error);
+                    replies.extend(hop_replies);
+                    if runtime_failure {
+                        // Runtime dispatch failure means execution order/liveness guarantees were
+                        // already broken for this transaction wave, so later hops are aborted.
+                        for remaining_hop in plan.hops.iter().skip(hop_index + 1) {
+                            for _ in &remaining_hop.per_shard {
+                                replies.push(CommandReply::Error(
+                                    "runtime dispatch failed: transaction aborted after hop failure"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1749,6 +1764,14 @@ fn wrong_arity(command_name: &str) -> Vec<u8> {
 
 fn wrong_arity_message(command_name: &str) -> String {
     format!("wrong number of arguments for '{command_name}' command")
+}
+
+fn is_runtime_dispatch_error(reply: &CommandReply) -> bool {
+    matches!(
+        reply,
+        CommandReply::Error(message)
+            if message.starts_with("runtime dispatch failed:")
+    )
 }
 
 /// Returns whether one command is `REPLCONF ACK <offset>`.
@@ -3863,6 +3886,86 @@ mod tests {
             .core
             .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
         assert_that!(&value, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn exec_plan_aborts_following_hops_after_runtime_dispatch_failure() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"plan:rt:skip-next-hop".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::Global,
+            hops: vec![
+                TransactionHop {
+                    per_shard: vec![(u16::MAX, CommandFrame::new("PING", Vec::new()))],
+                },
+                TransactionHop {
+                    per_shard: vec![(
+                        shard,
+                        CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+                    )],
+                },
+            ],
+        };
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![
+                CommandReply::Error(
+                    "runtime dispatch failed: invalid runtime state: target shard is out of range"
+                        .to_owned()
+                ),
+                CommandReply::Error(
+                    "runtime dispatch failed: transaction aborted after hop failure".to_owned()
+                ),
+            ])
+        );
+
+        let value = app
+            .core
+            .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
+        assert_that!(&value, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn exec_plan_keeps_following_hops_when_previous_command_error_is_not_runtime_failure() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"plan:rt:continue-after-command-error".to_vec();
+        let key_shard = app.core.resolve_shard_for_key(&key);
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::Global,
+            hops: vec![
+                TransactionHop {
+                    per_shard: vec![(
+                        0,
+                        CommandFrame::new("PING", vec![b"a".to_vec(), b"b".to_vec()]),
+                    )],
+                },
+                TransactionHop {
+                    per_shard: vec![(
+                        key_shard,
+                        CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+                    )],
+                },
+            ],
+        };
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![
+                CommandReply::Error("wrong number of arguments for 'PING' command".to_owned()),
+                CommandReply::SimpleString("OK".to_owned()),
+            ])
+        );
+
+        let value = app
+            .core
+            .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
+        assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
     }
 
     #[rstest]
