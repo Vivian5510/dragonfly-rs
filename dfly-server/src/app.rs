@@ -54,6 +54,8 @@ pub struct ServerApp {
     pub tiering: TieringModule,
     /// Monotonic transaction id allocator.
     next_txid: TxId,
+    /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
+    next_implicit_replica_id: u64,
 }
 
 impl ServerApp {
@@ -82,6 +84,7 @@ impl ServerApp {
             search,
             tiering,
             next_txid: 1,
+            next_implicit_replica_id: 1,
         }
     }
 
@@ -1200,7 +1203,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn handle_replconf_ack(
         &mut self,
-        connection: &ServerConnection,
+        connection: &mut ServerConnection,
         value: &[u8],
     ) -> Result<(), CommandReply> {
         let Ok(text) = std::str::from_utf8(value) else {
@@ -1213,6 +1216,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 "value is not an integer or out of range".to_owned(),
             ));
         };
+        self.ensure_replica_endpoint_for_ack(connection);
         if let Some(endpoint) = connection.replica_endpoint.as_ref() {
             let _ = self.replication.record_replica_ack_for_endpoint(
                 &endpoint.address,
@@ -1221,6 +1225,21 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
         Ok(())
+    }
+
+    fn ensure_replica_endpoint_for_ack(&mut self, connection: &mut ServerConnection) {
+        if connection.replica_endpoint.is_some() {
+            return;
+        }
+
+        // Some replicas may ACK before announcing LISTENING-PORT/IP metadata.
+        // Register a stable synthetic endpoint so WAIT/INFO can account for that replica.
+        let endpoint = ReplicaEndpointIdentity {
+            address: format!("implicit-replica-{}", self.next_implicit_replica_id),
+            listening_port: 0,
+        };
+        self.next_implicit_replica_id = self.next_implicit_replica_id.saturating_add(1);
+        self.register_connection_replica_endpoint(connection, endpoint);
     }
 
     fn register_connection_replica_endpoint(
@@ -5866,7 +5885,7 @@ mod tests {
     }
 
     #[rstest]
-    fn resp_replconf_ack_without_registered_endpoint_is_ignored_silently() {
+    fn resp_replconf_ack_without_registered_endpoint_is_tracked_via_implicit_endpoint() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
@@ -5884,7 +5903,19 @@ mod tests {
             )
             .expect("REPLCONF ACK should parse");
         assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
-        assert_that!(app.replication.last_acked_lsn(), eq(0_u64));
+        assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+
+        let info = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
+        assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
+
+        let wait = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait, eq(&vec![b":1\r\n".to_vec()]));
     }
 
     #[rstest]
