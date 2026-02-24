@@ -268,6 +268,31 @@ impl InMemoryShardRuntime {
         Ok(guard.processed_sequence >= sequence)
     }
 
+    /// Blocks until one shard has processed one specific submission sequence.
+    ///
+    /// Dragonfly transaction barriers are open-ended synchronization points
+    /// between coordinator and shard execution. This method mirrors that
+    /// behavior without imposing arbitrary wall-clock timeouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn wait_until_processed_sequence(&self, shard: ShardId, sequence: u64) -> DflyResult<()> {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let guard = state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        let _guard = state
+            .changed
+            .wait_while(guard, |inner| inner.processed_sequence < sequence)
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(())
+    }
+
     /// Returns and removes one worker reply for a specific processed sequence.
     ///
     /// # Errors
@@ -557,6 +582,37 @@ mod tests {
             runtime
                 .wait_for_processed_sequence(0, second_sequence, Duration::from_millis(200))
                 .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            runtime.processed_count(0).expect("count should succeed") >= 2,
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn runtime_wait_until_processed_sequence_blocks_until_barrier_reached() {
+        let runtime = InMemoryShardRuntime::new(ShardCount::new(2).expect("count should be valid"));
+        let first = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: false,
+                command: CommandFrame::new("GET", vec![b"a".to_vec()]),
+            })
+            .expect("submission should succeed");
+        let second = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: false,
+                command: CommandFrame::new("GET", vec![b"b".to_vec()]),
+            })
+            .expect("submission should succeed");
+        assert_that!(second > first, eq(true));
+
+        assert_that!(
+            runtime.wait_until_processed_sequence(0, second).is_ok(),
             eq(true)
         );
         assert_that!(

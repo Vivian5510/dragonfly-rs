@@ -9,7 +9,6 @@ use dfly_core::runtime::RuntimeEnvelope;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
@@ -106,15 +105,11 @@ impl ServerApp {
         }
         let mut shard_wait_error = HashMap::<u16, String>::new();
         for (shard, target_sequence) in target_sequence_by_shard {
-            match self.runtime.wait_for_processed_sequence(
-                shard,
-                target_sequence,
-                Duration::from_millis(200),
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    shard_wait_error.insert(shard, "runtime dispatch timed out".to_owned());
-                }
+            match self
+                .runtime
+                .wait_until_processed_sequence(shard, target_sequence)
+            {
+                Ok(()) => {}
                 Err(error) => {
                     shard_wait_error.insert(shard, format!("runtime dispatch failed: {error}"));
                 }
@@ -291,17 +286,8 @@ impl ServerApp {
             Err(error) => return CommandReply::Error(format!("runtime dispatch failed: {error}")),
         };
 
-        match self
-            .runtime
-            .wait_for_processed_sequence(shard, sequence, Duration::from_millis(200))
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return CommandReply::Error(
-                    "runtime dispatch failed: runtime dispatch timed out".to_owned(),
-                );
-            }
-            Err(error) => return CommandReply::Error(format!("runtime dispatch failed: {error}")),
+        if let Err(error) = self.runtime.wait_until_processed_sequence(shard, sequence) {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
         }
 
         match self.runtime.take_processed_reply(shard, sequence) {
@@ -358,14 +344,8 @@ impl ServerApp {
             barriers.push((shard, sequence));
         }
         for (shard, sequence) in barriers {
-            let reached = self.runtime.wait_for_processed_sequence(
-                shard,
-                sequence,
-                Duration::from_millis(200),
-            )?;
-            if !reached {
-                return Err(DflyError::InvalidState("runtime dispatch timed out"));
-            }
+            self.runtime
+                .wait_until_processed_sequence(shard, sequence)?;
         }
         Ok(())
     }
