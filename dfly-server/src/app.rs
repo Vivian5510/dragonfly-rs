@@ -790,7 +790,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         match subcommand.to_ascii_uppercase().as_str() {
+            "INFO" => self.execute_cluster_info(frame),
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
+            "NODES" => self.execute_cluster_nodes(frame),
             "SLOTS" => self.execute_cluster_slots(frame),
             _ => CommandReply::Error(format!("unknown CLUSTER subcommand '{subcommand}'")),
         }
@@ -829,6 +831,51 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             })
             .collect::<Vec<_>>();
         CommandReply::Array(slots)
+    }
+
+    fn execute_cluster_info(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER INFO' command".to_owned(),
+            );
+        }
+
+        let assigned = self.cluster.assigned_slots();
+        let state = if assigned > 0 { "ok" } else { "fail" };
+        let body = format!(
+            "cluster_state:{state}\r\ncluster_slots_assigned:{assigned}\r\ncluster_slots_ok:{assigned}\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:1\r\ncluster_size:1\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\n",
+            self.cluster.config_epoch, self.cluster.config_epoch
+        );
+        CommandReply::BulkString(body.into_bytes())
+    }
+
+    fn execute_cluster_nodes(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER NODES' command".to_owned(),
+            );
+        }
+
+        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
+        let bus_port = port.saturating_add(10_000);
+        let ranges = self
+            .cluster
+            .owned_ranges()
+            .iter()
+            .map(|range| format!("{}-{}", range.start, range.end))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut line = format!(
+            "{} {}:{}@{} myself,master - 0 0 {} connected",
+            self.cluster.node_id, host, port, bus_port, self.cluster.config_epoch
+        );
+        if !ranges.is_empty() {
+            line.push(' ');
+            line.push_str(&ranges);
+        }
+        line.push('\n');
+        CommandReply::BulkString(line.into_bytes())
     }
 
     fn execute_mget(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
@@ -2168,6 +2215,57 @@ mod tests {
             b"*2\r\n*3\r\n:0\r\n:99\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n*3\r\n:200\r\n:300\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n".to_vec(),
         ];
         assert_that!(&reply, eq(&expected));
+    }
+
+    #[rstest]
+    fn resp_cluster_info_reports_slot_summary() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        app.cluster.set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"INFO"]))
+            .expect("CLUSTER INFO should execute");
+        assert_that!(reply.len(), eq(1_usize));
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("cluster_state:ok\r\n"), eq(true));
+        assert_that!(body.contains("cluster_slots_assigned:201\r\n"), eq(true));
+        assert_that!(body.contains("cluster_known_nodes:1\r\n"), eq(true));
+    }
+
+    #[rstest]
+    fn resp_cluster_nodes_reports_myself_master_topology() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        app.cluster.set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"NODES"]))
+            .expect("CLUSTER NODES should execute");
+        let body = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(body.contains("myself,master"), eq(true));
+        assert_that!(body.contains(&app.cluster.node_id), eq(true));
+        assert_that!(body.contains("0-99 200-300"), eq(true));
     }
 
     #[rstest]

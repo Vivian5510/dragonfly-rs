@@ -3,15 +3,24 @@
 pub mod migration;
 pub mod slot;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use dfly_common::config::ClusterMode;
 use dfly_common::ids::MAX_SLOT_ID;
 use slot::{SlotRange, SlotRouter, key_slot};
+
+/// Monotonic seed for deterministic cluster node id allocation.
+static NEXT_NODE_ID_SEED: AtomicU64 = AtomicU64::new(1);
 
 /// Cluster subsystem bootstrap module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterModule {
     /// Startup cluster mode.
     pub mode: ClusterMode,
+    /// Local node id (40-hex, Redis-compatible shape).
+    pub node_id: String,
+    /// Local cluster config epoch.
+    pub config_epoch: u64,
     /// Slot ownership router for local node.
     pub slot_router: SlotRouter,
     /// Redirect endpoint used in MOVED replies for non-owned slots.
@@ -24,6 +33,8 @@ impl ClusterModule {
     pub fn new(mode: ClusterMode) -> Self {
         Self {
             mode,
+            node_id: generate_node_id(),
+            config_epoch: 1,
             slot_router: SlotRouter::new(vec![SlotRange {
                 start: 0,
                 end: MAX_SLOT_ID,
@@ -58,6 +69,21 @@ impl ClusterModule {
     pub fn owned_ranges(&self) -> &[SlotRange] {
         self.slot_router.owned_ranges()
     }
+
+    /// Returns how many slots are currently assigned to this node.
+    #[must_use]
+    pub fn assigned_slots(&self) -> usize {
+        self.slot_router
+            .owned_ranges()
+            .iter()
+            .map(|range| usize::from(range.end.saturating_sub(range.start)) + 1)
+            .sum()
+    }
+}
+
+fn generate_node_id() -> String {
+    let seed = NEXT_NODE_ID_SEED.fetch_add(1, Ordering::Relaxed);
+    format!("{seed:040x}")
 }
 
 #[cfg(test)]
@@ -95,5 +121,28 @@ mod tests {
 
         assert_that!(cluster.owns_key(key), eq(false));
         assert_that!(cluster.moved_slot_for_key(key), eq(Some(slot)));
+    }
+
+    #[rstest]
+    fn node_id_uses_40_hex_shape() {
+        let cluster = ClusterModule::new(ClusterMode::Disabled);
+        assert_that!(cluster.node_id.len(), eq(40_usize));
+        assert_that!(
+            cluster
+                .node_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn assigned_slots_sums_all_ranges() {
+        let mut cluster = ClusterModule::new(ClusterMode::Disabled);
+        cluster.set_owned_ranges(vec![
+            SlotRange { start: 0, end: 9 },
+            SlotRange { start: 20, end: 29 },
+        ]);
+        assert_that!(cluster.assigned_slots(), eq(20_usize));
     }
 }
