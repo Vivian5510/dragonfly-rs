@@ -1303,24 +1303,40 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(required_text) = std::str::from_utf8(&frame.args[0]) else {
             return CommandReply::Error("WAIT numreplicas must be valid UTF-8".to_owned());
         };
-        let Ok(_required) = required_text.parse::<u64>() else {
+        let Ok(required) = required_text.parse::<u64>() else {
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
         let Ok(timeout_text) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("WAIT timeout must be valid UTF-8".to_owned());
         };
-        let Ok(_timeout_millis) = timeout_text.parse::<u64>() else {
+        let Ok(timeout_millis) = timeout_text.parse::<u64>() else {
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
 
-        // WAIT returns "replicas reached" count, not "requested replicas" count.
-        // Timeout/blocking is not modeled yet, but the return semantics match Redis/Dragonfly.
-        let replicated = u64::try_from(
-            self.replication
-                .acked_replica_count_at_or_above(self.replication.replication_offset()),
-        )
-        .unwrap_or(u64::MAX);
-        CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX))
+        // WAIT returns the number of replicas that acknowledged the master offset captured
+        // at WAIT entry time. We poll until either enough replicas reached that offset or
+        // timeout elapses; this keeps Redis/Dragonfly return semantics while staying simple.
+        let target_offset = self.replication.replication_offset();
+        let wait_deadline =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_millis));
+        loop {
+            let replicated = u64::try_from(
+                self.replication
+                    .acked_replica_count_at_or_above(target_offset),
+            )
+            .unwrap_or(u64::MAX);
+            if replicated >= required {
+                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
+            }
+            if timeout_millis == 0 {
+                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
+            }
+            if wait_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn execute_dfly_flow(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -6018,6 +6034,41 @@ mod tests {
             .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
             .expect("WAIT should execute");
         assert_that!(&wait_two, eq(&vec![b":2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_wait_honors_timeout_when_required_replica_count_is_unmet() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica2,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+            )
+            .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica1 ACK should parse");
+
+        let started = std::time::Instant::now();
+        let wait = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"12"]))
+            .expect("WAIT should execute");
+        let elapsed = started.elapsed();
+        assert_that!(&wait, eq(&vec![b":1\r\n".to_vec()]));
+        assert_that!(elapsed >= std::time::Duration::from_millis(6), eq(true));
     }
 
     #[rstest]
