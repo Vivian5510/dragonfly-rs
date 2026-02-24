@@ -5970,6 +5970,67 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_info_replication_recomputes_last_ack_after_replica_reregister() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica2,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+            )
+            .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut client,
+                &resp_command(&[b"SET", b"info:ack:key1", b"value1"]),
+            )
+            .expect("first SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica1 first ACK should parse");
+        let _ = app
+            .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica2 first ACK should parse");
+        let _ = app
+            .feed_connection_bytes(
+                &mut client,
+                &resp_command(&[b"SET", b"info:ack:key2", b"value2"]),
+            )
+            .expect("second SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"2"]))
+            .expect("replica1 second ACK should parse");
+
+        let before = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let before_body = decode_resp_bulk_payload(&before[0]);
+        assert_that!(before_body.contains("last_ack_lsn:2\r\n"), eq(true));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica1 REPLCONF LISTENING-PORT re-registration should succeed");
+
+        let after = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let after_body = decode_resp_bulk_payload(&after[0]);
+        assert_that!(after_body.contains("last_ack_lsn:1\r\n"), eq(true));
+    }
+
+    #[rstest]
     fn resp_info_replication_reports_per_replica_state_and_lag() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
