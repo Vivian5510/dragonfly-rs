@@ -182,6 +182,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
+    /// Test-only helper that detaches one connection and releases its replica endpoint identity.
+    #[cfg(test)]
+    pub fn disconnect_connection(&mut self, connection: &mut ServerConnection) {
+        if let Some(endpoint) = connection.replica_endpoint.take() {
+            let _ = self
+                .replication
+                .remove_replica_endpoint(&endpoint.address, endpoint.listening_port);
+        }
+    }
+
     /// Feeds network bytes into one connection and executes all newly completed commands.
     ///
     /// The return vector contains one protocol-encoded reply per decoded command.
@@ -6630,6 +6640,44 @@ mod tests {
             eq(true)
         );
         assert_that!(body.contains("127.0.0.1"), eq(false));
+
+        let wait = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn disconnect_connection_unregisters_replica_endpoint_and_ack_progress() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut client,
+                &resp_command(&[b"SET", b"disconnect:replica:key", b"value"]),
+            )
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica ACK should parse");
+        assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+
+        app.disconnect_connection(&mut replica);
+
+        let info = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
+            .expect("INFO REPLICATION should succeed");
+        let body = decode_resp_bulk_payload(&info[0]);
+        assert_that!(body.contains("connected_slaves:0\r\n"), eq(true));
+        assert_that!(body.contains("last_ack_lsn:0\r\n"), eq(true));
 
         let wait = app
             .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
