@@ -302,4 +302,28 @@ mod tests {
             eq(true)
         );
     }
+
+    #[rstest]
+    fn in_memory_journal_reset_clears_records_and_rewinds_cursor() {
+        let mut journal = InMemoryJournal::new();
+        let _ = journal.append(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 1".to_vec(),
+        });
+        let _ = journal.append(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET a 2".to_vec(),
+        });
+        assert_that!(journal.current_lsn(), eq(3_u64));
+        assert_that!(journal.len(), eq(2_usize));
+
+        journal.reset();
+        assert_that!(journal.current_lsn(), eq(1_u64));
+        assert_that!(journal.is_empty(), eq(true));
+        assert_that!(journal.entry_at_lsn(1).is_none(), eq(true));
+    }
 }

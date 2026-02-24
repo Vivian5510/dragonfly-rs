@@ -385,4 +385,38 @@ mod tests {
             eq(true)
         );
     }
+
+    #[rstest]
+    fn reset_after_snapshot_load_rewinds_journal_and_replication_offsets() {
+        let mut replication = ReplicationModule::new(true);
+        let original_replid = replication.master_replid().to_owned();
+        replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET reset key".to_vec(),
+        });
+        replication.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        let _ = replication.record_replica_ack_for_endpoint("10.0.0.1", 7001, 1);
+        let sync_id = replication.create_sync_session(1);
+        let eof_token = replication.allocate_flow_eof_token();
+        assert_that!(
+            replication.register_sync_flow(&sync_id, 0, FlowSyncType::Full, None, eof_token),
+            ok(())
+        );
+
+        assert_that!(replication.replication_offset(), eq(1_u64));
+        assert_that!(replication.connected_replicas(), eq(1_usize));
+        assert_that!(replication.journal_lsn(), eq(2_u64));
+
+        replication.reset_after_snapshot_load();
+
+        assert_that!(replication.master_replid(), eq(original_replid.as_str()));
+        assert_that!(replication.replication_offset(), eq(0_u64));
+        assert_that!(replication.connected_replicas(), eq(0_usize));
+        assert_that!(replication.last_acked_lsn(), eq(0_u64));
+        assert_that!(replication.journal_entries().is_empty(), eq(true));
+        assert_that!(replication.journal_lsn(), eq(1_u64));
+        assert_that!(replication.is_known_sync_session(&sync_id), eq(false));
+    }
 }

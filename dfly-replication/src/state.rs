@@ -664,4 +664,35 @@ mod tests {
         );
         assert_that!(state.remove_replica_endpoint("10.0.0.9", 7009), eq(false));
     }
+
+    #[rstest]
+    fn reset_after_snapshot_load_clears_mutable_replication_state() {
+        let mut state = ReplicationState::default();
+        let original_replid = state.master_replid.clone();
+
+        state.set_last_lsn_from_next_cursor(6);
+        state.record_ack_lsn(3);
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        let sync_id = state.create_sync_session(1);
+        let eof_token = state.allocate_flow_eof_token();
+        assert_that!(
+            state.register_sync_flow(&sync_id, 0, FlowSyncType::Full, None, eof_token),
+            eq(Ok(()))
+        );
+        assert_that!(state.mark_sync_session_full_sync(&sync_id), eq(Ok(())));
+
+        state.reset_after_snapshot_load();
+
+        assert_that!(state.master_replid.as_str(), eq(original_replid.as_str()));
+        assert_that!(state.last_lsn, eq(0_u64));
+        assert_that!(state.last_acked_lsn, eq(0_u64));
+        assert_that!(state.connected_replicas, eq(0_usize));
+        assert_that!(state.replicas.is_empty(), eq(true));
+        assert_that!(state.sync_sessions.is_empty(), eq(true));
+        assert_that!(state.is_known_sync_session("SYNC1"), eq(false));
+        assert_that!(state.full_sync_in_progress, eq(false));
+        assert_that!(state.full_sync_done, eq(false));
+        assert_that!(state.create_sync_session(1).as_str(), eq("SYNC1"));
+        assert_that!(state.allocate_flow_eof_token().len(), eq(40_usize));
+    }
 }
