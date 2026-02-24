@@ -205,6 +205,16 @@ impl CommandRegistry {
             handler: handle_get,
         });
         registry.register(CommandSpec {
+            name: "DEL",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_del,
+        });
+        registry.register(CommandSpec {
+            name: "EXISTS",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_exists,
+        });
+        registry.register(CommandSpec {
             name: "EXPIRE",
             arity: CommandArity::Exact(2),
             handler: handle_expire,
@@ -301,6 +311,33 @@ fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         Some(value) => CommandReply::BulkString(value.value.clone()),
         None => CommandReply::Null,
     }
+}
+
+fn handle_del(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let mut deleted = 0_i64;
+
+    for key in &frame.args {
+        state.purge_expired_key(db, key);
+        if state.db_map_mut(db).remove(key).is_some() {
+            state.bump_key_version(db, key);
+            deleted = deleted.saturating_add(1);
+        }
+    }
+
+    CommandReply::Integer(deleted)
+}
+
+fn handle_exists(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let mut existing = 0_i64;
+
+    for key in &frame.args {
+        state.purge_expired_key(db, key);
+        if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+            existing = existing.saturating_add(1);
+        }
+    }
+
+    CommandReply::Integer(existing)
 }
 
 fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
@@ -414,6 +451,60 @@ mod tests {
             &mut state,
         );
         assert_that!(&get_reply, eq(&CommandReply::BulkString(b"alice".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_del_and_exists_follow_redis_counting_semantics() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let exists = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXISTS",
+                vec![
+                    b"k1".to_vec(),
+                    b"k2".to_vec(),
+                    b"missing".to_vec(),
+                    b"k1".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&exists, eq(&CommandReply::Integer(3)));
+
+        let deleted = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "DEL",
+                vec![
+                    b"k1".to_vec(),
+                    b"k2".to_vec(),
+                    b"missing".to_vec(),
+                    b"k1".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&deleted, eq(&CommandReply::Integer(2)));
+
+        let exists_after_delete = registry.dispatch(
+            0,
+            &CommandFrame::new("EXISTS", vec![b"k1".to_vec(), b"k2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&exists_after_delete, eq(&CommandReply::Integer(0)));
     }
 
     #[rstest]

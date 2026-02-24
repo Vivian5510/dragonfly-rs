@@ -188,7 +188,7 @@ impl CoreModule {
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
         match frame.name.as_str() {
-            "GET" | "SET" | "EXPIRE" | "TTL" => frame
+            "GET" | "SET" | "DEL" | "EXISTS" | "EXPIRE" | "TTL" => frame
                 .args
                 .first()
                 .map_or(0, |key| self.resolve_shard_for_key(key)),

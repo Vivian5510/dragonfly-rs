@@ -588,6 +588,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "WAIT" => self.execute_wait(frame),
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
+            "DEL" => self.execute_del(db, frame),
+            "EXISTS" => self.execute_exists(db, frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "GET" | "SET" | "EXPIRE" | "TTL" => self.execute_key_command(db, frame),
@@ -676,6 +678,43 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
         let _ = self.core.flush_all();
         CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_del(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        self.execute_counting_key_command(db, frame, "DEL")
+    }
+
+    fn execute_exists(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        self.execute_counting_key_command(db, frame, "EXISTS")
+    }
+
+    fn execute_counting_key_command(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        command: &str,
+    ) -> CommandReply {
+        if frame.args.is_empty() {
+            return CommandReply::Error(wrong_arity_message(command));
+        }
+
+        let mut total = 0_i64;
+        for key in &frame.args {
+            if let Some(moved) = self.cluster_moved_reply_for_key(key) {
+                return moved;
+            }
+
+            let single_key_frame = CommandFrame::new(command, vec![key.clone()]);
+            let reply = self.core.execute_in_db(db, &single_key_frame);
+            let CommandReply::Integer(delta) = reply else {
+                return CommandReply::Error(format!(
+                    "internal error: {command} did not return integer reply"
+                ));
+            };
+            total = total.saturating_add(delta.max(0));
+        }
+
+        CommandReply::Integer(total)
     }
 
     fn execute_role(&self, frame: &CommandFrame) -> CommandReply {
@@ -1506,6 +1545,7 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("FLUSHDB", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("FLUSHALL", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("EXPIRE", CommandReply::Integer(1)) => {
@@ -1713,6 +1753,40 @@ mod tests {
                 b"-ERR wrong number of arguments for 'MSET' command\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn resp_exists_and_del_follow_multi_key_count_semantics() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
+            .expect("SET k1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
+            .expect("SET k2 should succeed");
+
+        let exists = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXISTS", b"k1", b"k2", b"missing", b"k1"]),
+            )
+            .expect("EXISTS should execute");
+        assert_that!(&exists, eq(&vec![b":3\r\n".to_vec()]));
+
+        let deleted = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"DEL", b"k1", b"k2", b"missing", b"k1"]),
+            )
+            .expect("DEL should execute");
+        assert_that!(&deleted, eq(&vec![b":2\r\n".to_vec()]));
+
+        let exists_after = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
+            .expect("EXISTS should execute");
+        assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2251,6 +2325,29 @@ mod tests {
         assert_that!(entries[0].op, eq(JournalOp::Command));
         assert_that!(
             String::from_utf8_lossy(&entries[0].payload).contains("MSET"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn journal_records_del_only_when_keyspace_changes() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DEL", b"missing"]))
+            .expect("DEL missing should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DEL", b"k"]))
+            .expect("DEL existing should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(2_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
             eq(true)
         );
     }
