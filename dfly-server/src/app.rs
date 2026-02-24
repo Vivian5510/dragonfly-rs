@@ -692,7 +692,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "FLUSHALL" => self.execute_flushall(frame),
             "PSYNC" => self.execute_psync(frame),
             "WAIT" => self.execute_wait(frame),
-            "CLUSTER" => self.execute_cluster(frame),
+            "CLUSTER" => self.execute_cluster(db, frame),
             "DFLY" => self.execute_dfly_admin(frame),
             "DEL" => self.execute_del(db, frame),
             "UNLINK" => self.execute_unlink(db, frame),
@@ -1420,7 +1420,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.core.execute_in_db(db, frame)
     }
 
-    fn execute_cluster(&self, frame: &CommandFrame) -> CommandReply {
+    fn execute_cluster(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if self.cluster.mode == ClusterMode::Disabled {
             return CommandReply::Error(
                 "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
@@ -1438,6 +1438,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         match subcommand.to_ascii_uppercase().as_str() {
             "HELP" => Self::execute_cluster_help(frame),
+            "GETKEYSINSLOT" => self.execute_cluster_getkeysinslot(db, frame),
             "INFO" => self.execute_cluster_info(frame),
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
             "MYID" => self.execute_cluster_myid(frame),
@@ -1457,6 +1458,45 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Integer(i64::from(key_slot(&frame.args[1])))
     }
 
+    fn execute_cluster_getkeysinslot(&self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 3 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER GETKEYSINSLOT' command".to_owned(),
+            );
+        }
+
+        let Ok(slot_text) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error(
+                "CLUSTER GETKEYSINSLOT slot must be valid UTF-8".to_owned(),
+            );
+        };
+        let Ok(slot) = slot_text.parse::<u16>() else {
+            return CommandReply::Error("value is not an integer or out of range".to_owned());
+        };
+        if slot > 16_383 {
+            return CommandReply::Error("slot is out of range".to_owned());
+        }
+
+        let Ok(count_text) = std::str::from_utf8(&frame.args[2]) else {
+            return CommandReply::Error(
+                "CLUSTER GETKEYSINSLOT count must be valid UTF-8".to_owned(),
+            );
+        };
+        let Ok(limit) = count_text.parse::<usize>() else {
+            return CommandReply::Error("value is not an integer or out of range".to_owned());
+        };
+
+        let mut keys = self.core.keys_in_slot(db, slot);
+        if keys.len() > limit {
+            keys.truncate(limit);
+        }
+        CommandReply::Array(
+            keys.into_iter()
+                .map(CommandReply::BulkString)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn execute_cluster_help(frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 1 {
             return CommandReply::Error(
@@ -1468,6 +1508,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "SLOTS",
             "   Return information about slots range mappings. Each range is made of:",
             "   start, end, master and replicas IP addresses, ports and ids.",
+            "GETKEYSINSLOT <slot> <count>",
+            "   Return up to <count> keys for one hash slot.",
             "NODES",
             "   Return cluster configuration seen by node. Output format:",
             "   <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
