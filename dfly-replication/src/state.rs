@@ -40,6 +40,8 @@ pub struct ReplicaEndpoint {
     pub address: String,
     /// Replica listening port announced by `REPLCONF`.
     pub listening_port: u16,
+    /// Last acknowledged LSN observed from this replica endpoint.
+    pub last_acked_lsn: u64,
     /// High-level sync stage used by `ROLE` output.
     pub state: ReplicaSyncState,
 }
@@ -176,10 +178,49 @@ impl ReplicationState {
             self.replicas.push(ReplicaEndpoint {
                 address,
                 listening_port,
+                last_acked_lsn: 0,
                 state: ReplicaSyncState::Preparation,
             });
         }
         self.connected_replicas = self.replicas.len();
+    }
+
+    /// Records one replica ACK offset for a specific endpoint.
+    ///
+    /// ACK is clamped to current master offset and applied monotonically for that endpoint.
+    ///
+    pub fn record_replica_ack_for_endpoint(
+        &mut self,
+        address: &str,
+        listening_port: u16,
+        ack_lsn: u64,
+    ) -> bool {
+        let Some(replica) = self
+            .replicas
+            .iter_mut()
+            .find(|entry| entry.address == address && entry.listening_port == listening_port)
+        else {
+            return false;
+        };
+
+        let clamped = ack_lsn.min(self.last_lsn);
+        if clamped > replica.last_acked_lsn {
+            replica.last_acked_lsn = clamped;
+        }
+        if clamped > self.last_acked_lsn {
+            self.last_acked_lsn = clamped;
+        }
+        replica.state = ReplicaSyncState::StableSync;
+        true
+    }
+
+    /// Counts replicas with acknowledged LSN at or above one target offset.
+    #[must_use]
+    pub fn acked_replica_count_at_or_above(&self, offset: u64) -> usize {
+        self.replicas
+            .iter()
+            .filter(|replica| replica.last_acked_lsn >= offset)
+            .count()
     }
 
     /// Sets sync state on all registered replica endpoints.
@@ -380,6 +421,7 @@ mod tests {
         assert_that!(state.connected_replicas, eq(1_usize));
         assert_that!(state.replicas.len(), eq(1_usize));
         assert_that!(state.replicas[0].state, eq(ReplicaSyncState::Preparation));
+        assert_that!(state.replicas[0].last_acked_lsn, eq(0_u64));
 
         state.set_all_replica_states(ReplicaSyncState::FullSync);
         assert_that!(state.replicas[0].state, eq(ReplicaSyncState::FullSync));
@@ -452,5 +494,30 @@ mod tests {
             state.mark_sync_session_stable_sync(&sync),
             eq(Err(SyncSessionError::InvalidState))
         );
+    }
+
+    #[rstest]
+    fn endpoint_ack_updates_per_replica_and_global_ack() {
+        let mut state = ReplicationState::default();
+        state.set_last_lsn_from_next_cursor(6);
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        state.register_replica_endpoint("10.0.0.2".to_owned(), 7002);
+
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.1", 7001, 3),
+            eq(true)
+        );
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.2", 7002, 2),
+            eq(true)
+        );
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.9", 7009, 2),
+            eq(false)
+        );
+
+        assert_that!(state.last_acked_lsn, eq(3_u64));
+        assert_that!(state.acked_replica_count_at_or_above(3), eq(1_usize));
+        assert_that!(state.acked_replica_count_at_or_above(2), eq(2_usize));
     }
 }

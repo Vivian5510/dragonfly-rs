@@ -174,6 +174,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 privileged: false,
             }),
             transaction: TransactionSession::default(),
+            replica_endpoint: None,
         }
     }
 
@@ -230,6 +231,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     }
                     continue;
                 }
+            }
+
+            if frame.name == "REPLCONF" {
+                let reply = self.execute_replconf(connection, &frame);
+                if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
+                    // Dragonfly does not interleave ACK replies with journal stream writes.
+                    // We model the same behavior by consuming successful ACK silently.
+                    continue;
+                }
+                let encoded =
+                    encode_reply_for_protocol(connection.parser.context.protocol, &frame, reply);
+                responses.push(encoded);
+                continue;
             }
 
             let db = connection.parser.context.db_index;
@@ -413,7 +427,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "INFO" => self.execute_info(frame),
             "ROLE" => self.execute_role(frame),
             "PSYNC" => self.execute_psync(frame),
-            "REPLCONF" => self.execute_replconf(frame),
             "WAIT" => self.execute_wait(frame),
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
@@ -478,7 +491,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         ])
     }
 
-    fn execute_replconf(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_replconf(
+        &mut self,
+        connection: &mut ServerConnection,
+        frame: &CommandFrame,
+    ) -> CommandReply {
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error("syntax error".to_owned());
         }
@@ -500,24 +517,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let mut announced_port: Option<u16> = None;
         let mut announced_ip: Option<String> = None;
-        let mut saw_ack = false;
 
         for pair in frame.args.chunks_exact(2) {
             let option = pair[0].as_slice();
             let value = pair[1].as_slice();
             if option.eq_ignore_ascii_case(b"ACK") {
-                let Ok(text) = std::str::from_utf8(value) else {
-                    return CommandReply::Error(
-                        "REPLCONF ACK offset must be valid UTF-8".to_owned(),
-                    );
-                };
-                let Ok(ack_lsn) = text.parse::<u64>() else {
-                    return CommandReply::Error(
-                        "value is not an integer or out of range".to_owned(),
-                    );
-                };
-                self.replication.record_replica_ack(ack_lsn);
-                saw_ack = true;
+                if let Err(error_reply) = self.handle_replconf_ack(connection, value) {
+                    return error_reply;
+                }
                 continue;
             }
             if option.eq_ignore_ascii_case(b"LISTENING-PORT") {
@@ -552,17 +559,75 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("syntax error".to_owned());
         }
 
-        if let Some(port) = announced_port {
-            self.replication.register_replica_endpoint(
-                announced_ip.unwrap_or_else(|| "127.0.0.1".to_owned()),
-                port,
-            );
-        }
-        if saw_ack {
-            self.replication.mark_replicas_stable_sync();
-        }
+        self.apply_replconf_endpoint_update(connection, announced_port, announced_ip);
 
         CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn handle_replconf_ack(
+        &mut self,
+        connection: &ServerConnection,
+        value: &[u8],
+    ) -> Result<(), CommandReply> {
+        let Ok(text) = std::str::from_utf8(value) else {
+            return Err(CommandReply::Error(
+                "REPLCONF ACK offset must be valid UTF-8".to_owned(),
+            ));
+        };
+        let Ok(ack_lsn) = text.parse::<u64>() else {
+            return Err(CommandReply::Error(
+                "value is not an integer or out of range".to_owned(),
+            ));
+        };
+        if let Some(endpoint) = connection.replica_endpoint.as_ref() {
+            let applied = self.replication.record_replica_ack_for_endpoint(
+                &endpoint.address,
+                endpoint.listening_port,
+                ack_lsn,
+            );
+            if !applied {
+                self.replication.record_replica_ack(ack_lsn);
+            }
+        } else {
+            self.replication.record_replica_ack(ack_lsn);
+        }
+        Ok(())
+    }
+
+    fn apply_replconf_endpoint_update(
+        &mut self,
+        connection: &mut ServerConnection,
+        announced_port: Option<u16>,
+        announced_ip: Option<String>,
+    ) {
+        if let Some(port) = announced_port {
+            let address = announced_ip
+                .or_else(|| {
+                    connection
+                        .replica_endpoint
+                        .as_ref()
+                        .map(|endpoint| endpoint.address.clone())
+                })
+                .unwrap_or_else(|| "127.0.0.1".to_owned());
+            self.replication
+                .register_replica_endpoint(address.clone(), port);
+            connection.replica_endpoint = Some(ReplicaEndpointIdentity {
+                address,
+                listening_port: port,
+            });
+            return;
+        }
+
+        if let Some(address) = announced_ip
+            && let Some(existing) = connection.replica_endpoint.as_ref()
+        {
+            self.replication
+                .register_replica_endpoint(address.clone(), existing.listening_port);
+            connection.replica_endpoint = Some(ReplicaEndpointIdentity {
+                address,
+                listening_port: existing.listening_port,
+            });
+        }
     }
 
     fn execute_psync(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -613,14 +678,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
 
-        // Learning-path approximation: when the latest ACK reached current offset,
-        // all connected replicas are treated as confirmed for this offset.
-        let replicated =
-            if self.replication.last_acked_lsn() >= self.replication.replication_offset() {
-                u64::try_from(self.replication.connected_replicas()).unwrap_or(u64::MAX)
-            } else {
-                0
-            };
+        let replicated = u64::try_from(
+            self.replication
+                .acked_replica_count_at_or_above(self.replication.replication_offset()),
+        )
+        .unwrap_or(u64::MAX);
         let confirmed = replicated.min(required);
         CommandReply::Integer(i64::try_from(confirmed).unwrap_or(i64::MAX))
     }
@@ -1051,6 +1113,17 @@ pub struct ServerConnection {
     pub parser: ConnectionState,
     /// Connection-local transaction queue (`MULTI` mode).
     pub transaction: TransactionSession,
+    /// Replica endpoint identity announced on this connection via `REPLCONF`.
+    pub replica_endpoint: Option<ReplicaEndpointIdentity>,
+}
+
+/// One replica endpoint attached to a client connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaEndpointIdentity {
+    /// Replica IP/address.
+    pub address: String,
+    /// Replica listening port.
+    pub listening_port: u16,
 }
 
 /// Builds standard wrong-arity RESP error for one command.
@@ -1794,6 +1867,49 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
             .expect("WAIT should execute");
         assert_that!(&wait_after_ack, eq(&vec![b":1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_wait_counts_only_replicas_that_acked_target_offset() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica1,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica2,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+            )
+            .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+
+        let _ = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
+            .expect("SET should succeed");
+
+        let _ = app
+            .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica1 ACK should parse");
+
+        let wait_one = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_one, eq(&vec![b":1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica2 ACK should parse");
+
+        let wait_two = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_two, eq(&vec![b":2\r\n".to_vec()]));
     }
 
     #[rstest]

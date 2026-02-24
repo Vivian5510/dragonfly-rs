@@ -124,6 +124,25 @@ impl ReplicationModule {
             .collect()
     }
 
+    /// Records one replica ACK offset for a specific endpoint.
+    ///
+    /// Returns `false` when endpoint is not registered.
+    pub fn record_replica_ack_for_endpoint(
+        &mut self,
+        address: &str,
+        listening_port: u16,
+        ack_lsn: u64,
+    ) -> bool {
+        self.state
+            .record_replica_ack_for_endpoint(address, listening_port, ack_lsn)
+    }
+
+    /// Counts replicas acknowledged at or above one target offset.
+    #[must_use]
+    pub fn acked_replica_count_at_or_above(&self, offset: u64) -> usize {
+        self.state.acked_replica_count_at_or_above(offset)
+    }
+
     /// Creates one sync session id used by `DFLY` replication commands.
     pub fn create_sync_session(&mut self, flow_count: usize) -> String {
         self.state.create_sync_session(flow_count)
