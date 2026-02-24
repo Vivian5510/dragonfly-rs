@@ -634,18 +634,25 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let mut per_command_error = vec![None; hop.per_shard.len()];
         let mut target_sequence_by_shard = HashMap::<u16, u64>::new();
 
-        for (index, (shard, command)) in hop.per_shard.iter().enumerate() {
-            match self.submit_runtime_envelope_with_sequence(*shard, command) {
-                Ok(sequence) => {
-                    target_sequence_by_shard
-                        .entry(*shard)
-                        .and_modify(|current| {
-                            *current = (*current).max(sequence);
-                        })
-                        .or_insert(sequence);
-                }
-                Err(error) => {
-                    per_command_error[index] = Some(format!("runtime dispatch failed: {error}"));
+        for (index, (shard_hint, command)) in hop.per_shard.iter().enumerate() {
+            let target_shards =
+                self.runtime_target_shards_for_scheduled_command(*shard_hint, command);
+            for target_shard in target_shards {
+                match self.submit_runtime_envelope_with_sequence(target_shard, command) {
+                    Ok(sequence) => {
+                        target_sequence_by_shard
+                            .entry(target_shard)
+                            .and_modify(|current| {
+                                *current = (*current).max(sequence);
+                            })
+                            .or_insert(sequence);
+                    }
+                    Err(error) => {
+                        if per_command_error[index].is_none() {
+                            per_command_error[index] =
+                                Some(format!("runtime dispatch failed: {error}"));
+                        }
+                    }
                 }
             }
         }
@@ -728,7 +735,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn dispatch_direct_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
-        let target_shards = self.runtime_target_shards_for_direct_command(frame);
+        let target_shards = self.runtime_target_shards_for_command(frame);
         if target_shards.is_empty() {
             return Ok(());
         }
@@ -754,7 +761,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         Ok(())
     }
 
-    fn runtime_target_shards_for_direct_command(&self, frame: &CommandFrame) -> Vec<u16> {
+    fn runtime_target_shards_for_scheduled_command(
+        &self,
+        shard_hint: u16,
+        frame: &CommandFrame,
+    ) -> Vec<u16> {
+        let target_shards = self.runtime_target_shards_for_command(frame);
+        if target_shards.is_empty() {
+            return vec![shard_hint];
+        }
+        target_shards
+    }
+
+    fn runtime_target_shards_for_command(&self, frame: &CommandFrame) -> Vec<u16> {
         if matches!(
             self.core.command_routing(frame),
             CommandRouting::SingleKey { .. }
@@ -3911,6 +3930,87 @@ mod tests {
             .expect("drain should succeed");
         assert_that!(runtime.len(), eq(1_usize));
         assert_that!(&runtime[0].command, eq(&command));
+    }
+
+    #[rstest]
+    fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let first_key = b"plan:rt:global:mset:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"plan:rt:global:mset:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("plan:rt:global:mset:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let queued = vec![CommandFrame::new(
+            "MSET",
+            vec![first_key, b"a".to_vec(), second_key, b"b".to_vec()],
+        )];
+        let plan = app.build_exec_plan(&queued);
+        assert_that!(plan.mode, eq(TransactionMode::Global));
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![CommandReply::SimpleString("OK".to_owned())])
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let first_runtime = app
+            .runtime
+            .drain_processed_for_shard(first_shard)
+            .expect("drain should succeed");
+        let second_runtime = app
+            .runtime
+            .drain_processed_for_shard(second_shard)
+            .expect("drain should succeed");
+        assert_that!(first_runtime.len(), eq(1_usize));
+        assert_that!(second_runtime.len(), eq(1_usize));
+        assert_that!(&first_runtime[0].command, eq(&queued[0]));
+        assert_that!(&second_runtime[0].command, eq(&queued[0]));
+    }
+
+    #[rstest]
+    fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let queued = vec![CommandFrame::new("PING", Vec::new())];
+        let plan = app.build_exec_plan(&queued);
+        assert_that!(plan.mode, eq(TransactionMode::Global));
+
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(
+            &replies,
+            eq(&vec![CommandReply::SimpleString("PONG".to_owned())])
+        );
+        let shard_zero_runtime = app
+            .runtime
+            .drain_processed_for_shard(0)
+            .expect("drain should succeed");
+        assert_that!(shard_zero_runtime.len(), eq(1_usize));
+        assert_that!(&shard_zero_runtime[0].command, eq(&queued[0]));
+
+        for shard in 1_u16..app.config.shard_count.get() {
+            let runtime = app
+                .runtime
+                .drain_processed_for_shard(shard)
+                .expect("drain should succeed");
+            assert_that!(runtime.is_empty(), eq(true));
+        }
     }
 
     #[rstest]
