@@ -147,6 +147,14 @@ impl SharedCore {
         self.with_core(|core| core.keys_matching(db, pattern))
     }
 
+    /// Returns live keys in selected logical DB that belong to one cluster slot.
+    ///
+    /// Keys are aggregated across all shards and sorted for deterministic callers.
+    #[must_use]
+    pub fn keys_in_slot(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
+        self.with_core(|core| core.keys_in_slot(db, slot))
+    }
+
     /// Selects target shard for one command.
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
@@ -559,6 +567,44 @@ impl CoreModule {
         matched
     }
 
+    /// Returns live keys in selected logical DB that belong to one cluster slot.
+    ///
+    /// Dragonfly slot migration and cluster introspection operate over slot-scoped
+    /// key sets. We aggregate each shard-local `slot_keys` index and apply the
+    /// same expiration visibility rules as read commands.
+    #[must_use]
+    pub fn keys_in_slot(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let mut keys = Vec::new();
+
+        for state in &self.shard_states {
+            let Some(table) = state.db_tables.get(&db) else {
+                continue;
+            };
+            let Some(slot_keys) = table.slot_keys.get(&slot) else {
+                continue;
+            };
+            for key in slot_keys {
+                let Some(value) = table.prime.get(key) else {
+                    continue;
+                };
+                if value
+                    .expire_at_unix_secs
+                    .is_some_and(|expire_at| expire_at <= now)
+                {
+                    continue;
+                }
+                keys.push(key.clone());
+            }
+        }
+
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -724,6 +770,7 @@ fn parse_class_atom(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
 mod tests {
     use super::{CommandRouting, CoreModule, SingleKeyAccess, classify_single_key_access};
     use crate::command::{CommandFrame, CommandReply};
+    use dfly_cluster::slot::key_slot;
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -1193,5 +1240,45 @@ mod tests {
 
         let escaped = core.keys_matching(0, br"k\[1\]");
         assert_that!(&escaped, eq(&vec![br"k[1]".to_vec()]));
+    }
+
+    #[rstest]
+    fn core_keys_in_slot_aggregates_live_keys_from_slot_index() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let first_key = b"slot:keys:{alpha}:1".to_vec();
+        let second_key = b"slot:keys:{alpha}:2".to_vec();
+        let other_slot_key = b"slot:keys:{beta}:1".to_vec();
+        let expired_key = b"slot:keys:{alpha}:expired".to_vec();
+        let slot = key_slot(&first_key);
+        assert_that!(key_slot(&second_key), eq(slot));
+        assert_that!(key_slot(&expired_key), eq(slot));
+        assert_that!(key_slot(&other_slot_key) != slot, eq(true));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![first_key.clone(), b"one".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![second_key.clone(), b"two".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![other_slot_key.clone(), b"x".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![expired_key.clone(), b"gone".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("EXPIRE", vec![expired_key.clone(), b"0".to_vec()]),
+        );
+
+        let slot_keys = core.keys_in_slot(0, slot);
+        assert_that!(&slot_keys, eq(&vec![first_key.clone(), second_key.clone()]));
+        assert_that!(slot_keys.contains(&expired_key), eq(false));
+        assert_that!(slot_keys.contains(&other_slot_key), eq(false));
     }
 }
