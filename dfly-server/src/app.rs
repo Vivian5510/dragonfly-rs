@@ -93,6 +93,26 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         )
     }
 
+    /// Builds serialized snapshot bytes from current in-memory core state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when snapshot payload encoding fails.
+    pub fn create_snapshot_bytes(&self) -> DflyResult<Vec<u8>> {
+        let snapshot = self.core.export_snapshot();
+        self.storage.serialize_snapshot(&snapshot)
+    }
+
+    /// Replaces current in-memory state by decoding and importing snapshot bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when payload cannot be decoded or contains invalid shard ids.
+    pub fn load_snapshot_bytes(&mut self, payload: &[u8]) -> DflyResult<()> {
+        let snapshot = self.storage.deserialize_snapshot(payload)?;
+        self.core.import_snapshot(&snapshot)
+    }
+
     /// Creates a new logical client connection state.
     ///
     /// A real server would attach this state to a socket file descriptor. Here we keep it as
@@ -485,6 +505,8 @@ pub fn run() -> DflyResult<()> {
     // Keep one minimal end-to-end bootstrap probe so command pipeline code is part of
     // regular binary execution path, not only test-only dead code.
     let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
+    let snapshot = app.create_snapshot_bytes()?;
+    app.load_snapshot_bytes(&snapshot)?;
 
     println!("{}", app.startup_summary());
     Ok(())
@@ -494,6 +516,7 @@ pub fn run() -> DflyResult<()> {
 mod tests {
     use super::ServerApp;
     use dfly_common::config::RuntimeConfig;
+    use dfly_common::error::DflyError;
     use dfly_facade::protocol::ClientProtocol;
     use dfly_replication::journal::JournalOp;
     use googletest::prelude::*;
@@ -829,6 +852,73 @@ mod tests {
             &select,
             eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
         );
+    }
+
+    #[rstest]
+    fn server_snapshot_roundtrip_restores_data_across_databases() {
+        let mut source = ServerApp::new(RuntimeConfig::default());
+        let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
+            )
+            .expect("db0 SET should succeed");
+        let _ = source
+            .feed_connection_bytes(&mut source_connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n")
+            .expect("SELECT 2 should succeed");
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb2\r\n",
+            )
+            .expect("db2 SET should succeed");
+
+        let snapshot_bytes = source
+            .create_snapshot_bytes()
+            .expect("snapshot export should succeed");
+
+        let mut restored = ServerApp::new(RuntimeConfig::default());
+        restored
+            .load_snapshot_bytes(&snapshot_bytes)
+            .expect("snapshot import should succeed");
+
+        let mut restored_connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let db0_get = restored
+            .feed_connection_bytes(
+                &mut restored_connection,
+                b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+            )
+            .expect("db0 GET should succeed");
+        assert_that!(&db0_get, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+
+        let _ = restored
+            .feed_connection_bytes(
+                &mut restored_connection,
+                b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n",
+            )
+            .expect("SELECT 2 should succeed after restore");
+        let db2_get = restored
+            .feed_connection_bytes(
+                &mut restored_connection,
+                b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+            )
+            .expect("db2 GET should succeed");
+        assert_that!(&db2_get, eq(&vec![b"$3\r\ndb2\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn server_snapshot_load_rejects_malformed_payload() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let error = app
+            .load_snapshot_bytes(b"not-a-snapshot")
+            .expect_err("invalid bytes should fail");
+
+        let DflyError::Protocol(message) = error else {
+            panic!("expected protocol error");
+        };
+        assert_that!(message.contains("snapshot payload error"), eq(true));
     }
 
     fn resp_command(parts: &[&[u8]]) -> Vec<u8> {

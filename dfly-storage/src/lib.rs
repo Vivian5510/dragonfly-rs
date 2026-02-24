@@ -2,6 +2,10 @@
 
 pub mod db;
 pub mod namespace;
+pub mod snapshot;
+
+use dfly_common::error::DflyResult;
+use dfly_core::CoreSnapshot;
 
 /// Storage subsystem bootstrap module.
 #[derive(Debug, Default)]
@@ -12,5 +16,23 @@ impl StorageModule {
     #[must_use]
     pub fn new() -> Self {
         Self
+    }
+
+    /// Encodes an in-memory core snapshot into storage payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when snapshot field sizes exceed format limits.
+    pub fn serialize_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<Vec<u8>> {
+        snapshot::encode_core_snapshot(snapshot)
+    }
+
+    /// Decodes storage payload bytes into core snapshot representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when payload is malformed.
+    pub fn deserialize_snapshot(&self, payload: &[u8]) -> DflyResult<CoreSnapshot> {
+        snapshot::decode_core_snapshot(payload)
     }
 }

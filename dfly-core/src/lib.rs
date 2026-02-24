@@ -6,8 +6,9 @@ pub mod runtime;
 pub mod sharding;
 
 use command::{CommandFrame, CommandReply};
+use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{DbIndex, ShardCount};
-use dispatch::{CommandRegistry, DispatchState};
+use dispatch::{CommandRegistry, DispatchState, ValueEntry};
 use sharding::{HashTagShardResolver, ShardResolver};
 
 /// Core module bootstrap object.
@@ -25,6 +26,28 @@ pub struct CoreModule {
     /// Dragonfly isolates key ownership per shard thread. This vector models that ownership
     /// boundary in the learning implementation by keeping one independent keyspace per shard.
     shard_states: Vec<DispatchState>,
+}
+
+/// One logical KV entry in snapshot form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    /// Owning shard id.
+    pub shard: u16,
+    /// Logical DB id.
+    pub db: DbIndex,
+    /// Key bytes.
+    pub key: Vec<u8>,
+    /// Value bytes.
+    pub value: Vec<u8>,
+    /// Optional expire timestamp.
+    pub expire_at_unix_secs: Option<u64>,
+}
+
+/// Snapshot payload for full state capture.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoreSnapshot {
+    /// Flattened entry list.
+    pub entries: Vec<SnapshotEntry>,
 }
 
 impl CoreModule {
@@ -53,6 +76,63 @@ impl CoreModule {
             return CommandReply::Error(format!("invalid target shard {target_shard}"));
         };
         self.command_registry.dispatch(db, frame, target_state)
+    }
+
+    /// Exports current in-memory state as a snapshot payload.
+    #[must_use]
+    pub fn export_snapshot(&self) -> CoreSnapshot {
+        let mut entries = Vec::new();
+        for (shard_index, state) in self.shard_states.iter().enumerate() {
+            let Ok(shard) = u16::try_from(shard_index) else {
+                continue;
+            };
+            for (db, keyspace) in &state.db_kv {
+                for (key, value_entry) in keyspace {
+                    entries.push(SnapshotEntry {
+                        shard,
+                        db: *db,
+                        key: key.clone(),
+                        value: value_entry.value.clone(),
+                        expire_at_unix_secs: value_entry.expire_at_unix_secs,
+                    });
+                }
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.shard
+                .cmp(&right.shard)
+                .then(left.db.cmp(&right.db))
+                .then(left.key.cmp(&right.key))
+        });
+        CoreSnapshot { entries }
+    }
+
+    /// Replaces current in-memory state with provided snapshot payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when snapshot carries an out-of-range shard id.
+    pub fn import_snapshot(&mut self, snapshot: &CoreSnapshot) -> DflyResult<()> {
+        for state in &mut self.shard_states {
+            *state = DispatchState::default();
+        }
+
+        for entry in &snapshot.entries {
+            let Some(state) = self.shard_states.get_mut(usize::from(entry.shard)) else {
+                return Err(DflyError::Protocol(format!(
+                    "snapshot entry targets unknown shard {}",
+                    entry.shard
+                )));
+            };
+            state.db_kv.entry(entry.db).or_default().insert(
+                entry.key.clone(),
+                ValueEntry {
+                    value: entry.value.clone(),
+                    expire_at_unix_secs: entry.expire_at_unix_secs,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Resolves the owner shard for a key using the active sharding policy.
@@ -138,5 +218,31 @@ mod tests {
             core.shard_states[usize::from(second_shard)].db_len(0),
             eq(1_usize),
         );
+    }
+
+    #[rstest]
+    fn core_snapshot_roundtrip_preserves_db_state() {
+        let mut source = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+
+        let _ = source.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"user".to_vec(), b"alice".to_vec()]),
+        );
+        let _ = source.execute_in_db(
+            2,
+            &CommandFrame::new("SET", vec![b"user".to_vec(), b"bob".to_vec()]),
+        );
+
+        let snapshot = source.export_snapshot();
+
+        let mut restored = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        restored
+            .import_snapshot(&snapshot)
+            .expect("snapshot import should succeed");
+
+        let db0_get = restored.execute_in_db(0, &CommandFrame::new("GET", vec![b"user".to_vec()]));
+        let db2_get = restored.execute_in_db(2, &CommandFrame::new("GET", vec![b"user".to_vec()]));
+        assert_that!(&db0_get, eq(&CommandReply::BulkString(b"alice".to_vec())));
+        assert_that!(&db2_get, eq(&CommandReply::BulkString(b"bob".to_vec())));
     }
 }
