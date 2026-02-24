@@ -459,6 +459,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             Err(_) => {}
         }
 
+        Self::validate_non_core_queued_command(frame)
+    }
+
+    fn validate_non_core_queued_command(frame: &CommandFrame) -> Result<(), String> {
         match frame.name.as_str() {
             "INFO" => {
                 if frame.args.len() <= 1 {
@@ -544,6 +548,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     Err(wrong_arity_message("READWRITE"))
                 }
             }
+            "DBSIZE" => {
+                if frame.args.is_empty() {
+                    Ok(())
+                } else {
+                    Err(wrong_arity_message("DBSIZE"))
+                }
+            }
             _ => Err(format!("unknown command '{}'", frame.name)),
         }
     }
@@ -589,6 +600,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "ROLE" => self.execute_role(frame),
             "READONLY" => Self::execute_readonly(frame),
             "READWRITE" => self.execute_readwrite(frame),
+            "DBSIZE" => self.execute_dbsize(db, frame),
             "FLUSHDB" => self.execute_flushdb(db, frame),
             "FLUSHALL" => self.execute_flushall(frame),
             "PSYNC" => self.execute_psync(frame),
@@ -679,6 +691,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
         let _ = self.core.flush_db(db);
         CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_dbsize(&self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'DBSIZE' command".to_owned(),
+            );
+        }
+
+        CommandReply::Integer(i64::try_from(self.core.db_size(db)).unwrap_or(i64::MAX))
     }
 
     fn execute_flushall(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1850,6 +1872,51 @@ mod tests {
             .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"k"]))
             .expect("TYPE should execute");
         assert_that!(&existing, eq(&vec![b"+string\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_dbsize_counts_keys_in_selected_database() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k0", b"v0"]))
+            .expect("SET db0 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
+            .expect("SET db1 should execute");
+
+        let db1_size = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE"]))
+            .expect("DBSIZE db1 should execute");
+        assert_that!(&db1_size, eq(&vec![b":1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should execute");
+        let db0_size = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE"]))
+            .expect("DBSIZE db0 should execute");
+        assert_that!(&db0_size, eq(&vec![b":1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_dbsize_rejects_extra_arguments() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE", b"extra"]))
+            .expect("DBSIZE should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'DBSIZE' command\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]

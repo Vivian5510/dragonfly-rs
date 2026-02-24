@@ -180,6 +180,12 @@ impl CoreModule {
             .sum()
     }
 
+    /// Returns total key count for one logical DB across all shards.
+    #[must_use]
+    pub fn db_size(&self, db: DbIndex) -> usize {
+        self.shard_states.iter().map(|state| state.db_len(db)).sum()
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -363,5 +369,38 @@ mod tests {
         let db3_value = core.execute_in_db(3, &CommandFrame::new("GET", vec![b"key:3".to_vec()]));
         assert_that!(&db0_value, eq(&CommandReply::Null));
         assert_that!(&db3_value, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn core_db_size_counts_keys_across_shards_per_database() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let first_key = b"user:1001".to_vec();
+        let first_shard = core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"user:2002".to_vec();
+        let mut second_shard = core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix += 1;
+            second_key = format!("user:2002:{suffix}").into_bytes();
+            second_shard = core.resolve_shard_for_key(&second_key);
+        }
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![first_key.clone(), b"alpha".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![second_key.clone(), b"beta".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            1,
+            &CommandFrame::new("SET", vec![b"db1:key".to_vec(), b"value".to_vec()]),
+        );
+
+        assert_that!(core.db_size(0), eq(2_usize));
+        assert_that!(core.db_size(1), eq(1_usize));
+        assert_that!(core.db_size(2), eq(0_usize));
     }
 }
