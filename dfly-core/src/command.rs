@@ -32,6 +32,8 @@ pub enum CommandReply {
     BulkString(Vec<u8>),
     /// RESP null bulk string (`$-1`).
     Null,
+    /// RESP integer reply (`:<n>`).
+    Integer(i64),
     /// `-ERR ...` style error.
     Error(String),
 }
@@ -56,6 +58,7 @@ impl CommandReply {
                 output
             }
             Self::Null => b"$-1\r\n".to_vec(),
+            Self::Integer(value) => format!(":{value}\r\n").into_bytes(),
             Self::Error(message) => {
                 let mut output = Vec::with_capacity(message.len() + 6);
                 output.extend_from_slice(b"-ERR ");

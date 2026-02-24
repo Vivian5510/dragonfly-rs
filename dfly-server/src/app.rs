@@ -297,6 +297,7 @@ fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
             output
         }
         (_, CommandReply::SimpleString(message)) => format!("{message}\r\n").into_bytes(),
+        (_, CommandReply::Integer(value)) => format!("{value}\r\n").into_bytes(),
         (_, CommandReply::BulkString(payload)) => {
             let mut output = payload;
             output.extend_from_slice(b"\r\n");
