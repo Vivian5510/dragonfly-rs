@@ -4,21 +4,21 @@ pub mod plan;
 pub mod scheduler;
 pub mod session;
 
-use scheduler::NoopTransactionScheduler;
+use scheduler::InMemoryTransactionScheduler;
 
 /// Transaction subsystem bootstrap module.
 #[derive(Debug, Default)]
 pub struct TransactionModule {
     /// Current scheduler implementation used by the server composition root.
-    pub scheduler: NoopTransactionScheduler,
+    pub scheduler: InMemoryTransactionScheduler,
 }
 
 impl TransactionModule {
-    /// Creates the Unit 0 transaction module with a no-op scheduler placeholder.
+    /// Creates the transaction module with an in-memory scheduler.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            scheduler: NoopTransactionScheduler,
+            scheduler: InMemoryTransactionScheduler::default(),
         }
     }
 }

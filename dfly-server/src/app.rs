@@ -405,6 +405,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let db = connection.parser.context.db_index;
         let replies = self.execute_transaction_plan(db, &plan);
+        if let Err(error) = self.transaction.scheduler.conclude(plan.txid) {
+            return CommandReply::Error(format!("transaction completion failed: {error}"))
+                .to_resp_bytes();
+        }
         CommandReply::Array(replies).to_resp_bytes()
     }
 
