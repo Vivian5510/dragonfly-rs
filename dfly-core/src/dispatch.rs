@@ -237,6 +237,44 @@ impl DispatchState {
         }
     }
 
+    /// Runs one active-expiration pass on this shard state.
+    ///
+    /// Dragonfly uses periodic expiration fibers to reclaim stale keys even
+    /// when clients do not touch them. This pass mirrors that behavior by
+    /// scanning the expiration index and deleting up to `limit` expired keys.
+    ///
+    /// Returns the number of keys physically removed from this shard state.
+    pub fn active_expire_pass(&mut self, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+
+        let now = Self::now_unix_seconds();
+        let mut candidates = Vec::with_capacity(limit);
+        for (db, table) in &self.db_tables {
+            for (key, expire_at) in &table.expire {
+                if *expire_at <= now {
+                    candidates.push((*db, key.clone()));
+                    if candidates.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            if candidates.len() >= limit {
+                break;
+            }
+        }
+
+        let mut removed = 0_usize;
+        for (db, key) in candidates {
+            if self.remove_key(db, &key).is_some() {
+                self.bump_key_version(db, &key);
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
     /// Number of keys currently stored in one logical DB.
     #[must_use]
     pub fn db_len(&self, db: DbIndex) -> usize {

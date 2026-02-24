@@ -155,6 +155,15 @@ impl SharedCore {
         self.with_core(|core| core.keys_in_slot(db, slot))
     }
 
+    /// Runs one active-expiration pass on every shard.
+    ///
+    /// `limit_per_shard` bounds the number of expired keys deleted by each shard
+    /// in this pass. Returns the total number of removed keys across all shards.
+    #[must_use]
+    pub fn active_expire_pass(&self, limit_per_shard: usize) -> usize {
+        self.with_core_mut(|core| core.active_expire_pass(limit_per_shard))
+    }
+
     /// Selects target shard for one command.
     #[must_use]
     pub fn resolve_target_shard(&self, frame: &CommandFrame) -> u16 {
@@ -605,6 +614,16 @@ impl CoreModule {
         keys
     }
 
+    /// Runs one active-expiration pass on each shard state.
+    ///
+    /// Returns the total number of keys removed across all shards.
+    pub fn active_expire_pass(&mut self, limit_per_shard: usize) -> usize {
+        self.shard_states
+            .iter_mut()
+            .map(|state| state.active_expire_pass(limit_per_shard))
+            .sum()
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -768,12 +787,16 @@ fn parse_class_atom(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandRouting, CoreModule, SingleKeyAccess, classify_single_key_access};
+    use super::{
+        CommandRouting, CoreModule, CoreSnapshot, SingleKeyAccess, SnapshotEntry,
+        classify_single_key_access,
+    };
     use crate::command::{CommandFrame, CommandReply};
     use dfly_cluster::slot::key_slot;
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[rstest]
     fn core_execute_routes_set_get_through_shard_state() {
@@ -1280,5 +1303,101 @@ mod tests {
         assert_that!(&slot_keys, eq(&vec![first_key.clone(), second_key.clone()]));
         assert_that!(slot_keys.contains(&expired_key), eq(false));
         assert_that!(slot_keys.contains(&other_slot_key), eq(false));
+    }
+
+    #[rstest]
+    fn core_active_expire_pass_removes_expired_snapshot_entries() {
+        let mut core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let expired_key = b"active-expire:old".to_vec();
+        let live_key = b"active-expire:new".to_vec();
+        let expired_slot = key_slot(&expired_key);
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: expired_key.clone(),
+                    value: b"gone".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: live_key.clone(),
+                    value: b"alive".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_add(3600)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        assert_that!(core.db_size(0), eq(2_usize));
+
+        let removed = core.active_expire_pass(32);
+        assert_that!(removed, eq(1_usize));
+        assert_that!(core.db_size(0), eq(1_usize));
+        assert_that!(core.key_version(0, &expired_key), eq(2_u64));
+
+        let expired_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![expired_key.clone()]));
+        let live_value = core.execute_in_db(0, &CommandFrame::new("GET", vec![live_key.clone()]));
+        assert_that!(&expired_value, eq(&CommandReply::Null));
+        assert_that!(
+            &live_value,
+            eq(&CommandReply::BulkString(b"alive".to_vec()))
+        );
+
+        let table = core.shard_states[0]
+            .db_tables
+            .get(&0)
+            .expect("db table should still contain live key");
+        assert_that!(table.expire.contains_key(&expired_key), eq(false));
+        assert_that!(
+            table
+                .slot_keys
+                .get(&expired_slot)
+                .is_some_and(|keys| keys.contains(&expired_key)),
+            eq(false)
+        );
+    }
+
+    #[rstest]
+    fn core_active_expire_pass_honors_limit_per_shard() {
+        let mut core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: b"active-expire:one".to_vec(),
+                    value: b"1".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: b"active-expire:two".to_vec(),
+                    value: b"2".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        let first_removed = core.active_expire_pass(1);
+        assert_that!(first_removed, eq(1_usize));
+        assert_that!(core.db_size(0), eq(1_usize));
+
+        let second_removed = core.active_expire_pass(1);
+        assert_that!(second_removed, eq(1_usize));
+        assert_that!(core.db_size(0), eq(0_usize));
     }
 }
