@@ -1432,29 +1432,40 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
 
-        // WAIT returns the number of replicas that acknowledged the master offset captured
-        // at WAIT entry time. We poll until either enough replicas reached that offset or
-        // timeout elapses; this keeps Redis/Dragonfly return semantics while staying simple.
+        // WAIT returns the number of replicas that acknowledged the master offset captured at
+        // WAIT entry time. We block on replication ACK progress notifications instead of polling.
         let target_offset = self.replication.replication_offset();
-        let wait_deadline =
-            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_millis));
-        loop {
-            let replicated = u64::try_from(
+        let timeout = Duration::from_millis(timeout_millis);
+        let wait_started_at = std::time::Instant::now();
+        let current_replica_count = || {
+            u64::try_from(
                 self.replication
                     .acked_replica_count_at_or_above(target_offset),
             )
-            .unwrap_or(u64::MAX);
-            if replicated >= required {
-                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
-            }
-            if timeout_millis == 0 {
-                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
-            }
-            if wait_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
+            .unwrap_or(u64::MAX)
+        };
+        let integer_reply =
+            |replicated: u64| CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
+
+        loop {
+            let observed_progress = self.replication.ack_progress_token();
+            let replicated = current_replica_count();
+            if replicated >= required || timeout.is_zero() {
+                return integer_reply(replicated);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            let elapsed = wait_started_at.elapsed();
+            if elapsed >= timeout {
+                return integer_reply(replicated);
+            }
+
+            let remaining = timeout.saturating_sub(elapsed);
+            let progress = self
+                .replication
+                .wait_for_ack_progress(observed_progress, remaining);
+            if !progress {
+                return integer_reply(current_replica_count());
+            }
         }
     }
 

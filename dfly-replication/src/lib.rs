@@ -5,9 +5,60 @@ pub mod state;
 
 use journal::{InMemoryJournal, JournalEntry};
 use state::{FlowSyncType, ReplicaSyncState, ReplicationState, SyncSessionError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+/// ACK progress notifier used by `WAIT`-style blocking operations.
+#[derive(Debug, Clone)]
+struct AckProgressTracker {
+    epoch: Arc<(Mutex<u64>, Condvar)>,
+}
+
+impl AckProgressTracker {
+    fn new() -> Self {
+        Self {
+            epoch: Arc::new((Mutex::new(0), Condvar::new())),
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        let (lock, _) = &*self.epoch;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn notify_progress(&self) {
+        let (lock, condvar) = &*self.epoch;
+        let mut epoch = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *epoch = epoch.saturating_add(1);
+        drop(epoch);
+        condvar.notify_all();
+    }
+
+    fn wait_for_progress_since(&self, observed_epoch: u64, timeout: Duration) -> bool {
+        let (lock, condvar) = &*self.epoch;
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard != observed_epoch {
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let wait_result = condvar.wait_timeout_while(guard, timeout, |current_epoch| {
+            *current_epoch == observed_epoch
+        });
+        let (guard, _) = wait_result.unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard != observed_epoch
+    }
+}
 
 /// Replication subsystem bootstrap module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReplicationModule {
     /// Whether replication is enabled at bootstrap.
     pub enabled: bool,
@@ -15,6 +66,8 @@ pub struct ReplicationModule {
     pub journal: InMemoryJournal,
     /// Replication state and control-plane metadata.
     pub state: ReplicationState,
+    /// Event stream for ACK progress notifications consumed by `WAIT`.
+    ack_progress: AckProgressTracker,
 }
 
 impl ReplicationModule {
@@ -25,6 +78,7 @@ impl ReplicationModule {
             enabled,
             journal: InMemoryJournal::new(),
             state: ReplicationState::default(),
+            ack_progress: AckProgressTracker::new(),
         }
     }
 
@@ -82,6 +136,7 @@ impl ReplicationModule {
     /// Records one replica ACK offset.
     pub fn record_replica_ack(&mut self, ack_lsn: u64) {
         self.state.record_ack_lsn(ack_lsn);
+        self.ack_progress.notify_progress();
     }
 
     /// Returns highest acknowledged LSN from replicas.
@@ -169,14 +224,34 @@ impl ReplicationModule {
         listening_port: u16,
         ack_lsn: u64,
     ) -> bool {
-        self.state
-            .record_replica_ack_for_endpoint(address, listening_port, ack_lsn)
+        let recorded = self
+            .state
+            .record_replica_ack_for_endpoint(address, listening_port, ack_lsn);
+        if recorded {
+            self.ack_progress.notify_progress();
+        }
+        recorded
     }
 
     /// Counts replicas acknowledged at or above one target offset.
     #[must_use]
     pub fn acked_replica_count_at_or_above(&self, offset: u64) -> usize {
         self.state.acked_replica_count_at_or_above(offset)
+    }
+
+    /// Returns an ACK progress token used by blocking waiters to detect fresh ACK activity.
+    #[must_use]
+    pub fn ack_progress_token(&self) -> u64 {
+        self.ack_progress.snapshot()
+    }
+
+    /// Blocks until ACK progress token advances or timeout elapses.
+    ///
+    /// Returns `true` when progress advanced, `false` when timeout elapsed unchanged.
+    #[must_use]
+    pub fn wait_for_ack_progress(&self, observed_token: u64, timeout: Duration) -> bool {
+        self.ack_progress
+            .wait_for_progress_since(observed_token, timeout)
     }
 
     /// Creates one sync session id used by `DFLY` replication commands.
@@ -271,6 +346,7 @@ impl ReplicationModule {
     pub fn reset_after_snapshot_load(&mut self) {
         self.journal.reset();
         self.state.reset_after_snapshot_load();
+        self.ack_progress.notify_progress();
     }
 }
 
@@ -281,6 +357,8 @@ mod tests {
     use crate::state::FlowSyncType;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     #[rstest]
     fn flow_journal_entries_returns_suffix_for_partial_flow() {
@@ -418,5 +496,42 @@ mod tests {
         assert_that!(replication.journal_entries().is_empty(), eq(true));
         assert_that!(replication.journal_lsn(), eq(1_u64));
         assert_that!(replication.is_known_sync_session(&sync_id), eq(false));
+    }
+
+    #[rstest]
+    fn wait_for_ack_progress_times_out_without_new_ack() {
+        let replication = ReplicationModule::new(true);
+        let token = replication.ack_progress_token();
+
+        let advanced = replication.wait_for_ack_progress(token, Duration::from_millis(5));
+        assert_that!(advanced, eq(false));
+    }
+
+    #[rstest]
+    fn wait_for_ack_progress_unblocks_after_endpoint_ack_update() {
+        let mut replication = ReplicationModule::new(true);
+        replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET wait key".to_vec(),
+        });
+        replication.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+
+        let observed = replication.ack_progress_token();
+        let wait_replication = replication.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let wait_barrier = Arc::clone(&barrier);
+        let waiter = std::thread::spawn(move || {
+            wait_barrier.wait();
+            wait_replication.wait_for_ack_progress(observed, Duration::from_millis(200))
+        });
+
+        barrier.wait();
+        let recorded = replication.record_replica_ack_for_endpoint("10.0.0.1", 7001, 1);
+        assert_that!(recorded, eq(true));
+
+        let advanced = waiter.join().expect("ack wait thread should not panic");
+        assert_that!(advanced, eq(true));
     }
 }
