@@ -38,6 +38,12 @@ impl SlotRouter {
         debug_assert!(slot <= MAX_SLOT_ID);
         self.owned.iter().copied().any(|range| range.contains(slot))
     }
+
+    /// Returns currently owned slot ranges in insertion order.
+    #[must_use]
+    pub fn owned_ranges(&self) -> &[SlotRange] {
+        &self.owned
+    }
 }
 
 /// Computes Redis-compatible hash slot for one key.

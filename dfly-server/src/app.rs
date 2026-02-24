@@ -370,7 +370,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         frame: &CommandFrame,
     ) -> CommandReply {
         match frame.name.as_str() {
-            "CLUSTER" => Self::execute_cluster(frame),
+            "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
@@ -441,7 +441,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.core.execute_in_db(db, frame)
     }
 
-    fn execute_cluster(frame: &CommandFrame) -> CommandReply {
+    fn execute_cluster(&self, frame: &CommandFrame) -> CommandReply {
         let Some(subcommand_raw) = frame.args.first() else {
             return CommandReply::Error(
                 "wrong number of arguments for 'CLUSTER' command".to_owned(),
@@ -453,6 +453,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         match subcommand.to_ascii_uppercase().as_str() {
             "KEYSLOT" => Self::execute_cluster_keyslot(frame),
+            "SLOTS" => self.execute_cluster_slots(frame),
             _ => CommandReply::Error(format!("unknown CLUSTER subcommand '{subcommand}'")),
         }
     }
@@ -464,6 +465,32 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
         CommandReply::Integer(i64::from(key_slot(&frame.args[1])))
+    }
+
+    fn execute_cluster_slots(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 1 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'CLUSTER SLOTS' command".to_owned(),
+            );
+        }
+
+        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
+        let slots = self
+            .cluster
+            .owned_ranges()
+            .iter()
+            .map(|range| {
+                CommandReply::Array(vec![
+                    CommandReply::Integer(i64::from(range.start)),
+                    CommandReply::Integer(i64::from(range.end)),
+                    CommandReply::Array(vec![
+                        CommandReply::BulkString(host.as_bytes().to_vec()),
+                        CommandReply::Integer(port),
+                    ]),
+                ])
+            })
+            .collect::<Vec<_>>();
+        CommandReply::Array(slots)
     }
 
     fn execute_mget(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
@@ -667,6 +694,14 @@ fn parse_journal_command_frame(payload: &[u8]) -> DflyResult<CommandFrame> {
     }
 
     Ok(CommandFrame::new(command.name, command.args))
+}
+
+fn split_endpoint_host_port(endpoint: &str) -> (String, i64) {
+    let Some((host, port_text)) = endpoint.rsplit_once(':') else {
+        return (endpoint.to_owned(), 0);
+    };
+    let port = port_text.parse::<i64>().unwrap_or(0);
+    (host.to_owned(), port)
 }
 
 /// Encodes a canonical reply according to the target client protocol.
@@ -1259,6 +1294,32 @@ mod tests {
             .feed_connection_bytes(&mut connection, &command)
             .expect("CLUSTER KEYSLOT should execute");
         let expected = vec![format!(":{}\r\n", key_slot(key)).into_bytes()];
+        assert_that!(&reply, eq(&expected));
+    }
+
+    #[rstest]
+    fn resp_cluster_slots_returns_owned_ranges() {
+        let config = RuntimeConfig {
+            cluster_mode: ClusterMode::Emulated,
+            ..RuntimeConfig::default()
+        };
+        let mut app = ServerApp::new(config);
+        app.cluster.set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let command = resp_command(&[b"CLUSTER", b"SLOTS"]);
+        let reply = app
+            .feed_connection_bytes(&mut connection, &command)
+            .expect("CLUSTER SLOTS should execute");
+        let expected = vec![
+            b"*2\r\n*3\r\n:0\r\n:99\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n*3\r\n:200\r\n:300\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n".to_vec(),
+        ];
         assert_that!(&reply, eq(&expected));
     }
 

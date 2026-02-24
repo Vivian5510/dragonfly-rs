@@ -52,6 +52,12 @@ impl ClusterModule {
         let slot = key_slot(key);
         if self.owns_key(key) { None } else { Some(slot) }
     }
+
+    /// Returns currently owned slot ranges for this node.
+    #[must_use]
+    pub fn owned_ranges(&self) -> &[SlotRange] {
+        self.slot_router.owned_ranges()
+    }
 }
 
 #[cfg(test)]
