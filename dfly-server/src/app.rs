@@ -1797,6 +1797,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
 
             let frame = parse_journal_command_frame(&entry.payload)?;
+            // Journal replay should follow the same shard-ingress ordering contract as direct
+            // command execution, so restored state observes runtime barrier semantics.
+            if let Err(error) = self.dispatch_direct_command_runtime(&frame) {
+                return Err(DflyError::Protocol(format!(
+                    "journal replay runtime dispatch failed for txid {}: {error}",
+                    entry.txid
+                )));
+            }
             let reply = self.execute_command_without_side_effects(entry.db, &frame);
             if let CommandReply::Error(message) = reply {
                 return Err(DflyError::Protocol(format!(
@@ -7043,6 +7051,89 @@ mod tests {
             panic!("expected protocol error");
         };
         assert_that!(message.contains("not available"), eq(true));
+    }
+
+    #[rstest]
+    fn journal_replay_dispatches_runtime_for_single_key_command() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"journal:rt:set".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let payload = resp_command(&[b"SET", &key, b"value"]);
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload,
+        });
+
+        let applied = app
+            .recover_from_replication_journal()
+            .expect("journal replay should succeed");
+        assert_that!(applied, eq(1_usize));
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        let runtime = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+        assert_that!(runtime.len(), eq(1_usize));
+        assert_that!(&runtime[0].command.name, eq(&"SET".to_owned()));
+    }
+
+    #[rstest]
+    fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let first_key = b"journal:rt:mset:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"journal:rt:mset:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("journal:rt:mset:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload,
+        });
+
+        let applied = app
+            .recover_from_replication_journal()
+            .expect("journal replay should succeed");
+        assert_that!(applied, eq(1_usize));
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        assert_that!(
+            app.runtime
+                .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+        let first_runtime = app
+            .runtime
+            .drain_processed_for_shard(first_shard)
+            .expect("drain should succeed");
+        let second_runtime = app
+            .runtime
+            .drain_processed_for_shard(second_shard)
+            .expect("drain should succeed");
+        assert_that!(first_runtime.len(), eq(1_usize));
+        assert_that!(second_runtime.len(), eq(1_usize));
+        assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
+        assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
     }
 
     #[rstest]
