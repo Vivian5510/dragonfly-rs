@@ -240,4 +240,136 @@ impl ReplicationModule {
         }
         self.journal_contains_lsn(offset.saturating_add(1))
     }
+
+    /// Returns the journal payload slice visible to one negotiated sync flow.
+    ///
+    /// `FULL` flows do not read from journal backlog and therefore return an empty entry list.
+    /// `PARTIAL` flows return entries starting from `start_offset + 1` (inclusive).
+    ///
+    /// Returns `None` when the sync/session flow tuple is unknown or when partial backlog
+    /// entries are no longer available in memory.
+    #[must_use]
+    pub fn flow_journal_entries(&self, sync_id: &str, flow_id: usize) -> Option<Vec<JournalEntry>> {
+        let flow = self.state.sync_flow(sync_id, flow_id)?;
+        match flow.sync_type {
+            FlowSyncType::Full => Some(Vec::new()),
+            FlowSyncType::Partial => {
+                let start_offset = flow.start_offset?;
+                self.journal_entries_from_lsn(start_offset.saturating_add(1))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplicationModule;
+    use crate::journal::{InMemoryJournal, JournalEntry, JournalOp};
+    use crate::state::FlowSyncType;
+    use googletest::prelude::*;
+    use rstest::rstest;
+
+    #[rstest]
+    fn flow_journal_entries_returns_suffix_for_partial_flow() {
+        let mut replication = ReplicationModule::new(true);
+        replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow a".to_vec(),
+        });
+        replication.append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow b".to_vec(),
+        });
+        replication.append_journal(JournalEntry {
+            txid: 3,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow c".to_vec(),
+        });
+
+        let sync_id = replication.create_sync_session(1);
+        let eof_token = replication.allocate_flow_eof_token();
+        assert_that!(
+            replication.register_sync_flow(&sync_id, 0, FlowSyncType::Partial, Some(1), eof_token),
+            ok(())
+        );
+
+        let suffix = replication
+            .flow_journal_entries(&sync_id, 0)
+            .expect("partial flow should return journal suffix");
+        assert_that!(suffix.len(), eq(2_usize));
+        assert_that!(suffix[0].txid, eq(2_u64));
+        assert_that!(suffix[1].txid, eq(3_u64));
+    }
+
+    #[rstest]
+    fn flow_journal_entries_returns_empty_for_full_flow() {
+        let mut replication = ReplicationModule::new(true);
+        replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow v".to_vec(),
+        });
+
+        let sync_id = replication.create_sync_session(1);
+        let eof_token = replication.allocate_flow_eof_token();
+        assert_that!(
+            replication.register_sync_flow(&sync_id, 0, FlowSyncType::Full, None, eof_token),
+            ok(())
+        );
+
+        let entries = replication
+            .flow_journal_entries(&sync_id, 0)
+            .expect("full flow should return a valid empty journal slice");
+        assert_that!(entries.is_empty(), eq(true));
+    }
+
+    #[rstest]
+    fn flow_journal_entries_returns_none_for_unknown_or_stale_flow_state() {
+        let mut replication = ReplicationModule::new(true);
+        replication.journal = InMemoryJournal::with_backlog(1);
+        replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow old".to_vec(),
+        });
+        replication.append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"SET flow new".to_vec(),
+        });
+
+        assert_that!(
+            replication.flow_journal_entries("SYNC404", 0).is_none(),
+            eq(true)
+        );
+
+        let sync_id = replication.create_sync_session(2);
+        let stale_flow_token = replication.allocate_flow_eof_token();
+        assert_that!(
+            replication.register_sync_flow(
+                &sync_id,
+                0,
+                FlowSyncType::Partial,
+                Some(0),
+                stale_flow_token
+            ),
+            ok(())
+        );
+        assert_that!(
+            replication.flow_journal_entries(&sync_id, 0).is_none(),
+            eq(true)
+        );
+        assert_that!(
+            replication.flow_journal_entries(&sync_id, 1).is_none(),
+            eq(true)
+        );
+    }
 }

@@ -258,6 +258,19 @@ impl ReplicationState {
             .map(|session| session.state)
     }
 
+    /// Returns negotiated flow descriptor for one sync session and flow id.
+    ///
+    /// Returns `None` when session id is unknown, flow id is out of range, or the flow
+    /// slot has not been registered yet.
+    #[must_use]
+    pub fn sync_flow(&self, sync_id: &str, flow_id: usize) -> Option<&SyncFlow> {
+        let session = self
+            .sync_sessions
+            .iter()
+            .find(|session| session.id == sync_id)?;
+        session.flows.get(flow_id)?.as_ref()
+    }
+
     /// Registers one flow under one sync session.
     ///
     /// This command is only valid while the session is in `Preparation`.
