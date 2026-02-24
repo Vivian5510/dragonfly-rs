@@ -371,10 +371,63 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ) -> CommandReply {
         match frame.name.as_str() {
             "CLUSTER" => Self::execute_cluster(frame),
+            "DFLY" => self.execute_dfly_admin(frame),
             "MGET" => self.execute_mget(db, frame),
             "MSET" => self.execute_mset(db, frame),
             "GET" | "SET" | "EXPIRE" | "TTL" => self.execute_key_command(db, frame),
             _ => self.core.execute_in_db(db, frame),
+        }
+    }
+
+    fn execute_dfly_admin(&mut self, frame: &CommandFrame) -> CommandReply {
+        let Some(subcommand_raw) = frame.args.first() else {
+            return CommandReply::Error("wrong number of arguments for 'DFLY' command".to_owned());
+        };
+        let Ok(subcommand) = std::str::from_utf8(subcommand_raw) else {
+            return CommandReply::Error("DFLY subcommand must be valid UTF-8".to_owned());
+        };
+
+        match subcommand.to_ascii_uppercase().as_str() {
+            "SAVE" => self.execute_dfly_save(frame),
+            "LOAD" => self.execute_dfly_load(frame),
+            _ => CommandReply::Error(format!("unknown DFLY subcommand '{subcommand}'")),
+        }
+    }
+
+    fn execute_dfly_save(&mut self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'DFLY SAVE' command".to_owned(),
+            );
+        }
+        let Ok(path) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error("DFLY SAVE path must be valid UTF-8".to_owned());
+        };
+
+        let snapshot = self.core.export_snapshot();
+        match self.storage.write_snapshot_file(path, &snapshot) {
+            Ok(()) => CommandReply::SimpleString("OK".to_owned()),
+            Err(error) => CommandReply::Error(format!("DFLY SAVE failed: {error}")),
+        }
+    }
+
+    fn execute_dfly_load(&mut self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error(
+                "wrong number of arguments for 'DFLY LOAD' command".to_owned(),
+            );
+        }
+        let Ok(path) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error("DFLY LOAD path must be valid UTF-8".to_owned());
+        };
+
+        let snapshot = match self.storage.read_snapshot_file(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return CommandReply::Error(format!("DFLY LOAD failed: {error}")),
+        };
+        match self.core.import_snapshot(&snapshot) {
+            Ok(()) => CommandReply::SimpleString("OK".to_owned()),
+            Err(error) => CommandReply::Error(format!("DFLY LOAD failed: {error}")),
         }
     }
 
@@ -693,6 +746,8 @@ mod tests {
     use dfly_replication::journal::{JournalEntry, JournalOp};
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[rstest]
     fn resp_connection_executes_set_then_get() {
@@ -1266,6 +1321,59 @@ mod tests {
     }
 
     #[rstest]
+    fn dfly_save_then_load_restores_snapshot_file() {
+        let path = unique_test_snapshot_path("dfly-save-load");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+
+        let mut source = ServerApp::new(RuntimeConfig::default());
+        let mut source_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_conn,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+            )
+            .expect("seed SET should succeed");
+
+        let save = resp_command(&[b"DFLY", b"SAVE", &path_bytes]);
+        let save_reply = source
+            .feed_connection_bytes(&mut source_conn, &save)
+            .expect("DFLY SAVE should execute");
+        assert_that!(&save_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let mut restored = ServerApp::new(RuntimeConfig::default());
+        let mut restored_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let load = resp_command(&[b"DFLY", b"LOAD", &path_bytes]);
+        let load_reply = restored
+            .feed_connection_bytes(&mut restored_conn, &load)
+            .expect("DFLY LOAD should execute");
+        assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let get_reply = restored
+            .feed_connection_bytes(&mut restored_conn, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .expect("GET after LOAD should succeed");
+        assert_that!(&get_reply, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[rstest]
+    fn dfly_load_reports_missing_file_error() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let path = unique_test_snapshot_path("dfly-missing");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+
+        let load = resp_command(&[b"DFLY", b"LOAD", &path_bytes]);
+        let reply = app
+            .feed_connection_bytes(&mut conn, &load)
+            .expect("DFLY LOAD should parse");
+        assert_that!(
+            reply[0].starts_with(b"-ERR DFLY LOAD failed: io error:"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
     fn journal_replay_restores_state_in_fresh_server() {
         let mut source = ServerApp::new(RuntimeConfig::default());
         let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -1361,5 +1469,12 @@ mod tests {
             payload.extend_from_slice(b"\r\n");
         }
         payload
+    }
+
+    fn unique_test_snapshot_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!("dragonfly-rs-{tag}-{nanos}.snapshot"))
     }
 }

@@ -26,4 +26,8 @@ pub enum DflyError {
     /// Placeholder for not-yet-implemented feature paths.
     #[error("feature is not implemented yet: {0}")]
     NotImplemented(&'static str),
+
+    /// Filesystem I/O failed.
+    #[error("io error: {0}")]
+    Io(String),
 }
