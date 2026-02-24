@@ -174,6 +174,7 @@ impl ReplicationState {
             .find(|entry| entry.address == address && entry.listening_port == listening_port)
         {
             existing.state = ReplicaSyncState::Preparation;
+            existing.last_acked_lsn = 0;
         } else {
             self.replicas.push(ReplicaEndpoint {
                 address,
@@ -552,5 +553,22 @@ mod tests {
         assert_that!(state.last_acked_lsn, eq(3_u64));
         assert_that!(state.acked_replica_count_at_or_above(3), eq(1_usize));
         assert_that!(state.acked_replica_count_at_or_above(2), eq(2_usize));
+    }
+
+    #[rstest]
+    fn re_registering_replica_endpoint_resets_endpoint_ack_progress() {
+        let mut state = ReplicationState::default();
+        state.set_last_lsn_from_next_cursor(4);
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        assert_that!(
+            state.record_replica_ack_for_endpoint("10.0.0.1", 7001, 3),
+            eq(true)
+        );
+        assert_that!(state.acked_replica_count_at_or_above(3), eq(1_usize));
+
+        state.register_replica_endpoint("10.0.0.1".to_owned(), 7001);
+        assert_that!(state.replicas[0].state, eq(ReplicaSyncState::Preparation));
+        assert_that!(state.replicas[0].last_acked_lsn, eq(0_u64));
+        assert_that!(state.acked_replica_count_at_or_above(1), eq(0_usize));
     }
 }

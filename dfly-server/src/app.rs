@@ -5933,6 +5933,43 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_wait_does_not_reuse_ack_after_replica_re_registers() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut client = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica REPLCONF LISTENING-PORT should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
+            .expect("replica ACK should parse");
+
+        let wait_after_ack = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_after_ack, eq(&vec![b":1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut replica,
+                &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+            )
+            .expect("replica REPLCONF LISTENING-PORT re-registration should succeed");
+
+        let wait_after_reregister = app
+            .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
+        assert_that!(&wait_after_reregister, eq(&vec![b":0\r\n".to_vec()]));
+    }
+
+    #[rstest]
     fn resp_info_replication_reports_per_replica_state_and_lag() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut replica1 = ServerApp::new_connection(ClientProtocol::Resp);
