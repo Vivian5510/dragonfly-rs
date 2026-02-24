@@ -89,4 +89,20 @@ impl ReplicationModule {
     pub fn connected_replicas(&self) -> usize {
         self.state.connected_replicas
     }
+
+    /// Returns whether partial sync can continue from one replica offset.
+    ///
+    /// The offset semantics follow Redis/Dragonfly handshake:
+    /// replica sends the last applied offset, so the first required entry is `offset + 1`.
+    #[must_use]
+    pub fn can_partial_sync_from_offset(&self, offset: u64) -> bool {
+        let current_offset = self.replication_offset();
+        if offset > current_offset {
+            return false;
+        }
+        if offset == current_offset {
+            return true;
+        }
+        self.journal_contains_lsn(offset.saturating_add(1))
+    }
 }

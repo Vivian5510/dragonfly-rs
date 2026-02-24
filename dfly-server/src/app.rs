@@ -411,6 +411,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         match frame.name.as_str() {
             "INFO" => self.execute_info(frame),
             "ROLE" => self.execute_role(frame),
+            "PSYNC" => self.execute_psync(frame),
             "REPLCONF" => self.execute_replconf(frame),
             "CLUSTER" => self.execute_cluster(frame),
             "DFLY" => self.execute_dfly_admin(frame),
@@ -510,6 +511,34 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_psync(&self, frame: &CommandFrame) -> CommandReply {
+        if frame.args.len() != 2 {
+            return CommandReply::Error("wrong number of arguments for 'PSYNC' command".to_owned());
+        }
+
+        let Ok(requested_replid) = std::str::from_utf8(&frame.args[0]) else {
+            return CommandReply::Error("PSYNC replid must be valid UTF-8".to_owned());
+        };
+        let Ok(requested_offset_text) = std::str::from_utf8(&frame.args[1]) else {
+            return CommandReply::Error("PSYNC offset must be valid UTF-8".to_owned());
+        };
+        let Ok(requested_offset) = requested_offset_text.parse::<i64>() else {
+            return CommandReply::Error("PSYNC offset must be a valid integer".to_owned());
+        };
+
+        let master_replid = self.replication.master_replid();
+        let master_offset = self.replication.replication_offset();
+        let requested_offset_u64 = u64::try_from(requested_offset).ok();
+        if requested_replid == master_replid
+            && requested_offset_u64
+                .is_some_and(|offset| self.replication.can_partial_sync_from_offset(offset))
+        {
+            return CommandReply::SimpleString("CONTINUE".to_owned());
+        }
+
+        CommandReply::SimpleString(format!("FULLRESYNC {master_replid} {master_offset}"))
     }
 
     fn execute_dfly_admin(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1437,6 +1466,66 @@ mod tests {
         assert_that!(payload.contains("\r\n$5\r\nSYNC1\r\n"), eq(true));
         let shard_and_version = format!(":{}\r\n:1\r\n", app.config.shard_count.get());
         assert_that!(payload.contains(&shard_and_version), eq(true));
+    }
+
+    #[rstest]
+    fn resp_psync_with_unknown_replid_returns_full_resync_header() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", b"?", b"-1"]))
+            .expect("PSYNC should succeed");
+        let expected =
+            format!("+FULLRESYNC {} 0\r\n", app.replication.master_replid()).into_bytes();
+        assert_that!(&reply, eq(&vec![expected]));
+    }
+
+    #[rstest]
+    fn resp_psync_returns_continue_when_offset_is_available() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"psync:key", b"psync:value"]),
+            )
+            .expect("SET should succeed");
+
+        let replid = app.replication.master_replid().as_bytes().to_vec();
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", &replid, b"0"]))
+            .expect("PSYNC should succeed");
+        assert_that!(&reply, eq(&vec![b"+CONTINUE\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        app.replication.journal = InMemoryJournal::with_backlog(1);
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"stale:key", b"v1"]),
+            )
+            .expect("first SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"stale:key", b"v2"]),
+            )
+            .expect("second SET should succeed");
+
+        let replid = app.replication.master_replid().as_bytes().to_vec();
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", &replid, b"0"]))
+            .expect("PSYNC should succeed");
+        let expected =
+            format!("+FULLRESYNC {} 2\r\n", app.replication.master_replid()).into_bytes();
+        assert_that!(&reply, eq(&vec![expected]));
     }
 
     #[rstest]
