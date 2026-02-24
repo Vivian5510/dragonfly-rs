@@ -218,23 +218,17 @@ impl DispatchState {
         keys
     }
 
-    /// Returns live key count for one slot and lazily purges already-expired entries.
-    ///
-    /// Snapshot loads can temporarily materialize expired keys until active expiry runs.
-    /// Slot-cardinality calls trigger bounded lazy cleanup so slot indexes converge
-    /// without waiting for a periodic maintenance pass.
-    #[must_use]
-    pub fn count_live_keys_in_slot(&mut self, db: DbIndex, slot: u16) -> usize {
+    fn collect_live_slot_keys(&mut self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
         let Some(slot_keys) = self
             .db_table(db)
             .and_then(|table| table.slot_keys.get(&slot))
             .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
         else {
-            return 0;
+            return Vec::new();
         };
 
         let now = Self::now_unix_seconds();
-        let mut live = 0_usize;
+        let mut live = Vec::new();
         for key in slot_keys {
             let expire_at = self
                 .db_table(db)
@@ -252,7 +246,7 @@ impl DispatchState {
                         .and_then(|table| table.prime.get(&key))
                         .is_some()
                     {
-                        live = live.saturating_add(1);
+                        live.push(key);
                     } else if let Some(table) = self.db_tables.get_mut(&db) {
                         Self::decrement_slot_stat(table, &key);
                     }
@@ -260,6 +254,24 @@ impl DispatchState {
             }
         }
         live
+    }
+
+    /// Returns live keys for one slot and lazily purges already-expired entries.
+    #[must_use]
+    pub fn slot_keys_live(&mut self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
+        let mut live = self.collect_live_slot_keys(db, slot);
+        live.sort_unstable();
+        live
+    }
+
+    /// Returns live key count for one slot and lazily purges already-expired entries.
+    ///
+    /// Snapshot loads can temporarily materialize expired keys until active expiry runs.
+    /// Slot-cardinality calls trigger bounded lazy cleanup so slot indexes converge
+    /// without waiting for a periodic maintenance pass.
+    #[must_use]
+    pub fn count_live_keys_in_slot(&mut self, db: DbIndex, slot: u16) -> usize {
+        self.collect_live_slot_keys(db, slot).len()
     }
 
     /// Returns tracked version for one key.

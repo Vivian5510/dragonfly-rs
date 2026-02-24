@@ -711,33 +711,13 @@ impl CoreModule {
     /// same expiration visibility rules as read commands.
     #[must_use]
     pub fn keys_in_slot(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0_u64, |duration| duration.as_secs());
         let mut keys = Vec::new();
 
         for state in &self.shard_states {
-            let state = state
+            let mut state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(table) = state.db_tables.get(&db) else {
-                continue;
-            };
-            let Some(slot_keys) = table.slot_keys.get(&slot) else {
-                continue;
-            };
-            for key in slot_keys {
-                let Some(value) = table.prime.get(key) else {
-                    continue;
-                };
-                if value
-                    .expire_at_unix_secs
-                    .is_some_and(|expire_at| expire_at <= now)
-                {
-                    continue;
-                }
-                keys.push(key.clone());
-            }
+            keys.extend(state.slot_keys_live(db, slot));
         }
 
         keys.sort_unstable();
@@ -1588,6 +1568,47 @@ mod tests {
         assert_that!(&slot_keys, eq(&vec![first_key.clone(), second_key.clone()]));
         assert_that!(slot_keys.contains(&expired_key), eq(false));
         assert_that!(slot_keys.contains(&other_slot_key), eq(false));
+    }
+
+    #[rstest]
+    fn core_keys_in_slot_lazily_purges_expired_snapshot_entries() {
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let expired_key = b"slot:keys:{lazy}:expired".to_vec();
+        let live_key = b"slot:keys:{lazy}:live".to_vec();
+        let slot = key_slot(&expired_key);
+        assert_that!(key_slot(&live_key), eq(slot));
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: expired_key.clone(),
+                    value: b"gone".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: live_key.clone(),
+                    value: b"alive".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_add(3600)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        assert_that!(core.db_size(0), eq(2_usize));
+        assert_that!(&core.keys_in_slot(0, slot), eq(&vec![live_key.clone()]));
+        assert_that!(core.db_size(0), eq(1_usize));
+        assert_that!(core.key_version(0, &expired_key), eq(2_u64));
+
+        let expired_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![expired_key.clone()]));
+        assert_that!(&expired_value, eq(&CommandReply::Null));
     }
 
     #[rstest]
