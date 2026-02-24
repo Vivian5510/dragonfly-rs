@@ -601,8 +601,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "MSET" => self.execute_mset(db, frame),
             "MSETNX" => self.execute_msetnx(db, frame),
             "GET" | "SET" | "TYPE" | "SETEX" | "GETSET" | "GETDEL" | "APPEND" | "STRLEN"
-            | "GETRANGE" | "SETRANGE" | "EXPIRE" | "EXPIREAT" | "TTL" | "EXPIRETIME"
-            | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
+            | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "TTL" | "PTTL"
+            | "EXPIRETIME" | "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => {
                 self.execute_key_command(db, frame)
             }
             _ => self.core.execute_in_db(db, frame),
@@ -1603,6 +1603,13 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
                 Some(JournalOp::Command)
             }
         }
+        ("PEXPIRE", CommandReply::Integer(1)) => {
+            if pexpire_is_delete(frame) {
+                Some(JournalOp::Expired)
+            } else {
+                Some(JournalOp::Command)
+            }
+        }
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("DEL", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
         ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
@@ -1644,6 +1651,15 @@ fn expireat_is_delete(frame: &CommandFrame) -> bool {
         .and_then(|timestamp| std::str::from_utf8(timestamp).ok())
         .and_then(|timestamp| timestamp.parse::<i64>().ok())
         .is_some_and(|timestamp| timestamp <= now)
+}
+
+fn pexpire_is_delete(frame: &CommandFrame) -> bool {
+    frame
+        .args
+        .get(1)
+        .and_then(|milliseconds| std::str::from_utf8(milliseconds).ok())
+        .and_then(|milliseconds| milliseconds.parse::<i64>().ok())
+        .is_some_and(|milliseconds| milliseconds <= 0)
 }
 
 fn parse_db_index_arg(arg: &[u8]) -> Result<u16, String> {
@@ -2000,6 +2016,44 @@ mod tests {
                 b"-ERR invalid expire time in 'SETEX' command\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn resp_pttl_and_pexpire_follow_millisecond_expiry_lifecycle() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"temp", b"value"]))
+            .expect("SET should execute");
+        let pttl_without_expire = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
+            .expect("PTTL should execute");
+        assert_that!(&pttl_without_expire, eq(&vec![b":-1\r\n".to_vec()]));
+
+        let pexpire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIRE", b"temp", b"1500"]),
+            )
+            .expect("PEXPIRE should execute");
+        assert_that!(&pexpire, eq(&vec![b":1\r\n".to_vec()]));
+
+        let pttl = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
+            .expect("PTTL should execute");
+        let pttl_value = parse_resp_integer(&pttl[0]);
+        assert_that!(pttl_value > 0, eq(true));
+
+        let pexpire_now = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"temp", b"0"]))
+            .expect("PEXPIRE should execute");
+        assert_that!(&pexpire_now, eq(&vec![b":1\r\n".to_vec()]));
+
+        let pttl_after = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
+            .expect("PTTL should execute");
+        assert_that!(&pttl_after, eq(&vec![b":-2\r\n".to_vec()]));
     }
 
     #[rstest]
@@ -2806,6 +2860,30 @@ mod tests {
             String::from_utf8_lossy(&entries[0].payload).contains("SETEX"),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn journal_records_pexpire_as_command_or_expired_by_argument() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"k", b"1000"]))
+            .expect("PEXPIRE with positive timeout should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should recreate key");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"k", b"0"]))
+            .expect("PEXPIRE with zero timeout should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(4_usize));
+        assert_that!(entries[1].op, eq(JournalOp::Command));
+        assert_that!(entries[3].op, eq(JournalOp::Expired));
     }
 
     #[rstest]

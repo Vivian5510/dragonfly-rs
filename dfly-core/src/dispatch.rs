@@ -69,6 +69,15 @@ impl DispatchState {
         }
     }
 
+    /// Returns current Unix timestamp in milliseconds.
+    #[must_use]
+    fn now_unix_millis() -> u64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Err(_) => 0,
+        }
+    }
+
     /// Returns mutable map for one logical DB, creating it when missing.
     fn db_map_mut(&mut self, db: DbIndex) -> &mut HashMap<Vec<u8>, ValueEntry> {
         self.db_kv.entry(db).or_default()
@@ -279,6 +288,11 @@ impl CommandRegistry {
             handler: handle_expire,
         });
         self.register(CommandSpec {
+            name: "PEXPIRE",
+            arity: CommandArity::Exact(2),
+            handler: handle_pexpire,
+        });
+        self.register(CommandSpec {
             name: "EXPIREAT",
             arity: CommandArity::Exact(2),
             handler: handle_expireat,
@@ -287,6 +301,11 @@ impl CommandRegistry {
             name: "TTL",
             arity: CommandArity::Exact(1),
             handler: handle_ttl,
+        });
+        self.register(CommandSpec {
+            name: "PTTL",
+            arity: CommandArity::Exact(1),
+            handler: handle_pttl,
         });
         self.register(CommandSpec {
             name: "EXPIRETIME",
@@ -661,6 +680,41 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     CommandReply::Integer(0)
 }
 
+fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let milliseconds = match parse_i64_arg(&frame.args[1], "PEXPIRE milliseconds") {
+        Ok(milliseconds) => milliseconds,
+        Err(error) => return CommandReply::Error(error),
+    };
+    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+        return CommandReply::Integer(0);
+    }
+
+    if milliseconds <= 0 {
+        if state.db_map_mut(db).remove(key).is_some() {
+            state.bump_key_version(db, key);
+            return CommandReply::Integer(1);
+        }
+        return CommandReply::Integer(0);
+    }
+
+    let Ok(expire_delta_millis) = u64::try_from(milliseconds) else {
+        return CommandReply::Error("PEXPIRE milliseconds is out of range".to_owned());
+    };
+    let now_millis = DispatchState::now_unix_millis();
+    let expire_at_millis = now_millis.saturating_add(expire_delta_millis);
+    let expire_at_secs = expire_at_millis.saturating_add(999) / 1000;
+
+    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
+        entry.expire_at_unix_secs = Some(expire_at_secs);
+        state.bump_key_version(db, key);
+        return CommandReply::Integer(1);
+    }
+    CommandReply::Integer(0)
+}
+
 fn handle_expireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
@@ -714,6 +768,34 @@ fn handle_ttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         return CommandReply::Integer(-2);
     }
     let remaining = expire_at.saturating_sub(now);
+    match i64::try_from(remaining) {
+        Ok(remaining) => CommandReply::Integer(remaining),
+        Err(_) => CommandReply::Integer(i64::MAX),
+    }
+}
+
+fn handle_pttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let key = &frame.args[0];
+    state.purge_expired_key(db, key);
+
+    let Some(expire_at_secs) = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .and_then(|entry| entry.expire_at_unix_secs)
+    else {
+        if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+            return CommandReply::Integer(-1);
+        }
+        return CommandReply::Integer(-2);
+    };
+
+    let now_millis = DispatchState::now_unix_millis();
+    let expire_at_millis = expire_at_secs.saturating_mul(1000);
+    if expire_at_millis <= now_millis {
+        let _ = state.db_map_mut(db).remove(key);
+        return CommandReply::Integer(-2);
+    }
+    let remaining = expire_at_millis.saturating_sub(now_millis);
     match i64::try_from(remaining) {
         Ok(remaining) => CommandReply::Integer(remaining),
         Err(_) => CommandReply::Integer(i64::MAX),
@@ -1250,6 +1332,56 @@ mod tests {
             &mut state,
         );
         assert_that!(&ttl_after_expire, eq(&CommandReply::Integer(-2)));
+    }
+
+    #[rstest]
+    fn dispatch_pttl_and_pexpire_lifecycle() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"temp".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+
+        let pttl_without_expire = registry.dispatch(
+            0,
+            &CommandFrame::new("PTTL", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&pttl_without_expire, eq(&CommandReply::Integer(-1)));
+
+        let pexpire = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIRE", vec![b"temp".to_vec(), b"1500".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&pexpire, eq(&CommandReply::Integer(1)));
+
+        let pttl = registry.dispatch(
+            0,
+            &CommandFrame::new("PTTL", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(pttl_ms) = pttl else {
+            panic!("PTTL must return integer");
+        };
+        assert_that!(pttl_ms > 0, eq(true));
+
+        let pexpire_now = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIRE", vec![b"temp".to_vec(), b"0".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&pexpire_now, eq(&CommandReply::Integer(1)));
+
+        let pttl_after = registry.dispatch(
+            0,
+            &CommandFrame::new("PTTL", vec![b"temp".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&pttl_after, eq(&CommandReply::Integer(-2)));
     }
 
     #[rstest]
