@@ -3,13 +3,14 @@
 use dfly_cluster::ClusterModule;
 use dfly_cluster::slot::key_slot;
 use dfly_common::config::{ClusterMode, RuntimeConfig};
+use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
 use dfly_core::CoreModule;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
-use dfly_facade::protocol::ClientProtocol;
+use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
 use dfly_search::SearchModule;
@@ -112,6 +113,17 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     pub fn load_snapshot_bytes(&mut self, payload: &[u8]) -> DflyResult<()> {
         let snapshot = self.storage.deserialize_snapshot(payload)?;
         self.core.import_snapshot(&snapshot)
+    }
+
+    /// Replays currently buffered replication journal entries into the in-memory core state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when a journal payload is not a valid single RESP command
+    /// or when command execution returns an error reply.
+    pub fn recover_from_replication_journal(&mut self) -> DflyResult<usize> {
+        let entries = self.replication.journal_entries().to_vec();
+        self.replay_journal_entries(&entries)
     }
 
     /// Creates a new logical client connection state.
@@ -411,6 +423,26 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         None
     }
 
+    fn replay_journal_entries(&mut self, entries: &[JournalEntry]) -> DflyResult<usize> {
+        let mut applied = 0_usize;
+        for entry in entries {
+            if matches!(entry.op, JournalOp::Ping | JournalOp::Lsn) {
+                continue;
+            }
+
+            let frame = parse_journal_command_frame(&entry.payload)?;
+            let reply = self.execute_command_without_side_effects(entry.db, &frame);
+            if let CommandReply::Error(message) = reply {
+                return Err(DflyError::Protocol(format!(
+                    "journal replay failed for txid {}: {message}",
+                    entry.txid
+                )));
+            }
+            applied = applied.saturating_add(1);
+        }
+        Ok(applied)
+    }
+
     fn allocate_txid(&mut self) -> TxId {
         let txid = self.next_txid;
         self.next_txid = self.next_txid.saturating_add(1);
@@ -506,6 +538,22 @@ fn append_resp_bulk(output: &mut Vec<u8>, payload: &[u8]) {
     output.extend_from_slice(b"\r\n");
 }
 
+fn parse_journal_command_frame(payload: &[u8]) -> DflyResult<CommandFrame> {
+    let parsed = parse_next_command(ClientProtocol::Resp, payload)?;
+    let ParseStatus::Complete { command, consumed } = parsed else {
+        return Err(DflyError::Protocol(
+            "journal payload does not contain one complete RESP command".to_owned(),
+        ));
+    };
+    if consumed != payload.len() {
+        return Err(DflyError::Protocol(
+            "journal payload must contain exactly one command".to_owned(),
+        ));
+    }
+
+    Ok(CommandFrame::new(command.name, command.args))
+}
+
 /// Encodes a canonical reply according to the target client protocol.
 fn encode_reply_for_protocol(
     protocol: ClientProtocol,
@@ -563,6 +611,7 @@ pub fn run() -> DflyResult<()> {
     let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
     let snapshot = app.create_snapshot_bytes()?;
     app.load_snapshot_bytes(&snapshot)?;
+    let _ = app.recover_from_replication_journal()?;
 
     println!("{}", app.startup_summary());
     Ok(())
@@ -575,7 +624,7 @@ mod tests {
     use dfly_common::config::{ClusterMode, RuntimeConfig};
     use dfly_common::error::DflyError;
     use dfly_facade::protocol::ClientProtocol;
-    use dfly_replication::journal::JournalOp;
+    use dfly_replication::journal::{JournalEntry, JournalOp};
     use googletest::prelude::*;
     use rstest::rstest;
 
@@ -1019,6 +1068,94 @@ mod tests {
                 b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
             ])
         );
+    }
+
+    #[rstest]
+    fn journal_replay_restores_state_in_fresh_server() {
+        let mut source = ServerApp::new(RuntimeConfig::default());
+        let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+            )
+            .expect("SET should succeed");
+        let _ = source
+            .feed_connection_bytes(&mut source_connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+            .expect("SELECT should succeed");
+        let _ = source
+            .feed_connection_bytes(
+                &mut source_connection,
+                b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
+            )
+            .expect("SET should succeed");
+
+        let entries = source.replication.journal_entries().to_vec();
+
+        let mut restored = ServerApp::new(RuntimeConfig::default());
+        for entry in entries {
+            restored.replication.append_journal(entry);
+        }
+        let applied = restored
+            .recover_from_replication_journal()
+            .expect("journal replay should succeed");
+        assert_that!(applied, eq(2_usize));
+
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let db0 = restored
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .expect("GET in db0 should succeed");
+        assert_that!(&db0, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
+
+        let _ = restored
+            .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+            .expect("SELECT should succeed");
+        let db1 = restored
+            .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .expect("GET in db1 should succeed");
+        assert_that!(&db1, eq(&vec![b"$3\r\nbaz\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn journal_replay_rejects_malformed_payload() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"not-resp".to_vec(),
+        });
+
+        let error = app
+            .recover_from_replication_journal()
+            .expect_err("invalid journal payload must fail");
+        let DflyError::Protocol(message) = error else {
+            panic!("expected protocol error");
+        };
+        assert_that!(message.contains("RESP"), eq(true));
+    }
+
+    #[rstest]
+    fn journal_replay_skips_ping_and_lsn_entries() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Ping,
+            payload: Vec::new(),
+        });
+        app.replication.append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Lsn,
+            payload: Vec::new(),
+        });
+
+        let applied = app
+            .recover_from_replication_journal()
+            .expect("non-command entries should be skipped");
+        assert_that!(applied, eq(0_usize));
     }
 
     fn resp_command(parts: &[&[u8]]) -> Vec<u8> {
