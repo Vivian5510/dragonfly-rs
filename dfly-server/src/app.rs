@@ -764,14 +764,31 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn dispatch_direct_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
+        self.dispatch_runtime_for_command(frame, true)
+    }
+
+    fn dispatch_replay_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
+        // Recovery replay must stay independent from live transaction queue ownership checks.
+        // During restore we rebuild state from persisted journal entries and should not depend
+        // on transient in-memory scheduler leases.
+        self.dispatch_runtime_for_command(frame, false)
+    }
+
+    fn dispatch_runtime_for_command(
+        &self,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> DflyResult<()> {
         let target_shards = self.runtime_target_shards_for_command(frame);
         if target_shards.is_empty() {
             return Ok(());
         }
 
-        self.transaction
-            .scheduler
-            .ensure_shards_available(&target_shards)?;
+        if enforce_scheduler_barrier {
+            self.transaction
+                .scheduler
+                .ensure_shards_available(&target_shards)?;
+        }
 
         // Direct command path mirrors Dragonfly's coordinator ingress:
         // 1) push one envelope to each touched shard queue,
@@ -1910,7 +1927,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let frame = parse_journal_command_frame(&entry.payload)?;
             // Journal replay should follow the same shard-ingress ordering contract as direct
             // command execution, so restored state observes runtime barrier semantics.
-            if let Err(error) = self.dispatch_direct_command_runtime(&frame) {
+            if let Err(error) = self.dispatch_replay_command_runtime(&frame) {
                 return Err(DflyError::Protocol(format!(
                     "journal replay runtime dispatch failed for txid {}: {error}",
                     entry.txid
@@ -7683,6 +7700,52 @@ mod tests {
         assert_that!(second_runtime.len(), eq(1_usize));
         assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
         assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
+    }
+
+    #[rstest]
+    fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let key = b"journal:recovery:barrier".to_vec();
+        let shard = app.core.resolve_shard_for_key(&key);
+        let blocking_plan = TransactionPlan {
+            txid: 900,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    shard,
+                    CommandFrame::new("SET", vec![key.clone(), b"pending".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![shard],
+        };
+        assert_that!(
+            app.transaction.scheduler.schedule(&blocking_plan).is_ok(),
+            eq(true)
+        );
+
+        app.replication.append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", &key, b"replayed"]),
+        });
+
+        let applied = app
+            .recover_from_replication_journal()
+            .expect("recovery replay should bypass scheduler barrier");
+        assert_that!(applied, eq(1_usize));
+        let value = app
+            .core
+            .execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
+        assert_that!(&value, eq(&CommandReply::BulkString(b"replayed".to_vec())));
+
+        assert_that!(
+            app.transaction
+                .scheduler
+                .conclude(blocking_plan.txid)
+                .is_ok(),
+            eq(true)
+        );
     }
 
     #[rstest]
