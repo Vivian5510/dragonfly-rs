@@ -713,9 +713,39 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         frame: &CommandFrame,
         txid: Option<TxId>,
     ) -> CommandReply {
+        if txid.is_none() {
+            match self.dispatch_single_command_runtime(frame) {
+                Ok(()) => {}
+                Err(error) => {
+                    return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+                }
+            }
+        }
+
         let reply = self.execute_command_without_side_effects(db, frame);
         self.maybe_append_journal_for_command(txid, db, frame, &reply);
         reply
+    }
+
+    fn dispatch_single_command_runtime(&self, frame: &CommandFrame) -> DflyResult<()> {
+        if !matches!(
+            self.core.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return Ok(());
+        }
+
+        let target_shard = self.core.resolve_target_shard(frame);
+        let sequence = self.submit_runtime_envelope_with_sequence(target_shard, frame)?;
+        let reached = self.runtime.wait_for_processed_sequence(
+            target_shard,
+            sequence,
+            Duration::from_millis(200),
+        )?;
+        if reached {
+            return Ok(());
+        }
+        Err(DflyError::InvalidState("runtime dispatch timed out"))
     }
 
     fn execute_command_without_side_effects(
@@ -3810,24 +3840,27 @@ mod tests {
     }
 
     #[rstest]
-    fn exec_plan_non_atomic_does_not_enqueue_runtime_commands() {
+    fn exec_plan_non_atomic_enqueues_runtime_commands() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let key = b"plan:rt:readonly".to_vec();
         let shard = app.core.resolve_shard_for_key(&key);
+        let command = CommandFrame::new("GET", vec![key.clone()]);
         let plan = TransactionPlan {
             txid: 1,
             mode: TransactionMode::NonAtomic,
             hops: vec![TransactionHop {
-                per_shard: vec![(shard, CommandFrame::new("GET", vec![key]))],
+                per_shard: vec![(shard, command.clone())],
             }],
         };
 
-        let _ = app.execute_transaction_plan(0, &plan);
+        let replies = app.execute_transaction_plan(0, &plan);
+        assert_that!(&replies, eq(&vec![CommandReply::Null]));
         let runtime = app
             .runtime
             .drain_processed_for_shard(shard)
             .expect("drain should succeed");
-        assert_that!(&runtime, eq(&Vec::new()));
+        assert_that!(runtime.len(), eq(1_usize));
+        assert_that!(&runtime[0].command, eq(&command));
     }
 
     #[rstest]
