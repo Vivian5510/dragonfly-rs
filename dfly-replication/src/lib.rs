@@ -124,6 +124,22 @@ impl ReplicationModule {
             .collect()
     }
 
+    /// Creates one sync session id used by `DFLY` replication commands.
+    pub fn create_sync_session(&mut self) -> String {
+        self.state.create_sync_session()
+    }
+
+    /// Returns whether one sync session id is currently known.
+    #[must_use]
+    pub fn is_known_sync_session(&self, sync_id: &str) -> bool {
+        self.state.is_known_sync_session(sync_id)
+    }
+
+    /// Allocates one flow EOF token for `DFLY FLOW` response.
+    pub fn allocate_flow_eof_token(&mut self) -> String {
+        self.state.allocate_flow_eof_token()
+    }
+
     /// Returns whether partial sync can continue from one replica offset.
     ///
     /// The offset semantics follow Redis/Dragonfly handshake:

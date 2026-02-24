@@ -25,6 +25,12 @@ pub struct ReplicationState {
     pub connected_replicas: usize,
     /// Registered replica endpoints known by control plane.
     pub replicas: Vec<ReplicaEndpoint>,
+    /// Monotonic session id sequence used by `REPLCONF CAPA dragonfly`.
+    pub next_sync_session_id: u64,
+    /// Monotonic seed for 40-hex EOF token generation.
+    pub next_eof_token_seed: u64,
+    /// Active sync sessions accepted by `DFLY FLOW/SYNC/STARTSTABLE`.
+    pub active_sync_sessions: Vec<String>,
 }
 
 /// One replica endpoint tracked by master-side control plane.
@@ -79,6 +85,9 @@ impl ReplicationState {
             last_acked_lsn: 0,
             connected_replicas: 0,
             replicas: Vec::new(),
+            next_sync_session_id: 1,
+            next_eof_token_seed: 1,
+            active_sync_sessions: Vec::new(),
         }
     }
 
@@ -123,6 +132,29 @@ impl ReplicationState {
         for replica in &mut self.replicas {
             replica.state = state;
         }
+    }
+
+    /// Allocates one new sync session id (`SYNC<n>`) and registers it as active.
+    pub fn create_sync_session(&mut self) -> String {
+        let session = format!("SYNC{}", self.next_sync_session_id);
+        self.next_sync_session_id = self.next_sync_session_id.saturating_add(1);
+        self.active_sync_sessions.push(session.clone());
+        session
+    }
+
+    /// Returns whether one sync session id is currently known.
+    #[must_use]
+    pub fn is_known_sync_session(&self, sync_id: &str) -> bool {
+        self.active_sync_sessions
+            .iter()
+            .any(|entry| entry == sync_id)
+    }
+
+    /// Allocates one 40-hex EOF token for `DFLY FLOW` handshake.
+    pub fn allocate_flow_eof_token(&mut self) -> String {
+        let token = format!("{:040x}", self.next_eof_token_seed);
+        self.next_eof_token_seed = self.next_eof_token_seed.saturating_add(1);
+        token
     }
 }
 
@@ -193,5 +225,23 @@ mod tests {
 
         state.set_all_replica_states(ReplicaSyncState::StableSync);
         assert_that!(state.replicas[0].state, eq(ReplicaSyncState::StableSync));
+    }
+
+    #[rstest]
+    fn sync_session_ids_and_flow_tokens_are_monotonic() {
+        let mut state = ReplicationState::default();
+        let sync_1 = state.create_sync_session();
+        let sync_2 = state.create_sync_session();
+
+        assert_that!(sync_1.as_str(), eq("SYNC1"));
+        assert_that!(sync_2.as_str(), eq("SYNC2"));
+        assert_that!(state.is_known_sync_session("SYNC1"), eq(true));
+        assert_that!(state.is_known_sync_session("SYNC2"), eq(true));
+
+        let token_1 = state.allocate_flow_eof_token();
+        let token_2 = state.allocate_flow_eof_token();
+        assert_that!(token_1.len(), eq(40_usize));
+        assert_that!(token_2.len(), eq(40_usize));
+        assert_that!(token_1 == token_2, eq(false));
     }
 }
