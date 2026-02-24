@@ -6,6 +6,7 @@ use dfly_common::config::{ClusterMode, RuntimeConfig};
 use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
+use dfly_core::CommandRouting;
 use dfly_core::CoreModule;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::FacadeModule;
@@ -500,38 +501,34 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
         let txid = self.allocate_txid();
-        if queued_commands
-            .iter()
-            .all(|command| self.core.is_single_key_command(command))
-        {
-            // Lock-ahead path: one hop models one wave that can be executed with disjoint shard
-            // ownership. We keep at most one command per shard inside a hop.
-            let mut hops = Vec::new();
-            let mut current_hop = TransactionHop {
-                per_shard: Vec::new(),
-            };
-            let mut occupied_shards = HashSet::new();
-
-            for command in queued_commands.iter().cloned() {
-                let shard = self.core.resolve_target_shard(&command);
-                if occupied_shards.contains(&shard) {
-                    hops.push(current_hop);
-                    current_hop = TransactionHop {
-                        per_shard: Vec::new(),
-                    };
-                    occupied_shards.clear();
+        let mut all_single_key = true;
+        let mut all_read_only_single_key = true;
+        for command in queued_commands {
+            match self.core.command_routing(command) {
+                CommandRouting::SingleKey { is_write } => {
+                    if is_write {
+                        all_read_only_single_key = false;
+                    }
                 }
-                current_hop.per_shard.push((shard, command));
-                let _ = occupied_shards.insert(shard);
+                CommandRouting::NonKey => {
+                    all_single_key = false;
+                    all_read_only_single_key = false;
+                }
             }
-            if !current_hop.per_shard.is_empty() {
-                hops.push(current_hop);
-            }
+        }
 
+        if all_read_only_single_key {
+            return TransactionPlan {
+                txid,
+                mode: TransactionMode::NonAtomic,
+                hops: self.build_single_key_hops(queued_commands),
+            };
+        }
+        if all_single_key {
             return TransactionPlan {
                 txid,
                 mode: TransactionMode::LockAhead,
-                hops,
+                hops: self.build_single_key_hops(queued_commands),
             };
         }
 
@@ -550,11 +547,54 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
+    fn build_single_key_hops(&self, queued_commands: &[CommandFrame]) -> Vec<TransactionHop> {
+        // One hop is one "parallelizable wave": at most one command per shard while preserving
+        // original command order across hops.
+        let mut hops = Vec::new();
+        let mut current_hop = TransactionHop {
+            per_shard: Vec::new(),
+        };
+        let mut occupied_shards = HashSet::new();
+
+        for command in queued_commands.iter().cloned() {
+            let shard = self.core.resolve_target_shard(&command);
+            if occupied_shards.contains(&shard) {
+                hops.push(current_hop);
+                current_hop = TransactionHop {
+                    per_shard: Vec::new(),
+                };
+                occupied_shards.clear();
+            }
+            current_hop.per_shard.push((shard, command));
+            let _ = occupied_shards.insert(shard);
+        }
+        if !current_hop.per_shard.is_empty() {
+            hops.push(current_hop);
+        }
+        hops
+    }
+
     fn execute_transaction_plan(&mut self, db: u16, plan: &TransactionPlan) -> Vec<CommandReply> {
         let mut replies = Vec::new();
         for hop in &plan.hops {
             for (_, command) in &hop.per_shard {
-                replies.push(self.execute_user_command(db, command, Some(plan.txid)));
+                match plan.mode {
+                    TransactionMode::NonAtomic => {
+                        if matches!(
+                            self.core.command_routing(command),
+                            CommandRouting::SingleKey { is_write: true }
+                        ) {
+                            replies.push(CommandReply::Error(
+                                "transaction planning error: NonAtomic mode cannot execute write commands".to_owned(),
+                            ));
+                        } else {
+                            replies.push(self.execute_user_command(db, command, None));
+                        }
+                    }
+                    TransactionMode::LockAhead | TransactionMode::Global => {
+                        replies.push(self.execute_user_command(db, command, Some(plan.txid)));
+                    }
+                }
             }
         }
         replies
@@ -3537,6 +3577,41 @@ mod tests {
     }
 
     #[rstest]
+    fn exec_plan_selects_non_atomic_for_single_key_reads() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+
+        let first_key = b"plan:ro:1".to_vec();
+        let first_shard = app.core.resolve_shard_for_key(&first_key);
+        let mut second_key = b"plan:ro:2".to_vec();
+        let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+        let mut suffix = 0_u32;
+        while second_shard == first_shard {
+            suffix = suffix.saturating_add(1);
+            second_key = format!("plan:ro:2:{suffix}").into_bytes();
+            second_shard = app.core.resolve_shard_for_key(&second_key);
+        }
+
+        let queued = vec![
+            CommandFrame::new("GET", vec![first_key.clone()]),
+            CommandFrame::new("TTL", vec![second_key.clone()]),
+            CommandFrame::new("TYPE", vec![first_key.clone()]),
+        ];
+        let plan = app.build_exec_plan(&queued);
+
+        assert_that!(plan.mode, eq(TransactionMode::NonAtomic));
+        assert_that!(plan.hops.len(), eq(2_usize));
+        assert_that!(plan.hops[0].per_shard.len(), eq(2_usize));
+        assert_that!(plan.hops[1].per_shard.len(), eq(1_usize));
+
+        let flattened = plan
+            .hops
+            .iter()
+            .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
+            .collect::<Vec<_>>();
+        assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
     fn exec_plan_falls_back_to_global_mode_for_non_key_commands() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let queued = vec![
@@ -3559,6 +3634,36 @@ mod tests {
             .flat_map(|hop| hop.per_shard.iter().map(|(_, command)| command.clone()))
             .collect::<Vec<_>>();
         assert_that!(&flattened, eq(&queued));
+    }
+
+    #[rstest]
+    fn resp_exec_read_only_queue_uses_non_mutating_path() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("seed SET should succeed");
+        assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should queue");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"k"]))
+            .expect("TYPE should queue");
+
+        let exec = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should succeed");
+        let expected = vec![b"*2\r\n$1\r\nv\r\n+string\r\n".to_vec()];
+        assert_that!(&exec, eq(&expected));
+
+        // Read-only transaction must not create new journal records.
+        assert_that!(app.replication.journal_entries().len(), eq(1_usize));
     }
 
     #[rstest]
