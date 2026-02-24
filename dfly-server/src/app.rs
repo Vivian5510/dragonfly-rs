@@ -340,7 +340,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_discard(connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        let in_multi = connection.transaction.in_multi();
         if !frame.args.is_empty() {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return wrong_arity("DISCARD");
         }
         if connection.transaction.discard() {
@@ -350,10 +354,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_exec(&mut self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+        let in_multi = connection.transaction.in_multi();
         if !frame.args.is_empty() {
+            if in_multi {
+                connection.transaction.mark_queued_error();
+            }
             return wrong_arity("EXEC");
         }
-        if !connection.transaction.in_multi() {
+        if !in_multi {
             return CommandReply::Error("EXEC without MULTI".to_owned()).to_resp_bytes();
         }
         if connection.transaction.has_queued_error() {
@@ -2292,6 +2300,64 @@ mod tests {
             .expect("EXEC should parse");
         assert_that!(
             &exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_exec_arity_error_inside_multi() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let exec_arity_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC", b"extra"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec_arity_error,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'EXEC' command\r\n".to_vec()
+            ])
+        );
+
+        let exec_after_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec_after_error,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_execaborts_after_discard_arity_error_inside_multi() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let discard_arity_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"DISCARD", b"extra"]))
+            .expect("DISCARD should parse");
+        assert_that!(
+            &discard_arity_error,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'DISCARD' command\r\n".to_vec()
+            ])
+        );
+
+        let exec_after_error = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &exec_after_error,
             eq(&vec![
                 b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
             ])
