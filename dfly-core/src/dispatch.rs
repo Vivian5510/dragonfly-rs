@@ -474,6 +474,7 @@ impl CommandRegistry {
             arity: CommandArity::Exact(2),
             handler: handle_setnx,
         });
+        self.register_multi_key_string_commands();
         self.register(CommandSpec {
             name: "GET",
             arity: CommandArity::Exact(1),
@@ -553,6 +554,24 @@ impl CommandRegistry {
             name: "RENAMENX",
             arity: CommandArity::Exact(2),
             handler: handle_renamenx,
+        });
+    }
+
+    fn register_multi_key_string_commands(&mut self) {
+        self.register(CommandSpec {
+            name: "MSET",
+            arity: CommandArity::AtLeast(2),
+            handler: handle_mset,
+        });
+        self.register(CommandSpec {
+            name: "MSETNX",
+            arity: CommandArity::AtLeast(2),
+            handler: handle_msetnx,
+        });
+        self.register(CommandSpec {
+            name: "MGET",
+            arity: CommandArity::AtLeast(1),
+            handler: handle_mget,
         });
     }
 
@@ -796,6 +815,72 @@ fn handle_setnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
         },
     );
     state.bump_key_version(db, &key);
+    CommandReply::Integer(1)
+}
+
+fn handle_mget(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    let mut values = Vec::with_capacity(frame.args.len());
+    for key in &frame.args {
+        state.purge_expired_key(db, key);
+        let value = state
+            .db_map(db)
+            .and_then(|map| map.get(key))
+            .map_or(CommandReply::Null, |entry| {
+                CommandReply::BulkString(entry.value.clone())
+            });
+        values.push(value);
+    }
+    CommandReply::Array(values)
+}
+
+fn handle_mset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+        return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
+    }
+
+    for pair in frame.args.chunks_exact(2) {
+        let key = pair[0].clone();
+        let value = pair[1].clone();
+        state.purge_expired_key(db, &key);
+        let _ = state.upsert_key(
+            db,
+            &key,
+            ValueEntry {
+                value,
+                expire_at_unix_secs: None,
+            },
+        );
+        state.bump_key_version(db, &key);
+    }
+    CommandReply::SimpleString("OK".to_owned())
+}
+
+fn handle_msetnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
+    if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
+        return CommandReply::Error("wrong number of arguments for 'MSETNX' command".to_owned());
+    }
+
+    for pair in frame.args.chunks_exact(2) {
+        let key = &pair[0];
+        state.purge_expired_key(db, key);
+        if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+            return CommandReply::Integer(0);
+        }
+    }
+
+    for pair in frame.args.chunks_exact(2) {
+        let key = pair[0].clone();
+        let value = pair[1].clone();
+        let _ = state.upsert_key(
+            db,
+            &key,
+            ValueEntry {
+                value,
+                expire_at_unix_secs: None,
+            },
+        );
+        state.bump_key_version(db, &key);
+    }
     CommandReply::Integer(1)
 }
 
@@ -2414,6 +2499,153 @@ mod tests {
             &mut state,
         );
         assert_that!(&value, eq(&CommandReply::BulkString(b"v1".to_vec())));
+    }
+
+    #[rstest]
+    fn dispatch_mget_preserves_order_and_null_entries() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            &mut state,
+        );
+
+        let mget = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MGET",
+                vec![b"k2".to_vec(), b"missing".to_vec(), b"k1".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &mget,
+            eq(&CommandReply::Array(vec![
+                CommandReply::BulkString(b"v2".to_vec()),
+                CommandReply::Null,
+                CommandReply::BulkString(b"v1".to_vec()),
+            ]))
+        );
+    }
+
+    #[rstest]
+    fn dispatch_mset_updates_pairs_and_rejects_odd_arity() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let ok = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MSET",
+                vec![
+                    b"k1".to_vec(),
+                    b"v1".to_vec(),
+                    b"k2".to_vec(),
+                    b"v2".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&ok, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let k1 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k1".to_vec()]),
+            &mut state,
+        );
+        let k2 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k2".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&k1, eq(&CommandReply::BulkString(b"v1".to_vec())));
+        assert_that!(&k2, eq(&CommandReply::BulkString(b"v2".to_vec())));
+
+        let invalid = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MSET",
+                vec![b"only".to_vec(), b"one".to_vec(), b"orphan".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &invalid,
+            eq(&CommandReply::Error(
+                "wrong number of arguments for 'MSET' command".to_owned()
+            ))
+        );
+    }
+
+    #[rstest]
+    fn dispatch_msetnx_sets_all_or_none_and_rejects_odd_arity() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MSETNX",
+                vec![
+                    b"k1".to_vec(),
+                    b"v1".to_vec(),
+                    b"k2".to_vec(),
+                    b"v2".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::Integer(1)));
+
+        let second = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MSETNX",
+                vec![
+                    b"k1".to_vec(),
+                    b"next".to_vec(),
+                    b"k3".to_vec(),
+                    b"v3".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(&second, eq(&CommandReply::Integer(0)));
+
+        let k1 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k1".to_vec()]),
+            &mut state,
+        );
+        let k3 = registry.dispatch(
+            0,
+            &CommandFrame::new("GET", vec![b"k3".to_vec()]),
+            &mut state,
+        );
+        assert_that!(&k1, eq(&CommandReply::BulkString(b"v1".to_vec())));
+        assert_that!(&k3, eq(&CommandReply::Null));
+
+        let invalid = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "MSETNX",
+                vec![b"odd".to_vec(), b"pair".to_vec(), b"tail".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &invalid,
+            eq(&CommandReply::Error(
+                "wrong number of arguments for 'MSETNX' command".to_owned()
+            ))
+        );
     }
 
     #[rstest]

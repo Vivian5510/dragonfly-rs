@@ -192,7 +192,8 @@ impl ServerApp {
 
         let same_shard = self
             .same_shard_copy_rename_target_shard(command)
-            .or_else(|| self.same_shard_multikey_count_target_shard(command));
+            .or_else(|| self.same_shard_multikey_count_target_shard(command))
+            .or_else(|| self.same_shard_multikey_string_target_shard(command));
         let Some(same_shard) = same_shard else {
             return false;
         };
@@ -372,6 +373,25 @@ impl ServerApp {
         let mut keys = frame.args.iter();
         let first_shard = self.core.resolve_shard_for_key(keys.next()?);
         if keys.any(|key| self.core.resolve_shard_for_key(key) != first_shard) {
+            return None;
+        }
+        Some(first_shard)
+    }
+
+    fn same_shard_multikey_string_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
+        let keys: Vec<&[u8]> = match frame.name.as_str() {
+            "MGET" if frame.args.len() >= 2 => frame.args.iter().map(Vec::as_slice).collect(),
+            "MSET" | "MSETNX" if frame.args.len() >= 4 && frame.args.len().is_multiple_of(2) => {
+                frame.args.iter().step_by(2).map(Vec::as_slice).collect()
+            }
+            _ => return None,
+        };
+        let (first_key, remaining) = keys.split_first()?;
+        let first_shard = self.core.resolve_shard_for_key(first_key);
+        if remaining
+            .iter()
+            .any(|key| self.core.resolve_shard_for_key(key) != first_shard)
+        {
             return None;
         }
         Some(first_shard)

@@ -2037,6 +2037,85 @@ fn exec_plan_global_same_shard_multikey_count_executes_on_worker_fiber() {
 }
 
 #[rstest]
+fn exec_plan_global_same_shard_multikey_string_executes_on_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"plan:rt:global:mset:same:1".to_vec();
+    let shard = app.core.resolve_shard_for_key(&first_key);
+    let mut second_key = b"plan:rt:global:mset:same:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("plan:rt:global:mset:same:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let queued_set = vec![CommandFrame::new(
+        "MSET",
+        vec![
+            first_key.clone(),
+            b"va".to_vec(),
+            second_key.clone(),
+            b"vb".to_vec(),
+        ],
+    )];
+    let set_plan = app.build_exec_plan(&queued_set);
+    assert_that!(set_plan.mode, eq(TransactionMode::Global));
+    assert_that!(&set_plan.touched_shards, eq(&vec![shard]));
+
+    let set_replies = app.execute_transaction_plan(0, &set_plan);
+    assert_that!(
+        &set_replies,
+        eq(&vec![CommandReply::SimpleString("OK".to_owned())])
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let set_runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(set_runtime.len(), eq(1_usize));
+    assert_that!(&set_runtime[0].command, eq(&queued_set[0]));
+    assert_that!(set_runtime[0].execute_on_worker, eq(true));
+
+    let queued_get = vec![CommandFrame::new(
+        "MGET",
+        vec![second_key.clone(), first_key.clone()],
+    )];
+    let get_plan = app.build_exec_plan(&queued_get);
+    assert_that!(get_plan.mode, eq(TransactionMode::Global));
+    assert_that!(&get_plan.touched_shards, eq(&vec![shard]));
+
+    let get_replies = app.execute_transaction_plan(0, &get_plan);
+    assert_that!(
+        &get_replies,
+        eq(&vec![CommandReply::Array(vec![
+            CommandReply::BulkString(b"vb".to_vec()),
+            CommandReply::BulkString(b"va".to_vec()),
+        ])])
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let get_runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(get_runtime.len(), eq(1_usize));
+    assert_that!(&get_runtime[0].command, eq(&queued_get[0]));
+    assert_that!(get_runtime[0].execute_on_worker, eq(true));
+}
+
+#[rstest]
 fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let queued = vec![CommandFrame::new("PING", Vec::new())];
