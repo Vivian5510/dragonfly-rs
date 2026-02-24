@@ -124,6 +124,45 @@ impl DispatchState {
     pub fn db_len(&self, db: DbIndex) -> usize {
         self.db_map(db).map_or(0, HashMap::len)
     }
+
+    /// Removes all keys in one logical DB and bumps their key versions.
+    ///
+    /// Returns the number of removed keys.
+    pub fn flush_db(&mut self, db: DbIndex) -> usize {
+        let Some(keyspace) = self.db_kv.get(&db) else {
+            return 0;
+        };
+
+        let keys = keyspace.keys().cloned().collect::<Vec<_>>();
+        let removed = keys.len();
+        for key in &keys {
+            self.bump_key_version(db, key);
+        }
+        let _ = self.db_kv.remove(&db);
+        removed
+    }
+
+    /// Removes all keys in all logical DBs and bumps their key versions.
+    ///
+    /// Returns the number of removed keys.
+    pub fn flush_all(&mut self) -> usize {
+        let mut keys_per_db = Vec::new();
+        let mut removed = 0_usize;
+
+        for (db, keyspace) in &self.db_kv {
+            let keys = keyspace.keys().cloned().collect::<Vec<_>>();
+            removed = removed.saturating_add(keys.len());
+            keys_per_db.push((*db, keys));
+        }
+
+        for (db, keys) in keys_per_db {
+            for key in keys {
+                self.bump_key_version(db, &key);
+            }
+        }
+        self.db_kv.clear();
+        removed
+    }
 }
 
 /// Runtime command registry.

@@ -449,6 +449,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn validate_queued_command(&self, frame: &CommandFrame) -> Result<(), String> {
+        if matches!(frame.name.as_str(), "FLUSHDB" | "FLUSHALL") {
+            return Err(format!("'{}' not allowed inside a transaction", frame.name));
+        }
+
         match self.core.validate_command(frame) {
             Ok(()) => return Ok(()),
             Err(message) if !message.starts_with("unknown command ") => return Err(message),
@@ -578,6 +582,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "ROLE" => self.execute_role(frame),
             "READONLY" => Self::execute_readonly(frame),
             "READWRITE" => self.execute_readwrite(frame),
+            "FLUSHDB" => self.execute_flushdb(db, frame),
+            "FLUSHALL" => self.execute_flushall(frame),
             "PSYNC" => self.execute_psync(frame),
             "WAIT" => self.execute_wait(frame),
             "CLUSTER" => self.execute_cluster(frame),
@@ -649,6 +655,26 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
             );
         }
+        CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_flushdb(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'FLUSHDB' command".to_owned(),
+            );
+        }
+        let _ = self.core.flush_db(db);
+        CommandReply::SimpleString("OK".to_owned())
+    }
+
+    fn execute_flushall(&mut self, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'FLUSHALL' command".to_owned(),
+            );
+        }
+        let _ = self.core.flush_all();
         CommandReply::SimpleString("OK".to_owned())
     }
 
@@ -1480,6 +1506,8 @@ fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<
     match (frame.name.as_str(), reply) {
         ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("FLUSHDB", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        ("FLUSHALL", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
         ("EXPIRE", CommandReply::Integer(1)) => {
             if expire_is_delete(frame) {
                 Some(JournalOp::Expired)
@@ -2005,6 +2033,41 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_watch_aborts_exec_when_flushdb_deletes_watched_key() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                &resp_command(&[b"SET", b"watch:key", b"v"]),
+            )
+            .expect("seed SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"watch:key"]))
+            .expect("WATCH should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut writer_conn, &resp_command(&[b"FLUSHDB"]))
+            .expect("FLUSHDB should succeed");
+
+        let _ = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut watch_conn,
+                &resp_command(&[b"SET", b"watch:key", b"mine"]),
+            )
+            .expect("SET should queue");
+
+        let exec = app
+            .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(&exec, eq(&vec![b"*-1\r\n".to_vec()]));
+    }
+
+    #[rstest]
     fn resp_execaborts_after_watch_or_unwatch_error_inside_multi() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
@@ -2193,6 +2256,33 @@ mod tests {
     }
 
     #[rstest]
+    fn journal_records_flush_commands() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHDB"]))
+            .expect("FLUSHDB should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHALL"]))
+            .expect("FLUSHALL should succeed");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(
+            String::from_utf8_lossy(&entries[1].payload).contains("FLUSHDB"),
+            eq(true)
+        );
+        assert_that!(
+            String::from_utf8_lossy(&entries[2].payload).contains("FLUSHALL"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
     fn journal_uses_same_txid_for_exec_batch_entries() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -2260,6 +2350,125 @@ mod tests {
             .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n")
             .expect("GET in DB 0 should succeed");
         assert_that!(&get_in_db0, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_flushdb_clears_only_selected_database() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"db0"]))
+            .expect("SET in DB 0 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"db1"]))
+            .expect("SET in DB 1 should succeed");
+
+        let flushdb = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHDB"]))
+            .expect("FLUSHDB should execute");
+        assert_that!(&flushdb, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let get_in_db1 = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET in DB 1 should execute");
+        assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should succeed");
+        let get_in_db0 = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET in DB 0 should execute");
+        assert_that!(&get_in_db0, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_flushall_clears_all_databases() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k0", b"v0"]))
+            .expect("SET in DB 0 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should succeed");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
+            .expect("SET in DB 1 should succeed");
+
+        let flushall = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHALL"]))
+            .expect("FLUSHALL should execute");
+        assert_that!(&flushall, eq(&vec![b"+OK\r\n".to_vec()]));
+
+        let get_in_db1 = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k1"]))
+            .expect("GET in DB 1 should execute");
+        assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should succeed");
+        let get_in_db0 = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k0"]))
+            .expect("GET in DB 0 should execute");
+        assert_that!(&get_in_db0, eq(&vec![b"$-1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_flush_commands_are_rejected_inside_multi() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+
+        let mut flushall_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let _ = app
+            .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let flushall = app
+            .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"FLUSHALL"]))
+            .expect("FLUSHALL should parse");
+        assert_that!(
+            &flushall,
+            eq(&vec![
+                b"-ERR 'FLUSHALL' not allowed inside a transaction\r\n".to_vec()
+            ])
+        );
+        let flushall_exec = app
+            .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &flushall_exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
+
+        let mut flushdb_conn = ServerApp::new_connection(ClientProtocol::Resp);
+        let _ = app
+            .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed");
+        let flushdb = app
+            .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"FLUSHDB"]))
+            .expect("FLUSHDB should parse");
+        assert_that!(
+            &flushdb,
+            eq(&vec![
+                b"-ERR 'FLUSHDB' not allowed inside a transaction\r\n".to_vec()
+            ])
+        );
+        let flushdb_exec = app
+            .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
+        assert_that!(
+            &flushdb_exec,
+            eq(&vec![
+                b"-ERR EXECABORT Transaction discarded because of previous errors\r\n".to_vec()
+            ])
+        );
     }
 
     #[rstest]

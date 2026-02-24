@@ -160,6 +160,26 @@ impl CoreModule {
             .map_or(0, |state| state.key_version(db, key))
     }
 
+    /// Removes all keys in one logical DB across all shards.
+    ///
+    /// Returns the number of removed keys.
+    pub fn flush_db(&mut self, db: DbIndex) -> usize {
+        self.shard_states
+            .iter_mut()
+            .map(|state| state.flush_db(db))
+            .sum()
+    }
+
+    /// Removes all keys in all logical DBs across all shards.
+    ///
+    /// Returns the number of removed keys.
+    pub fn flush_all(&mut self) -> usize {
+        self.shard_states
+            .iter_mut()
+            .map(dispatch::DispatchState::flush_all)
+            .sum()
+    }
+
     /// Selects target shard for one command.
     ///
     /// Current strategy:
@@ -294,5 +314,51 @@ mod tests {
             &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
         );
         assert_that!(core.key_version(0, &key), eq(1_u64));
+    }
+
+    #[rstest]
+    fn core_flush_db_clears_only_selected_database() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"flush:key".to_vec(), b"db0".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            2,
+            &CommandFrame::new("SET", vec![b"flush:key".to_vec(), b"db2".to_vec()]),
+        );
+
+        let removed = core.flush_db(2);
+        assert_that!(removed, eq(1_usize));
+
+        let db0_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![b"flush:key".to_vec()]));
+        let db2_value =
+            core.execute_in_db(2, &CommandFrame::new("GET", vec![b"flush:key".to_vec()]));
+        assert_that!(&db0_value, eq(&CommandReply::BulkString(b"db0".to_vec())));
+        assert_that!(&db2_value, eq(&CommandReply::Null));
+    }
+
+    #[rstest]
+    fn core_flush_all_clears_all_databases() {
+        let mut core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![b"key:0".to_vec(), b"v0".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            3,
+            &CommandFrame::new("SET", vec![b"key:3".to_vec(), b"v3".to_vec()]),
+        );
+
+        let removed = core.flush_all();
+        assert_that!(removed, eq(2_usize));
+
+        let db0_value = core.execute_in_db(0, &CommandFrame::new("GET", vec![b"key:0".to_vec()]));
+        let db3_value = core.execute_in_db(3, &CommandFrame::new("GET", vec![b"key:3".to_vec()]));
+        assert_that!(&db0_value, eq(&CommandReply::Null));
+        assert_that!(&db3_value, eq(&CommandReply::Null));
     }
 }
