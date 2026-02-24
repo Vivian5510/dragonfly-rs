@@ -2512,6 +2512,118 @@ mod tests {
     }
 
     #[rstest]
+    fn resp_expire_family_supports_nx_xx_gt_lt_options() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"opt:key", b"v"]))
+            .expect("SET should execute");
+
+        let gt_on_persistent = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"GT"]),
+            )
+            .expect("EXPIRE GT should parse");
+        assert_that!(&gt_on_persistent, eq(&vec![b":0\r\n".to_vec()]));
+
+        let lt_on_persistent = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"LT"]),
+            )
+            .expect("EXPIRE LT should parse");
+        assert_that!(&lt_on_persistent, eq(&vec![b":1\r\n".to_vec()]));
+
+        let first_expiretime = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"opt:key"]))
+            .expect("EXPIRETIME should execute");
+        let first_expiretime = parse_resp_integer(&first_expiretime[0]);
+
+        let nx_with_existing_expire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"NX"]),
+            )
+            .expect("EXPIRE NX should parse");
+        assert_that!(&nx_with_existing_expire, eq(&vec![b":0\r\n".to_vec()]));
+
+        let xx_with_existing_expire = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"XX"]),
+            )
+            .expect("EXPIRE XX should parse");
+        assert_that!(&xx_with_existing_expire, eq(&vec![b":1\r\n".to_vec()]));
+
+        let second_expiretime = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"opt:key"]))
+            .expect("EXPIRETIME should execute");
+        let second_expiretime = parse_resp_integer(&second_expiretime[0]);
+        assert_that!(second_expiretime > first_expiretime, eq(true));
+
+        let gt_with_smaller_target = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"GT"]),
+            )
+            .expect("EXPIRE GT should parse");
+        assert_that!(&gt_with_smaller_target, eq(&vec![b":0\r\n".to_vec()]));
+
+        let lt_with_smaller_target = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"LT"]),
+            )
+            .expect("EXPIRE LT should parse");
+        assert_that!(&lt_with_smaller_target, eq(&vec![b":1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_expire_family_rejects_invalid_option_sets() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let nx_xx = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"missing", b"10", b"NX", b"XX"]),
+            )
+            .expect("EXPIRE should parse");
+        assert_that!(
+            &nx_xx,
+            eq(&vec![
+                b"-ERR NX and XX options at the same time are not compatible\r\n".to_vec()
+            ])
+        );
+
+        let gt_lt = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"PEXPIRE", b"missing", b"10", b"GT", b"LT"]),
+            )
+            .expect("PEXPIRE should parse");
+        assert_that!(
+            &gt_lt,
+            eq(&vec![
+                b"-ERR GT and LT options at the same time are not compatible\r\n".to_vec()
+            ])
+        );
+
+        let unknown = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIREAT", b"missing", b"1", b"SOMETHING"]),
+            )
+            .expect("EXPIREAT should parse");
+        assert_that!(
+            &unknown,
+            eq(&vec![b"-ERR Unsupported option: SOMETHING\r\n".to_vec()])
+        );
+    }
+
+    #[rstest]
     fn resp_expiretime_reports_missing_persistent_and_expiring_keys() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
@@ -3454,6 +3566,45 @@ mod tests {
         assert_that!(entries.len(), eq(4_usize));
         assert_that!(entries[1].op, eq(JournalOp::Command));
         assert_that!(entries[3].op, eq(JournalOp::Expired));
+    }
+
+    #[rstest]
+    fn journal_records_expire_options_only_when_update_is_applied() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
+            .expect("SET should succeed");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"k", b"10", b"GT"]),
+            )
+            .expect("EXPIRE GT should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"k", b"10", b"LT"]),
+            )
+            .expect("EXPIRE LT should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"k", b"20", b"NX"]),
+            )
+            .expect("EXPIRE NX should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"EXPIRE", b"k", b"0", b"LT"]),
+            )
+            .expect("EXPIRE LT delete should execute");
+
+        let entries = app.replication.journal_entries();
+        assert_that!(entries.len(), eq(3_usize));
+        assert_that!(entries[1].op, eq(JournalOp::Command));
+        assert_that!(entries[2].op, eq(JournalOp::Expired));
     }
 
     #[rstest]

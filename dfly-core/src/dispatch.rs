@@ -319,22 +319,22 @@ impl CommandRegistry {
         });
         self.register(CommandSpec {
             name: "EXPIRE",
-            arity: CommandArity::Exact(2),
+            arity: CommandArity::AtLeast(2),
             handler: handle_expire,
         });
         self.register(CommandSpec {
             name: "PEXPIRE",
-            arity: CommandArity::Exact(2),
+            arity: CommandArity::AtLeast(2),
             handler: handle_pexpire,
         });
         self.register(CommandSpec {
             name: "PEXPIREAT",
-            arity: CommandArity::Exact(2),
+            arity: CommandArity::AtLeast(2),
             handler: handle_pexpireat,
         });
         self.register(CommandSpec {
             name: "EXPIREAT",
-            arity: CommandArity::Exact(2),
+            arity: CommandArity::AtLeast(2),
             handler: handle_expireat,
         });
         self.register(CommandSpec {
@@ -978,11 +978,32 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
+    let options = match parse_expire_options(&frame.args[2..]) {
+        Ok(options) => options,
+        Err(error) => return CommandReply::Error(error),
+    };
     let seconds = match parse_i64_arg(&frame.args[1], "EXPIRE seconds") {
         Ok(seconds) => seconds,
         Err(error) => return CommandReply::Error(error),
     };
-    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+    let current_expire_at = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.expire_at_unix_secs);
+    let Some(current_expire_at) = current_expire_at else {
+        return CommandReply::Integer(0);
+    };
+
+    let now_secs = DispatchState::now_unix_seconds();
+    let target_expire_at = if seconds <= 0 {
+        now_secs.saturating_sub(1)
+    } else {
+        let Ok(expire_delta) = u64::try_from(seconds) else {
+            return CommandReply::Error("EXPIRE seconds is out of range".to_owned());
+        };
+        now_secs.saturating_add(expire_delta)
+    };
+    if !expire_options_satisfied(options, current_expire_at, target_expire_at) {
         return CommandReply::Integer(0);
     }
 
@@ -994,14 +1015,9 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
         return CommandReply::Integer(0);
     }
 
-    let Ok(expire_delta) = u64::try_from(seconds) else {
-        return CommandReply::Error("EXPIRE seconds is out of range".to_owned());
-    };
-    let expire_at = DispatchState::now_unix_seconds().saturating_add(expire_delta);
-
     let mut updated = false;
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(expire_at);
+        entry.expire_at_unix_secs = Some(target_expire_at);
         updated = true;
     }
     if updated {
@@ -1015,11 +1031,34 @@ fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
+    let options = match parse_expire_options(&frame.args[2..]) {
+        Ok(options) => options,
+        Err(error) => return CommandReply::Error(error),
+    };
     let milliseconds = match parse_i64_arg(&frame.args[1], "PEXPIRE milliseconds") {
         Ok(milliseconds) => milliseconds,
         Err(error) => return CommandReply::Error(error),
     };
-    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+    let current_expire_at_secs = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.expire_at_unix_secs);
+    let Some(current_expire_at_secs) = current_expire_at_secs else {
+        return CommandReply::Integer(0);
+    };
+
+    let now_millis = DispatchState::now_unix_millis();
+    let target_expire_at_millis = if milliseconds <= 0 {
+        now_millis.saturating_sub(1)
+    } else {
+        let Ok(expire_delta_millis) = u64::try_from(milliseconds) else {
+            return CommandReply::Error("PEXPIRE milliseconds is out of range".to_owned());
+        };
+        now_millis.saturating_add(expire_delta_millis)
+    };
+    let current_expire_at_millis = current_expire_at_secs
+        .map(|expire_at_secs| expire_at_secs.saturating_mul(1000).saturating_sub(1));
+    if !expire_options_satisfied(options, current_expire_at_millis, target_expire_at_millis) {
         return CommandReply::Integer(0);
     }
 
@@ -1031,12 +1070,7 @@ fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
         return CommandReply::Integer(0);
     }
 
-    let Ok(expire_delta_millis) = u64::try_from(milliseconds) else {
-        return CommandReply::Error("PEXPIRE milliseconds is out of range".to_owned());
-    };
-    let now_millis = DispatchState::now_unix_millis();
-    let expire_at_millis = now_millis.saturating_add(expire_delta_millis);
-    let expire_at_secs = expire_at_millis.saturating_add(999) / 1000;
+    let expire_at_secs = target_expire_at_millis.saturating_add(999) / 1000;
 
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
         entry.expire_at_unix_secs = Some(expire_at_secs);
@@ -1050,16 +1084,34 @@ fn handle_pexpireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
+    let options = match parse_expire_options(&frame.args[2..]) {
+        Ok(options) => options,
+        Err(error) => return CommandReply::Error(error),
+    };
     let timestamp_millis = match parse_i64_arg(&frame.args[1], "PEXPIREAT timestamp") {
         Ok(timestamp) => timestamp,
         Err(error) => return CommandReply::Error(error),
     };
-    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+    let current_expire_at_secs = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.expire_at_unix_secs);
+    let Some(current_expire_at_secs) = current_expire_at_secs else {
+        return CommandReply::Integer(0);
+    };
+
+    let timestamp_millis = timestamp_millis.max(0);
+    let now_millis = i64::try_from(DispatchState::now_unix_millis()).unwrap_or(i64::MAX);
+    let Ok(target_expire_at_millis) = u64::try_from(timestamp_millis) else {
+        return CommandReply::Error("PEXPIREAT timestamp is out of range".to_owned());
+    };
+    let current_expire_at_millis = current_expire_at_secs
+        .map(|expire_at_secs| expire_at_secs.saturating_mul(1000).saturating_sub(1));
+    if !expire_options_satisfied(options, current_expire_at_millis, target_expire_at_millis) {
         return CommandReply::Integer(0);
     }
 
-    let now_millis = i64::try_from(DispatchState::now_unix_millis()).unwrap_or(i64::MAX);
-    if timestamp_millis <= now_millis {
+    if i64::try_from(target_expire_at_millis).unwrap_or(i64::MAX) <= now_millis {
         if state.db_map_mut(db).remove(key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
@@ -1067,10 +1119,7 @@ fn handle_pexpireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState
         return CommandReply::Integer(0);
     }
 
-    let Ok(timestamp_millis) = u64::try_from(timestamp_millis) else {
-        return CommandReply::Error("PEXPIREAT timestamp is out of range".to_owned());
-    };
-    let expire_at_secs = timestamp_millis.saturating_add(999) / 1000;
+    let expire_at_secs = target_expire_at_millis.saturating_add(999) / 1000;
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
         entry.expire_at_unix_secs = Some(expire_at_secs);
         state.bump_key_version(db, key);
@@ -1083,16 +1132,32 @@ fn handle_expireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
+    let options = match parse_expire_options(&frame.args[2..]) {
+        Ok(options) => options,
+        Err(error) => return CommandReply::Error(error),
+    };
     let timestamp = match parse_i64_arg(&frame.args[1], "EXPIREAT timestamp") {
         Ok(timestamp) => timestamp,
         Err(error) => return CommandReply::Error(error),
     };
-    if !state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+    let current_expire_at = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.expire_at_unix_secs);
+    let Some(current_expire_at) = current_expire_at else {
+        return CommandReply::Integer(0);
+    };
+
+    let timestamp = timestamp.max(0);
+    let now = i64::try_from(DispatchState::now_unix_seconds()).unwrap_or(i64::MAX);
+    let Ok(target_expire_at) = u64::try_from(timestamp) else {
+        return CommandReply::Error("EXPIREAT timestamp is out of range".to_owned());
+    };
+    if !expire_options_satisfied(options, current_expire_at, target_expire_at) {
         return CommandReply::Integer(0);
     }
 
-    let now = i64::try_from(DispatchState::now_unix_seconds()).unwrap_or(i64::MAX);
-    if timestamp <= now {
+    if i64::try_from(target_expire_at).unwrap_or(i64::MAX) <= now {
         if state.db_map_mut(db).remove(key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
@@ -1100,11 +1165,8 @@ fn handle_expireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
         return CommandReply::Integer(0);
     }
 
-    let Ok(expire_at) = u64::try_from(timestamp) else {
-        return CommandReply::Error("EXPIREAT timestamp is out of range".to_owned());
-    };
     if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(expire_at);
+        entry.expire_at_unix_secs = Some(target_expire_at);
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1291,6 +1353,66 @@ fn mutate_counter_by(
     );
     state.bump_key_version(db, key);
     CommandReply::Integer(next)
+}
+
+type ExpireOptions = u8;
+
+const EXPIRE_ALWAYS: ExpireOptions = 0;
+const EXPIRE_NX: ExpireOptions = 1 << 0;
+const EXPIRE_XX: ExpireOptions = 1 << 1;
+const EXPIRE_GT: ExpireOptions = 1 << 2;
+const EXPIRE_LT: ExpireOptions = 1 << 3;
+
+fn parse_expire_options(args: &[Vec<u8>]) -> Result<ExpireOptions, String> {
+    let mut options = EXPIRE_ALWAYS;
+
+    for arg in args {
+        if arg.eq_ignore_ascii_case(b"NX") {
+            options |= EXPIRE_NX;
+        } else if arg.eq_ignore_ascii_case(b"XX") {
+            options |= EXPIRE_XX;
+        } else if arg.eq_ignore_ascii_case(b"GT") {
+            options |= EXPIRE_GT;
+        } else if arg.eq_ignore_ascii_case(b"LT") {
+            options |= EXPIRE_LT;
+        } else {
+            let option = String::from_utf8_lossy(arg).to_ascii_uppercase();
+            return Err(format!("Unsupported option: {option}"));
+        }
+    }
+
+    if (options & EXPIRE_NX != 0) && (options & EXPIRE_XX != 0) {
+        return Err("NX and XX options at the same time are not compatible".to_owned());
+    }
+    if (options & EXPIRE_GT != 0) && (options & EXPIRE_LT != 0) {
+        return Err("GT and LT options at the same time are not compatible".to_owned());
+    }
+
+    Ok(options)
+}
+
+/// Evaluates EXPIRE-option predicates using Dragonfly's update semantics.
+///
+/// When no current expiry exists, comparisons treat it as an infinite timestamp.
+fn expire_options_satisfied(
+    options: ExpireOptions,
+    current_expire_at: Option<u64>,
+    next_expire_at: u64,
+) -> bool {
+    if options == EXPIRE_ALWAYS {
+        return true;
+    }
+
+    let mut satisfied = false;
+    let current_cmp = current_expire_at.unwrap_or(u64::MAX);
+    if current_expire_at.is_some() {
+        satisfied |= options & EXPIRE_XX != 0;
+    } else {
+        satisfied |= options & EXPIRE_NX != 0;
+    }
+    satisfied |= options & EXPIRE_LT != 0 && next_expire_at < current_cmp;
+    satisfied |= options & EXPIRE_GT != 0 && next_expire_at > current_cmp;
+    satisfied
 }
 
 fn parse_i64_arg(arg: &[u8], field_name: &str) -> Result<i64, String> {
@@ -2377,6 +2499,238 @@ mod tests {
             &mut state,
         );
         assert_that!(&reply, eq(&CommandReply::Integer(0)));
+    }
+
+    #[rstest]
+    fn dispatch_expire_options_control_update_conditions() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"key".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+
+        let gt_on_persistent = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"10".to_vec(), b"GT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&gt_on_persistent, eq(&CommandReply::Integer(0)));
+
+        let lt_on_persistent = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"10".to_vec(), b"LT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&lt_on_persistent, eq(&CommandReply::Integer(1)));
+
+        let first_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(first_expiretime) = first_expiretime else {
+            panic!("EXPIRETIME must return integer");
+        };
+
+        let nx_with_existing_ttl = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"20".to_vec(), b"NX".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&nx_with_existing_ttl, eq(&CommandReply::Integer(0)));
+
+        let xx_with_existing_ttl = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"20".to_vec(), b"XX".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&xx_with_existing_ttl, eq(&CommandReply::Integer(1)));
+
+        let second_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(second_expiretime) = second_expiretime else {
+            panic!("EXPIRETIME must return integer");
+        };
+        assert_that!(second_expiretime > first_expiretime, eq(true));
+
+        let gt_with_smaller_target = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"5".to_vec(), b"GT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&gt_with_smaller_target, eq(&CommandReply::Integer(0)));
+
+        let unchanged_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        assert_that!(
+            &unchanged_expiretime,
+            eq(&CommandReply::Integer(second_expiretime))
+        );
+
+        let lt_with_smaller_target = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![b"key".to_vec(), b"5".to_vec(), b"LT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&lt_with_smaller_target, eq(&CommandReply::Integer(1)));
+
+        let third_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("EXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(third_expiretime) = third_expiretime else {
+            panic!("EXPIRETIME must return integer");
+        };
+        assert_that!(third_expiretime < second_expiretime, eq(true));
+    }
+
+    #[rstest]
+    fn dispatch_pexpire_options_control_millisecond_predicates() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![b"key".to_vec(), b"value".to_vec()]),
+            &mut state,
+        );
+        let first = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PEXPIRE",
+                vec![b"key".to_vec(), b"1000".to_vec(), b"LT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&first, eq(&CommandReply::Integer(1)));
+
+        let first_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(first_expiretime) = first_expiretime else {
+            panic!("PEXPIRETIME must return integer");
+        };
+
+        let gt_smaller = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PEXPIRE",
+                vec![b"key".to_vec(), b"500".to_vec(), b"GT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&gt_smaller, eq(&CommandReply::Integer(0)));
+
+        let gt_bigger = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PEXPIRE",
+                vec![b"key".to_vec(), b"2000".to_vec(), b"GT".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(&gt_bigger, eq(&CommandReply::Integer(1)));
+
+        let second_expiretime = registry.dispatch(
+            0,
+            &CommandFrame::new("PEXPIRETIME", vec![b"key".to_vec()]),
+            &mut state,
+        );
+        let CommandReply::Integer(second_expiretime) = second_expiretime else {
+            panic!("PEXPIRETIME must return integer");
+        };
+        assert_that!(second_expiretime > first_expiretime, eq(true));
+    }
+
+    #[rstest]
+    fn dispatch_expire_options_reject_invalid_combinations_or_unknown_tokens() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+
+        let nx_xx = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIRE",
+                vec![
+                    b"key".to_vec(),
+                    b"10".to_vec(),
+                    b"NX".to_vec(),
+                    b"XX".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &nx_xx,
+            eq(&CommandReply::Error(
+                "NX and XX options at the same time are not compatible".to_owned()
+            ))
+        );
+
+        let gt_lt = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "PEXPIRE",
+                vec![
+                    b"key".to_vec(),
+                    b"10".to_vec(),
+                    b"GT".to_vec(),
+                    b"LT".to_vec(),
+                ],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &gt_lt,
+            eq(&CommandReply::Error(
+                "GT and LT options at the same time are not compatible".to_owned()
+            ))
+        );
+
+        let unknown = registry.dispatch(
+            0,
+            &CommandFrame::new(
+                "EXPIREAT",
+                vec![b"key".to_vec(), b"1".to_vec(), b"SOMETHING".to_vec()],
+            ),
+            &mut state,
+        );
+        assert_that!(
+            &unknown,
+            eq(&CommandReply::Error(
+                "Unsupported option: SOMETHING".to_owned()
+            ))
+        );
     }
 
     #[rstest]
