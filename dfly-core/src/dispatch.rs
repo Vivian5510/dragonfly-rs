@@ -106,44 +106,29 @@ impl DispatchState {
         self.db_tables.get(&db)
     }
 
-    /// Returns mutable map for one logical DB, creating it when missing.
-    fn db_map_mut(&mut self, db: DbIndex) -> &mut HashMap<Vec<u8>, ValueEntry> {
-        &mut self.db_table_mut(db).prime
-    }
-
     /// Returns immutable map for one logical DB.
     fn db_map(&self, db: DbIndex) -> Option<&HashMap<Vec<u8>, ValueEntry>> {
         self.db_table(db).map(|table| &table.prime)
     }
 
-    /// Rebuilds expiration index and slot indexes for one DB table.
-    ///
-    /// This keeps the layered table model consistent even while command handlers are still
-    /// written in terms of `prime` map updates.
-    fn rebuild_table_indexes(&mut self, db: DbIndex) {
-        let Some(table) = self.db_tables.get_mut(&db) else {
-            return;
-        };
-
-        table.expire.clear();
-        table.slot_stats.clear();
-        table.slot_keys.clear();
-        for (key, entry) in &table.prime {
-            if let Some(expire_at) = entry.expire_at_unix_secs {
-                let _ = table.expire.insert(key.clone(), expire_at);
-            }
-            let slot = key_slot(key);
-            let cardinality = table.slot_stats.entry(slot).or_default();
-            *cardinality = cardinality.saturating_add(1);
-            let _ = table.slot_keys.entry(slot).or_default().insert(key.clone());
+    fn update_expire_index(table: &mut DbTable, key: &[u8], expire_at: Option<u64>) {
+        if let Some(expire_at_unix_secs) = expire_at {
+            let _ = table.expire.insert(key.to_vec(), expire_at_unix_secs);
+        } else {
+            let _ = table.expire.remove(key);
         }
     }
 
-    /// Rebuilds all DB table secondary indexes (`expire`, `slot_stats`, `slot_keys`).
-    fn rebuild_all_table_indexes(&mut self) {
-        let dbs = self.db_tables.keys().copied().collect::<Vec<_>>();
-        for db in dbs {
-            self.rebuild_table_indexes(db);
+    fn increment_slot_stat(table: &mut DbTable, key: &[u8]) {
+        let slot = key_slot(key);
+        let inserted = table
+            .slot_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.to_vec());
+        if inserted {
+            let cardinality = table.slot_stats.entry(slot).or_default();
+            *cardinality = cardinality.saturating_add(1);
         }
     }
 
@@ -162,6 +147,36 @@ impl DispatchState {
             let _ = table.slot_stats.remove(&slot);
             let _ = table.slot_keys.remove(&slot);
         }
+    }
+
+    fn upsert_key(&mut self, db: DbIndex, key: &[u8], value: ValueEntry) -> Option<ValueEntry> {
+        let key_bytes = key.to_vec();
+        let expire_at = value.expire_at_unix_secs;
+        let table = self.db_table_mut(db);
+        let previous = table.prime.insert(key_bytes.clone(), value);
+        Self::update_expire_index(table, key, expire_at);
+        Self::increment_slot_stat(table, key);
+        previous
+    }
+
+    fn remove_key(&mut self, db: DbIndex, key: &[u8]) -> Option<ValueEntry> {
+        let table = self.db_tables.get_mut(&db)?;
+        let removed = table.prime.remove(key)?;
+        let _ = table.expire.remove(key);
+        Self::decrement_slot_stat(table, key);
+        Some(removed)
+    }
+
+    fn set_key_expire(&mut self, db: DbIndex, key: &[u8], expire_at: Option<u64>) -> bool {
+        let Some(table) = self.db_tables.get_mut(&db) else {
+            return false;
+        };
+        let Some(entry) = table.prime.get_mut(key) else {
+            return false;
+        };
+        entry.expire_at_unix_secs = expire_at;
+        Self::update_expire_index(table, key, expire_at);
+        true
     }
 
     /// Returns all keys tracked for one cluster slot in one logical DB.
@@ -198,7 +213,15 @@ impl DispatchState {
     /// This keeps optimistic watch checks consistent after `LOAD`/snapshot import.
     pub fn mark_key_loaded(&mut self, db: DbIndex, key: &[u8]) {
         self.bump_key_version(db, key);
-        self.rebuild_table_indexes(db);
+        let Some(table) = self.db_tables.get_mut(&db) else {
+            return;
+        };
+        let Some(entry) = table.prime.get(key) else {
+            return;
+        };
+        let expire_at = entry.expire_at_unix_secs;
+        Self::update_expire_index(table, key, expire_at);
+        Self::increment_slot_stat(table, key);
     }
 
     /// Removes one key when its expiration timestamp has already passed.
@@ -209,12 +232,7 @@ impl DispatchState {
             .copied()
             .is_some_and(|expire_at| expire_at <= Self::now_unix_seconds());
 
-        if should_remove
-            && let Some(table) = self.db_tables.get_mut(&db)
-            && table.prime.remove(key).is_some()
-        {
-            let _ = table.expire.remove(key);
-            Self::decrement_slot_stat(table, key);
+        if should_remove && self.remove_key(db, key).is_some() {
             self.bump_key_version(db, key);
         }
     }
@@ -523,10 +541,7 @@ impl CommandRegistry {
         let Some(spec) = self.entries.get(&command_name) else {
             return CommandReply::Error(format!("unknown command '{command_name}'"));
         };
-        let reply = (spec.handler)(db, frame, state);
-        // Keep layered table indexes synchronized after each command execution.
-        state.rebuild_all_table_indexes();
-        reply
+        (spec.handler)(db, frame, state)
     }
 }
 
@@ -605,8 +620,9 @@ fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         None
     };
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value,
             expire_at_unix_secs,
@@ -630,8 +646,9 @@ fn handle_setnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
         return CommandReply::Integer(0);
     }
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value,
             expire_at_unix_secs: None,
@@ -669,8 +686,9 @@ fn handle_getset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
         .and_then(|map| map.get(&key))
         .map(|entry| entry.value.clone());
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value: next_value,
             expire_at_unix_secs: None,
@@ -685,7 +703,7 @@ fn handle_getdel(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
-    let removed = state.db_map_mut(db).remove(key);
+    let removed = state.remove_key(db, key);
     if let Some(entry) = removed {
         state.bump_key_version(db, key);
         return CommandReply::BulkString(entry.value);
@@ -706,8 +724,9 @@ fn handle_append(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
         };
     value.extend_from_slice(suffix);
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value: value.clone(),
             expire_at_unix_secs,
@@ -783,8 +802,9 @@ fn handle_setrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
     }
     value[offset..offset + payload.len()].copy_from_slice(payload);
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value: value.clone(),
             expire_at_unix_secs,
@@ -799,7 +819,7 @@ fn handle_del(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
 
     for key in &frame.args {
         state.purge_expired_key(db, key);
-        if state.db_map_mut(db).remove(key).is_some() {
+        if state.remove_key(db, key).is_some() {
             state.bump_key_version(db, key);
             deleted = deleted.saturating_add(1);
         }
@@ -843,10 +863,10 @@ fn handle_move(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
         return CommandReply::Integer(0);
     }
 
-    let Some(entry) = state.db_map_mut(db).remove(&key) else {
+    let Some(entry) = state.remove_key(db, &key) else {
         return CommandReply::Integer(0);
     };
-    state.db_map_mut(target_db).insert(key.clone(), entry);
+    let _ = state.upsert_key(target_db, &key, entry);
     state.bump_key_version(db, &key);
     state.bump_key_version(target_db, &key);
     CommandReply::Integer(1)
@@ -895,16 +915,14 @@ pub fn rename_between_states(
         return CommandReply::Integer(0);
     }
 
-    let Some(source_entry) = source_state.db_map_mut(db).remove(source_key) else {
+    let Some(source_entry) = source_state.remove_key(db, source_key) else {
         return CommandReply::Error("no such key".to_owned());
     };
 
     if !destination_should_not_exist {
-        let _ = destination_state.db_map_mut(db).remove(destination_key);
+        let _ = destination_state.remove_key(db, destination_key);
     }
-    destination_state
-        .db_map_mut(db)
-        .insert(destination_key.to_vec(), source_entry);
+    let _ = destination_state.upsert_key(db, destination_key, source_entry);
 
     source_state.bump_key_version(db, source_key);
     destination_state.bump_key_version(db, destination_key);
@@ -954,9 +972,7 @@ pub fn copy_between_states(
         return CommandReply::Integer(0);
     }
 
-    destination_state
-        .db_map_mut(db)
-        .insert(copy.destination_key.to_vec(), source_entry);
+    let _ = destination_state.upsert_key(db, copy.destination_key, source_entry);
     destination_state.bump_key_version(db, copy.destination_key);
     CommandReply::Integer(1)
 }
@@ -989,9 +1005,7 @@ fn copy_single_state(db: DbIndex, args: &[Vec<u8>], state: &mut DispatchState) -
         return CommandReply::Integer(0);
     }
 
-    state
-        .db_map_mut(db)
-        .insert(copy.destination_key.to_vec(), source_entry);
+    let _ = state.upsert_key(db, copy.destination_key, source_entry);
     state.bump_key_version(db, copy.destination_key);
     CommandReply::Integer(1)
 }
@@ -1026,16 +1040,14 @@ fn rename_single_state(
         return CommandReply::Integer(0);
     }
 
-    let Some(source_entry) = state.db_map_mut(db).remove(source_key) else {
+    let Some(source_entry) = state.remove_key(db, source_key) else {
         return CommandReply::Error("no such key".to_owned());
     };
 
     if !destination_should_not_exist {
-        let _ = state.db_map_mut(db).remove(destination_key);
+        let _ = state.remove_key(db, destination_key);
     }
-    state
-        .db_map_mut(db)
-        .insert(destination_key.to_vec(), source_entry);
+    let _ = state.upsert_key(db, destination_key, source_entry);
     state.bump_key_version(db, source_key);
     state.bump_key_version(db, destination_key);
 
@@ -1094,8 +1106,9 @@ fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
     };
     let expire_at = DispatchState::now_unix_seconds().saturating_add(expire_delta);
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value: frame.args[2].clone(),
             expire_at_unix_secs: Some(expire_at),
@@ -1120,8 +1133,9 @@ fn handle_psetex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let expire_at_millis = now_millis.saturating_add(expire_delta_millis);
     let expire_at_secs = expire_at_millis.saturating_add(999) / 1000;
 
-    state.db_map_mut(db).insert(
-        key.clone(),
+    let _ = state.upsert_key(
+        db,
+        &key,
         ValueEntry {
             value: frame.args[2].clone(),
             expire_at_unix_secs: Some(expire_at_secs),
@@ -1165,19 +1179,14 @@ fn handle_expire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     }
 
     if seconds <= 0 {
-        if state.db_map_mut(db).remove(key).is_some() {
+        if state.remove_key(db, key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
         }
         return CommandReply::Integer(0);
     }
 
-    let mut updated = false;
-    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(target_expire_at);
-        updated = true;
-    }
-    if updated {
+    if state.set_key_expire(db, key, Some(target_expire_at)) {
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1220,7 +1229,7 @@ fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
     }
 
     if milliseconds <= 0 {
-        if state.db_map_mut(db).remove(key).is_some() {
+        if state.remove_key(db, key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
         }
@@ -1229,8 +1238,7 @@ fn handle_pexpire(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
 
     let expire_at_secs = target_expire_at_millis.saturating_add(999) / 1000;
 
-    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(expire_at_secs);
+    if state.set_key_expire(db, key, Some(expire_at_secs)) {
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1269,7 +1277,7 @@ fn handle_pexpireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState
     }
 
     if i64::try_from(target_expire_at_millis).unwrap_or(i64::MAX) <= now_millis {
-        if state.db_map_mut(db).remove(key).is_some() {
+        if state.remove_key(db, key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
         }
@@ -1277,8 +1285,7 @@ fn handle_pexpireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState
     }
 
     let expire_at_secs = target_expire_at_millis.saturating_add(999) / 1000;
-    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(expire_at_secs);
+    if state.set_key_expire(db, key, Some(expire_at_secs)) {
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1315,15 +1322,14 @@ fn handle_expireat(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
     }
 
     if i64::try_from(target_expire_at).unwrap_or(i64::MAX) <= now {
-        if state.db_map_mut(db).remove(key).is_some() {
+        if state.remove_key(db, key).is_some() {
             state.bump_key_version(db, key);
             return CommandReply::Integer(1);
         }
         return CommandReply::Integer(0);
     }
 
-    if let Some(entry) = state.db_map_mut(db).get_mut(key) {
-        entry.expire_at_unix_secs = Some(target_expire_at);
+    if state.set_key_expire(db, key, Some(target_expire_at)) {
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1347,7 +1353,7 @@ fn handle_ttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
 
     let now = DispatchState::now_unix_seconds();
     if expire_at <= now {
-        let _ = state.db_map_mut(db).remove(key);
+        let _ = state.remove_key(db, key);
         return CommandReply::Integer(-2);
     }
     let remaining = expire_at.saturating_sub(now);
@@ -1375,7 +1381,7 @@ fn handle_pttl(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
     let now_millis = DispatchState::now_unix_millis();
     let expire_at_millis = expire_at_secs.saturating_mul(1000);
     if expire_at_millis <= now_millis {
-        let _ = state.db_map_mut(db).remove(key);
+        let _ = state.remove_key(db, key);
         return CommandReply::Integer(-2);
     }
     let remaining = expire_at_millis.saturating_sub(now_millis);
@@ -1436,15 +1442,12 @@ fn handle_persist(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) 
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
 
-    let mut changed = false;
-    if let Some(entry) = state.db_map_mut(db).get_mut(key)
-        && entry.expire_at_unix_secs.is_some()
+    if state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .is_some_and(|entry| entry.expire_at_unix_secs.is_some())
+        && state.set_key_expire(db, key, None)
     {
-        entry.expire_at_unix_secs = None;
-        changed = true;
-    }
-
-    if changed {
         state.bump_key_version(db, key);
         return CommandReply::Integer(1);
     }
@@ -1501,8 +1504,9 @@ fn mutate_counter_by(
         return CommandReply::Error("value is not an integer or out of range".to_owned());
     };
 
-    state.db_map_mut(db).insert(
-        key.to_vec(),
+    let _ = state.upsert_key(
+        db,
+        key,
         ValueEntry {
             value: next.to_string().into_bytes(),
             expire_at_unix_secs,
