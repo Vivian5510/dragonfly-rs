@@ -467,7 +467,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "INFO" => (frame.args.len() <= 1)
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message("INFO")),
-            "TIME" | "ROLE" | "READONLY" | "READWRITE" | "DBSIZE" => frame
+            "TIME" | "ROLE" | "READONLY" | "READWRITE" | "DBSIZE" | "RANDOMKEY" => frame
                 .args
                 .is_empty()
                 .then_some(())
@@ -539,6 +539,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             "READONLY" => Self::execute_readonly(frame),
             "READWRITE" => self.execute_readwrite(frame),
             "DBSIZE" => self.execute_dbsize(db, frame),
+            "RANDOMKEY" => self.execute_randomkey(db, frame),
             "FLUSHDB" => self.execute_flushdb(db, frame),
             "FLUSHALL" => self.execute_flushall(frame),
             "PSYNC" => self.execute_psync(frame),
@@ -659,6 +660,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         CommandReply::Integer(i64::try_from(self.core.db_size(db)).unwrap_or(i64::MAX))
+    }
+
+    fn execute_randomkey(&self, db: u16, frame: &CommandFrame) -> CommandReply {
+        if !frame.args.is_empty() {
+            return CommandReply::Error(
+                "wrong number of arguments for 'RANDOMKEY' command".to_owned(),
+            );
+        }
+
+        self.core
+            .random_key(db)
+            .map_or(CommandReply::Null, CommandReply::BulkString)
     }
 
     fn execute_flushall(&mut self, frame: &CommandFrame) -> CommandReply {
@@ -1907,6 +1920,71 @@ mod tests {
             &reply,
             eq(&vec![
                 b"-ERR wrong number of arguments for 'DBSIZE' command\r\n".to_vec()
+            ])
+        );
+    }
+
+    #[rstest]
+    fn resp_randomkey_returns_null_for_empty_database() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY"]))
+            .expect("RANDOMKEY should execute");
+        assert_that!(&reply, eq(&vec![b"$-1\r\n".to_vec()]));
+    }
+
+    #[rstest]
+    fn resp_randomkey_returns_existing_key_from_selected_database() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"random:one", b"v1"]),
+            )
+            .expect("SET random:one should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"random:two", b"v2"]),
+            )
+            .expect("SET random:two should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT 1 should execute");
+        let _ = app
+            .feed_connection_bytes(
+                &mut connection,
+                &resp_command(&[b"SET", b"random:db1", b"x"]),
+            )
+            .expect("SET random:db1 should execute");
+        let _ = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+            .expect("SELECT 0 should execute");
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY"]))
+            .expect("RANDOMKEY should execute");
+        assert_that!(reply.len(), eq(1_usize));
+        let key = decode_resp_bulk_payload(&reply[0]);
+        assert_that!(key == "random:one" || key == "random:two", eq(true));
+    }
+
+    #[rstest]
+    fn resp_randomkey_rejects_arguments() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+        let reply = app
+            .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY", b"extra"]))
+            .expect("RANDOMKEY should parse");
+        assert_that!(
+            &reply,
+            eq(&vec![
+                b"-ERR wrong number of arguments for 'RANDOMKEY' command\r\n".to_vec()
             ])
         );
     }

@@ -12,6 +12,7 @@ use dispatch::{
     CommandRegistry, DispatchState, ValueEntry, copy_between_states, rename_between_states,
 };
 use sharding::{HashTagShardResolver, ShardResolver};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Core module bootstrap object.
 ///
@@ -270,6 +271,41 @@ impl CoreModule {
     #[must_use]
     pub fn db_size(&self, db: DbIndex) -> usize {
         self.shard_states.iter().map(|state| state.db_len(db)).sum()
+    }
+
+    /// Returns one random key from selected logical DB across all shards.
+    ///
+    /// Expired keys are ignored even if they are still physically present in shard maps.
+    #[must_use]
+    pub fn random_key(&self, db: DbIndex) -> Option<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+
+        let mut candidates = Vec::new();
+        for state in &self.shard_states {
+            let Some(keyspace) = state.db_kv.get(&db) else {
+                continue;
+            };
+            for (key, value) in keyspace {
+                if value
+                    .expire_at_unix_secs
+                    .is_none_or(|expire_at| expire_at > now)
+                {
+                    candidates.push(key.clone());
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let entropy = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let len = u128::try_from(candidates.len()).unwrap_or(1);
+        let index = usize::try_from(entropy % len).unwrap_or(0);
+        Some(candidates.swap_remove(index))
     }
 
     /// Selects target shard for one command.
@@ -624,5 +660,36 @@ mod tests {
             &destination,
             eq(&CommandReply::BulkString(b"value".to_vec()))
         );
+    }
+
+    #[rstest]
+    fn core_random_key_returns_none_for_empty_database() {
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        assert_that!(&core.random_key(0), eq(&None));
+    }
+
+    #[rstest]
+    fn core_random_key_returns_live_key_from_selected_database() {
+        let mut core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+
+        let key_one = b"random:key:1".to_vec();
+        let key_two = b"random:key:2".to_vec();
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key_one.clone(), b"v1".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key_two.clone(), b"v2".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            1,
+            &CommandFrame::new("SET", vec![b"other-db".to_vec(), b"x".to_vec()]),
+        );
+
+        let selected = core.random_key(0);
+        assert_that!(selected.is_some(), eq(true));
+        let selected = selected.unwrap_or_default();
+        assert_that!(selected == key_one || selected == key_two, eq(true));
     }
 }
