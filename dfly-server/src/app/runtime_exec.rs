@@ -198,6 +198,15 @@ impl ServerApp {
             return false;
         }
 
+        if matches!(command.name.as_str(), "COPY" | "RENAME" | "RENAMENX")
+            && !target_shards.is_empty()
+        {
+            // Cross-shard copy/rename still runs as one shard-owned callback in Dragonfly's
+            // transaction runtime model. We execute it on one owner worker and keep the other
+            // touched shards in the hop barrier.
+            return true;
+        }
+
         let same_shard = self
             .same_shard_copy_rename_target_shard(command)
             .or_else(|| self.same_shard_multikey_count_target_shard(command))

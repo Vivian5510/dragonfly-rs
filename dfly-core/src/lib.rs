@@ -390,16 +390,33 @@ impl CoreModule {
         if matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") && frame.args.len() >= 2 {
             let source = self.resolve_shard_for_key(&frame.args[0]);
             let destination = self.resolve_shard_for_key(&frame.args[1]);
-            if source != shard || destination != shard {
+            if source == destination {
+                if source != shard {
+                    return CommandReply::Error(format!(
+                        "runtime worker shard mismatch: envelope={shard}, source={source}, destination={destination}",
+                    ));
+                }
+
+                let Some(mut target_state) = self.lock_shard(shard) else {
+                    return CommandReply::Error(format!("invalid target shard {shard}"));
+                };
+                return self.command_registry.dispatch(db, frame, &mut target_state);
+            }
+
+            if shard != source && shard != destination {
                 return CommandReply::Error(format!(
                     "runtime worker shard mismatch: envelope={shard}, source={source}, destination={destination}",
                 ));
             }
 
-            let Some(mut target_state) = self.lock_shard(shard) else {
-                return CommandReply::Error(format!("invalid target shard {shard}"));
+            // Cross-shard COPY/RENAME execution keeps one worker-owned callback while
+            // the command implementation acquires both shard states in deterministic order.
+            return match frame.name.as_str() {
+                "COPY" => self.execute_copy_in_db(db, frame),
+                "RENAME" => self.execute_rename_in_db(db, frame, false),
+                "RENAMENX" => self.execute_rename_in_db(db, frame, true),
+                _ => CommandReply::Error("unknown command".to_owned()),
             };
-            return self.command_registry.dispatch(db, frame, &mut target_state);
         }
 
         if matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") && frame.args.len() < 2 {
@@ -1202,7 +1219,7 @@ mod tests {
     }
 
     #[rstest]
-    fn core_execute_on_shard_in_db_rejects_cross_shard_copy_command() {
+    fn core_execute_on_shard_in_db_runs_cross_shard_copy_from_owner_worker() {
         let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
         let source_key = b"runtime:copy:cross:source".to_vec();
         let source_shard = core.resolve_shard_for_key(&source_key);
@@ -1215,13 +1232,41 @@ mod tests {
             destination_shard = core.resolve_shard_for_key(&destination_key);
         }
 
+        let set = core.execute_on_shard_in_db(
+            source_shard,
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+
         let copy = core.execute_on_shard_in_db(
             source_shard,
             0,
+            &CommandFrame::new("COPY", vec![source_key.clone(), destination_key.clone()]),
+        );
+        assert_that!(&copy, eq(&CommandReply::Integer(1)));
+
+        let destination_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key.clone()]));
+        assert_that!(
+            &destination_value,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
+
+        let mut non_owner_shard = 0_u16;
+        for shard in 0_u16..8_u16 {
+            if shard != source_shard && shard != destination_shard {
+                non_owner_shard = shard;
+                break;
+            }
+        }
+        let copy_wrong_worker = core.execute_on_shard_in_db(
+            non_owner_shard,
+            0,
             &CommandFrame::new("COPY", vec![source_key, destination_key]),
         );
-        let CommandReply::Error(copy_error) = copy else {
-            panic!("cross-shard copy must fail");
+        let CommandReply::Error(copy_error) = copy_wrong_worker else {
+            panic!("cross-shard copy on non-owner worker must fail");
         };
         assert_that!(
             copy_error.contains("runtime worker shard mismatch"),
