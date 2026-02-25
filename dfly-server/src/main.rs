@@ -1,6 +1,7 @@
 //! Binary entrypoint for `dfly-server`.
 
 mod app;
+#[cfg(test)]
 mod ingress;
 mod network;
 

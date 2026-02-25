@@ -2,7 +2,7 @@
 
 mod runtime_exec;
 
-use crate::network::{ServerReactor, ServerReactorConfig};
+use crate::network::{ServerReactorConfig, ThreadedServerReactor};
 use dfly_cluster::ClusterModule;
 use dfly_cluster::slot::key_slot;
 use dfly_common::config::{ClusterMode, RuntimeConfig};
@@ -2174,14 +2174,18 @@ pub fn run() -> DflyResult<()> {
     let _ = app.recover_from_replication_journal()?;
     let _ = app.recover_from_replication_journal_from_lsn(app.replication.journal_lsn())?;
 
+    let reactor_config = ServerReactorConfig {
+        io_worker_count: usize::from(app.facade.io_thread_count),
+        ..ServerReactorConfig::default()
+    };
     let mut reactor = if let Some(memcache_bind_addr) = memcache_bind_addr {
-        ServerReactor::bind_with_memcache(
+        ThreadedServerReactor::bind_with_memcache(
             redis_bind_addr,
             Some(memcache_bind_addr),
-            ServerReactorConfig::default(),
+            reactor_config,
         )?
     } else {
-        ServerReactor::bind(redis_bind_addr, ServerReactorConfig::default())?
+        ThreadedServerReactor::bind(redis_bind_addr, reactor_config)?
     };
     println!("{}", app.startup_summary());
     loop {

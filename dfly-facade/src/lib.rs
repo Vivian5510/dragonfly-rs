@@ -21,9 +21,8 @@ impl FacadeModule {
     /// Builds the facade bootstrap model from process config.
     #[must_use]
     pub fn from_config(config: &RuntimeConfig) -> Self {
-        // Runtime currently uses one reactor service loop as the active I/O worker domain.
-        // ProactorPool remains available for focused facade tests but is not bootstrapped here.
-        let io_thread_count = 1;
+        // Reactor runtime maps accepted sockets across a fixed I/O worker set.
+        let io_thread_count = config.shard_count.get().max(1);
         Self {
             redis_port: config.redis_port,
             memcached_port: config.memcached_port,
