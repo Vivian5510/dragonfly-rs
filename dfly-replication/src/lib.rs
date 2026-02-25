@@ -57,6 +57,30 @@ impl AckProgressTracker {
     }
 }
 
+/// Cloneable ACK-progress waiter used by `WAIT` callers that must not hold outer locks
+/// while blocking for replica acknowledgements.
+#[derive(Debug, Clone)]
+pub struct AckProgressWatcher {
+    tracker: AckProgressTracker,
+}
+
+impl AckProgressWatcher {
+    /// Returns current progress token.
+    #[must_use]
+    pub fn token(&self) -> u64 {
+        self.tracker.snapshot()
+    }
+
+    /// Blocks until token advances or timeout elapses.
+    ///
+    /// Returns `true` when progress advanced, `false` when timeout elapsed unchanged.
+    #[must_use]
+    pub fn wait_for_progress_since(&self, observed_token: u64, timeout: Duration) -> bool {
+        self.tracker
+            .wait_for_progress_since(observed_token, timeout)
+    }
+}
+
 /// Replication subsystem bootstrap module.
 #[derive(Debug, Clone)]
 pub struct ReplicationModule {
@@ -243,6 +267,14 @@ impl ReplicationModule {
     #[must_use]
     pub fn ack_progress_token(&self) -> u64 {
         self.ack_progress.snapshot()
+    }
+
+    /// Returns one cloneable ACK progress watcher that can wait without borrowing this module.
+    #[must_use]
+    pub fn ack_progress_watcher(&self) -> AckProgressWatcher {
+        AckProgressWatcher {
+            tracker: self.ack_progress.clone(),
+        }
     }
 
     /// Blocks until ACK progress token advances or timeout elapses.

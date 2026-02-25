@@ -1018,13 +1018,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             && frame.args[0].eq_ignore_ascii_case(b"CAPA")
             && frame.args[1].eq_ignore_ascii_case(b"dragonfly")
         {
-            let sync_id = self
-                .replication_guard()
-                .create_sync_session(usize::from(self.config.shard_count.get()));
+            let (master_replid, sync_id) = {
+                let mut replication = self.replication_guard();
+                (
+                    replication.master_replid().to_owned(),
+                    replication.create_sync_session(usize::from(self.config.shard_count.get())),
+                )
+            };
             return CommandReply::Array(vec![
-                CommandReply::BulkString(
-                    self.replication_guard().master_replid().as_bytes().to_vec(),
-                ),
+                CommandReply::BulkString(master_replid.into_bytes()),
                 CommandReply::BulkString(sync_id.into_bytes()),
                 CommandReply::Integer(i64::from(self.config.shard_count.get())),
                 CommandReply::Integer(1),
@@ -1155,16 +1157,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         connection: &mut ServerConnection,
         endpoint: ReplicaEndpointIdentity,
     ) {
+        let mut replication = self.replication_guard();
         if let Some(existing) = connection.replica_endpoint.clone()
             && existing != endpoint
         {
-            let _ = self
-                .replication_guard()
-                .remove_replica_endpoint(&existing.address, existing.listening_port);
+            let _ = replication.remove_replica_endpoint(&existing.address, existing.listening_port);
         }
 
-        self.replication_guard()
-            .register_replica_endpoint(endpoint.address.clone(), endpoint.listening_port);
+        replication.register_replica_endpoint(endpoint.address.clone(), endpoint.listening_port);
         connection.replica_endpoint = Some(endpoint);
     }
 
@@ -1224,20 +1224,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("PSYNC offset must be a valid integer".to_owned());
         };
 
-        let master_replid = self.replication_guard().master_replid().to_owned();
-        let master_offset = self.replication_guard().replication_offset();
         let requested_offset_u64 = u64::try_from(requested_offset).ok();
+        let mut replication = self.replication_guard();
+        let master_replid = replication.master_replid().to_owned();
+        let master_offset = replication.replication_offset();
         if requested_replid == master_replid
-            && requested_offset_u64.is_some_and(|offset| {
-                self.replication_guard()
-                    .can_partial_sync_from_offset(offset)
-            })
+            && requested_offset_u64
+                .is_some_and(|offset| replication.can_partial_sync_from_offset(offset))
         {
-            self.replication_guard().mark_replicas_stable_sync();
+            replication.mark_replicas_stable_sync();
             return CommandReply::SimpleString("CONTINUE".to_owned());
         }
 
-        self.replication_guard().mark_replicas_full_sync();
+        replication.mark_replicas_full_sync();
         CommandReply::SimpleString(format!("FULLRESYNC {master_replid} {master_offset}"))
     }
 
@@ -1260,22 +1259,27 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         // WAIT returns the number of replicas that acknowledged the master offset captured at
-        // WAIT entry time. We block on replication ACK progress notifications instead of polling.
-        let target_offset = self.replication_guard().replication_offset();
+        // WAIT entry time. We block on ACK progress with a cloneable watcher so the blocking wait
+        // does not hold the outer replication mutex and starve ACK updates.
+        let (target_offset, ack_watcher) = {
+            let replication = self.replication_guard();
+            (
+                replication.replication_offset(),
+                replication.ack_progress_watcher(),
+            )
+        };
         let timeout = Duration::from_millis(timeout_millis);
         let wait_started_at = std::time::Instant::now();
-        let current_replica_count = || {
-            u64::try_from(
-                self.replication_guard()
-                    .acked_replica_count_at_or_above(target_offset),
-            )
-            .unwrap_or(u64::MAX)
+        let current_replica_count = || -> u64 {
+            let replication = self.replication_guard();
+            u64::try_from(replication.acked_replica_count_at_or_above(target_offset))
+                .unwrap_or(u64::MAX)
         };
         let integer_reply =
             |replicated: u64| CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
 
         loop {
-            let observed_progress = self.replication_guard().ack_progress_token();
+            let observed_progress = ack_watcher.token();
             let replicated = current_replica_count();
             if replicated >= required || timeout.is_zero() {
                 return integer_reply(replicated);
@@ -1287,9 +1291,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             }
 
             let remaining = timeout.saturating_sub(elapsed);
-            let progress = self
-                .replication_guard()
-                .wait_for_ack_progress(observed_progress, remaining);
+            let progress = ack_watcher.wait_for_progress_since(observed_progress, remaining);
             if !progress {
                 return integer_reply(current_replica_count());
             }
@@ -1306,14 +1308,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(master_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY FLOW master id must be valid UTF-8".to_owned());
         };
-        if master_id != self.replication_guard().master_replid() {
+        let mut replication = self.replication_guard();
+        if master_id != replication.master_replid() {
             return CommandReply::Error("bad master id".to_owned());
         }
 
         let Ok(sync_id) = std::str::from_utf8(&frame.args[2]) else {
             return CommandReply::Error("DFLY FLOW sync id must be valid UTF-8".to_owned());
         };
-        if !self.replication_guard().is_known_sync_session(sync_id) {
+        if !replication.is_known_sync_session(sync_id) {
             return CommandReply::Error("syncid not found".to_owned());
         }
 
@@ -1362,16 +1365,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         let (sync_type, flow_start_offset) = requested_offset
-            .filter(|offset| {
-                self.replication_guard()
-                    .can_partial_sync_from_offset(*offset)
-            })
+            .filter(|offset| replication.can_partial_sync_from_offset(*offset))
             .map_or((FlowSyncType::Full, None), |offset| {
                 (FlowSyncType::Partial, Some(offset))
             });
 
-        let eof_token = self.replication_guard().allocate_flow_eof_token();
-        if let Err(error) = self.replication_guard().register_sync_flow(
+        let eof_token = replication.allocate_flow_eof_token();
+        if let Err(error) = replication.register_sync_flow(
             sync_id,
             flow_id,
             sync_type,
@@ -1399,14 +1399,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY SYNC sync id must be valid UTF-8".to_owned());
         };
-        if let Err(error) = self
-            .replication_guard()
-            .mark_sync_session_full_sync(sync_id)
-        {
+        let mut replication = self.replication_guard();
+        if let Err(error) = replication.mark_sync_session_full_sync(sync_id) {
             return sync_session_error_reply(error);
         }
 
-        self.replication_guard().mark_replicas_full_sync();
+        replication.mark_replicas_full_sync();
         CommandReply::SimpleString("OK".to_owned())
     }
 
@@ -1419,14 +1417,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY STARTSTABLE sync id must be valid UTF-8".to_owned());
         };
-        if let Err(error) = self
-            .replication_guard()
-            .mark_sync_session_stable_sync(sync_id)
-        {
+        let mut replication = self.replication_guard();
+        if let Err(error) = replication.mark_sync_session_stable_sync(sync_id) {
             return sync_session_error_reply(error);
         }
 
-        self.replication_guard().mark_replicas_stable_sync();
+        replication.mark_replicas_stable_sync();
         CommandReply::SimpleString("OK".to_owned())
     }
 
@@ -1674,7 +1670,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 "wrong number of arguments for 'CLUSTER MYID' command".to_owned(),
             );
         }
-        CommandReply::BulkString(self.cluster_read_guard().node_id.as_bytes().to_vec())
+        let cluster = self.cluster_read_guard();
+        CommandReply::BulkString(cluster.node_id.as_bytes().to_vec())
     }
 
     fn execute_cluster_shards(&self, frame: &CommandFrame) -> CommandReply {
@@ -1698,7 +1695,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             .collect::<Vec<_>>();
         let nodes = vec![CommandReply::Array(vec![
             CommandReply::BulkString(b"id".to_vec()),
-            CommandReply::BulkString(self.cluster_read_guard().node_id.as_bytes().to_vec()),
+            CommandReply::BulkString(cluster.node_id.as_bytes().to_vec()),
             CommandReply::BulkString(b"endpoint".to_vec()),
             CommandReply::BulkString(host.as_bytes().to_vec()),
             CommandReply::BulkString(b"ip".to_vec()),
@@ -1880,11 +1877,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn cluster_moved_reply_for_key(&self, key: &[u8]) -> Option<CommandReply> {
-        self.cluster_read_guard()
+        let cluster = self.cluster_read_guard();
+        cluster
             .moved_slot_for_key(key)
             .map(|slot| CommandReply::Moved {
                 slot,
-                endpoint: self.cluster_read_guard().redirect_endpoint.clone(),
+                endpoint: cluster.redirect_endpoint.clone(),
             })
     }
 
