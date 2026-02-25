@@ -28,6 +28,8 @@ struct ParseRequest {
 struct IoWorkerQueueMetrics {
     pending: AtomicUsize,
     peak_pending: AtomicUsize,
+    pending_bytes: AtomicUsize,
+    peak_pending_bytes: AtomicUsize,
     blocked_submitters: AtomicUsize,
 }
 
@@ -182,6 +184,30 @@ impl ProactorPool {
         Ok(metrics.peak_pending.load(Ordering::Acquire))
     }
 
+    /// Returns current pending parse queue bytes for one I/O worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when worker id is out of range.
+    pub fn pending_queue_bytes(&self, io_worker: u16) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_worker.get(usize::from(io_worker)) else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
+        Ok(metrics.pending_bytes.load(Ordering::Acquire))
+    }
+
+    /// Returns maximum observed pending parse queue bytes for one I/O worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when worker id is out of range.
+    pub fn peak_pending_queue_bytes(&self, io_worker: u16) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_worker.get(usize::from(io_worker)) else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
+        Ok(metrics.peak_pending_bytes.load(Ordering::Acquire))
+    }
+
     /// Returns current number of submitters blocked by parse queue pressure.
     ///
     /// # Errors
@@ -232,6 +258,7 @@ impl ProactorPool {
             return Err(DflyError::InvalidState("io worker is out of range"));
         };
         let queue_soft_limit = self.queue_soft_limit;
+        let request_bytes = bytes.len();
 
         let mut blocked_submitter_marked = false;
         while queue_soft_limit != usize::MAX
@@ -264,6 +291,11 @@ impl ProactorPool {
 
         let pending_depth = queue_metrics.pending.fetch_add(1, Ordering::AcqRel) + 1;
         update_peak_pending(&queue_metrics.peak_pending, pending_depth);
+        let pending_bytes = queue_metrics
+            .pending_bytes
+            .fetch_add(request_bytes, Ordering::AcqRel)
+            + request_bytes;
+        update_peak_pending(&queue_metrics.peak_pending_bytes, pending_bytes);
 
         let (response_tx, response_rx) = std_mpsc::channel::<ProactorParseBatch>();
         sender
@@ -278,6 +310,11 @@ impl ProactorPool {
                     Ordering::Acquire,
                     |pending| Some(pending.saturating_sub(1)),
                 );
+                let _ = queue_metrics.pending_bytes.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |pending| Some(pending.saturating_sub(request_bytes)),
+                );
                 queue_state.changed.notify_all();
                 DflyError::InvalidState("io worker queue is closed")
             })?;
@@ -286,6 +323,11 @@ impl ProactorPool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |pending| Some(pending.saturating_sub(1)),
+            );
+            let _ = queue_metrics.pending_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(request_bytes)),
             );
             queue_state.changed.notify_all();
             DflyError::InvalidState("io worker reply channel is closed")
@@ -374,6 +416,7 @@ fn handle_parse_request(
         bytes,
         response,
     } = request;
+    let request_bytes = bytes.len();
     parser.feed_bytes(&bytes);
     let (commands, parse_error) = drain_commands(&mut parser);
     if let Some(queue_metrics) = queue_metrics_per_worker.get(usize::from(io_worker)) {
@@ -383,6 +426,11 @@ fn handle_parse_request(
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     Some(pending.saturating_sub(1))
                 });
+        let _ = queue_metrics.pending_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |pending| Some(pending.saturating_sub(request_bytes)),
+        );
     }
     if let Some(queue_state) = queue_state_per_worker.get(usize::from(io_worker)) {
         queue_state.changed.notify_all();
@@ -489,9 +537,20 @@ mod tests {
             eq(0_usize)
         );
         assert_that!(
+            pool.pending_queue_bytes(0)
+                .expect("pending bytes should be available"),
+            eq(0_usize)
+        );
+        assert_that!(
             pool.peak_pending_queue_depth(0)
                 .expect("peak depth should be available")
                 >= 1,
+            eq(true)
+        );
+        assert_that!(
+            pool.peak_pending_queue_bytes(0)
+                .expect("peak bytes should be available")
+                >= b"*1\r\n$4\r\nPING\r\n".len(),
             eq(true)
         );
         assert_that!(
