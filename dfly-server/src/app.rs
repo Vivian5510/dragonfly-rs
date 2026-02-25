@@ -2220,29 +2220,33 @@ fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns `DflyError::Protocol` if the bootstrap probe command cannot be parsed.
+/// Returns `DflyError::Io` when listener bootstrap or reactor polling fails.
 pub fn run() -> DflyResult<()> {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    let mut bootstrap_connection = ServerApp::new_connection(ClientProtocol::Resp);
-
-    // Keep one minimal end-to-end bootstrap probe so command pipeline code is part of
-    // regular binary execution path, not only test-only dead code.
-    let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
+    let config = RuntimeConfig::default();
+    let redis_bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.redis_port));
+    let memcache_bind_addr = config
+        .memcached_port
+        .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+    let mut app = ServerApp::new(config);
+    // Keep subsystem initialization paths exercised in regular server startup.
     let snapshot = app.create_snapshot_bytes()?;
     app.load_snapshot_bytes(&snapshot)?;
     let _ = app.recover_from_replication_journal()?;
     let _ = app.recover_from_replication_journal_from_lsn(app.replication.journal_lsn())?;
 
-    // Optional ingress probe that exercises real socket reactor wiring without forcing
-    // the default binary path into a long-running server loop.
-    if std::env::var_os("DFLY_RS_ENABLE_REACTOR_BOOTSTRAP").is_some() {
-        let bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ServerReactor::bind(bind_addr, ServerReactorConfig::default())?;
-        let _ = reactor.poll_once(&mut app, Some(Duration::from_millis(1)))?;
-    }
-
+    let mut reactor = if let Some(memcache_bind_addr) = memcache_bind_addr {
+        ServerReactor::bind_with_memcache(
+            redis_bind_addr,
+            Some(memcache_bind_addr),
+            ServerReactorConfig::default(),
+        )?
+    } else {
+        ServerReactor::bind(redis_bind_addr, ServerReactorConfig::default())?
+    };
     println!("{}", app.startup_summary());
-    Ok(())
+    loop {
+        let _ = reactor.poll_once(&mut app, Some(Duration::from_millis(10)))?;
+    }
 }
 
 #[cfg(test)]
