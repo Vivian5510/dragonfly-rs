@@ -234,6 +234,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Test-only helper that detaches one connection and releases its replica endpoint identity.
     #[cfg(test)]
     pub fn disconnect_connection(&mut self, connection: &mut ServerConnection) {
+        if let Some(affinity) = connection.io_affinity.take() {
+            let _ = self.facade.proactor_pool.release_connection(affinity);
+        }
         if let Some(endpoint) = connection.replica_endpoint.take() {
             let _ = self
                 .replication

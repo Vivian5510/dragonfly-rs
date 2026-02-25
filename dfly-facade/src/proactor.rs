@@ -29,6 +29,10 @@ enum ParseRequest {
         context: ConnectionContext,
         bytes: Vec<u8>,
     },
+    Release {
+        sequence: u64,
+        connection_id: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +98,7 @@ pub struct ProactorBoundParseBatch {
 enum ProactorParseCompletion {
     Detached(ProactorParseBatch),
     Bound(ProactorBoundParseBatch),
+    Released,
 }
 
 /// In-memory proactor pool using one worker thread per I/O queue.
@@ -315,7 +320,8 @@ impl ProactorPool {
         let sequence = self.submit_parse_request(io_worker, request, bytes.len())?;
         match self.wait_for_parse_completion(io_worker, sequence)? {
             ProactorParseCompletion::Detached(reply) => Ok(reply),
-            ProactorParseCompletion::Bound(_) => Err(DflyError::InvalidState(
+            ProactorParseCompletion::Bound(_) | ProactorParseCompletion::Released => Err(
+                DflyError::InvalidState(
                 "io worker completion type mismatch",
             )),
         }
@@ -345,9 +351,30 @@ impl ProactorPool {
         let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
         match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
             ProactorParseCompletion::Bound(reply) => Ok(reply),
-            ProactorParseCompletion::Detached(_) => Err(DflyError::InvalidState(
+            ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Released => Err(
+                DflyError::InvalidState(
                 "io worker completion type mismatch",
             )),
+        }
+    }
+
+    /// Releases worker-owned parser state for one bound connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when worker id is invalid or queue/completion
+    /// state is unavailable.
+    pub fn release_connection(&self, affinity: ConnectionAffinity) -> DflyResult<()> {
+        let request = ParseRequest::Release {
+            sequence: 0,
+            connection_id: affinity.connection_id,
+        };
+        let sequence = self.submit_parse_request(affinity.io_worker, request, 0)?;
+        match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
+            ProactorParseCompletion::Released => Ok(()),
+            ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Bound(_) => Err(
+                DflyError::InvalidState("io worker completion type mismatch"),
+            ),
         }
     }
 
@@ -431,6 +458,10 @@ impl ProactorPool {
                 connection_id,
                 context,
                 bytes,
+            },
+            ParseRequest::Release { connection_id, .. } => ParseRequest::Release {
+                sequence,
+                connection_id,
             },
         };
         sender.send(request).map_err(|_| {
@@ -613,6 +644,21 @@ fn handle_parse_request(
                 completion_per_worker,
             );
         }
+        ParseRequest::Release {
+            sequence,
+            connection_id,
+        } => {
+            let _ = parsers_by_connection.remove(&connection_id);
+            finalize_parse_request(
+                io_worker,
+                sequence,
+                0,
+                ProactorParseCompletion::Released,
+                queue_metrics_per_worker,
+                queue_state_per_worker,
+                completion_per_worker,
+            );
+        }
     }
 }
 
@@ -782,6 +828,31 @@ mod tests {
             &first_complete.commands[0].args,
             eq(&vec![b"hello".to_vec()])
         );
+    }
+
+    #[rstest]
+    fn proactor_pool_release_connection_drops_bound_parser_state() {
+        let pool = ProactorPool::new(1);
+        let affinity = pool.bind_connection(77);
+        let context = ConnectionContext {
+            protocol: ClientProtocol::Resp,
+            db_index: 0,
+            privileged: false,
+        };
+
+        let partial = pool
+            .parse_on_worker_for_connection(affinity, &context, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
+            .expect("partial parse should reach worker");
+        assert_that!(partial.commands.is_empty(), eq(true));
+
+        assert_that!(pool.release_connection(affinity).is_ok(), eq(true));
+
+        let parsed = pool
+            .parse_on_worker_for_connection(affinity, &context, b"*1\r\n$4\r\nPING\r\n")
+            .expect("fresh parser after release should parse full command");
+        assert_that!(parsed.commands.len(), eq(1_usize));
+        assert_that!(parsed.commands[0].name.as_str(), eq("PING"));
+        assert_that!(parsed.parse_error.is_none(), eq(true));
     }
 
     #[rstest]
