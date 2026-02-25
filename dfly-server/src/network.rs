@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use dfly_common::error::{DflyError, DflyResult};
-use dfly_facade::connection::ConnectionState;
 use dfly_facade::protocol::ClientProtocol;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -112,7 +111,6 @@ enum ConnectionLifecycle {
 struct ReactorConnection {
     socket: TcpStream,
     logical: ServerConnection,
-    parser: ConnectionState,
     write_buffer: Vec<u8>,
     lifecycle: ConnectionLifecycle,
     read_paused_by_backpressure: bool,
@@ -122,11 +120,9 @@ struct ReactorConnection {
 impl ReactorConnection {
     fn new(socket: TcpStream, protocol: ClientProtocol) -> Self {
         let logical = ServerApp::new_connection(protocol);
-        let parser = ConnectionState::new(logical.context.clone());
         Self {
             socket,
             logical,
-            parser,
             write_buffer: Vec::new(),
             lifecycle: ConnectionLifecycle::Active,
             read_paused_by_backpressure: false,
@@ -433,32 +429,26 @@ impl ServerReactor {
                     return;
                 }
                 Ok(read_len) => {
-                    connection.parser.feed_bytes(&chunk[..read_len]);
-                    loop {
-                        match connection.parser.try_pop_command() {
-                            Ok(Some(parsed)) => {
-                                if let Some(reply) =
-                                    app.execute_parsed_command(&mut connection.logical, parsed)
-                                {
-                                    connection.write_buffer.extend_from_slice(&reply);
-                                    connection.update_backpressure_state(
-                                        write_high_watermark,
-                                        write_low_watermark,
-                                    );
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                connection
-                                    .write_buffer
-                                    .extend_from_slice(format!("-ERR {error}\r\n").as_bytes());
-                                connection.mark_draining();
+                    match app.feed_connection_bytes(&mut connection.logical, &chunk[..read_len]) {
+                        Ok(replies) => {
+                            for reply in replies {
+                                connection.write_buffer.extend_from_slice(&reply);
                                 connection.update_backpressure_state(
                                     write_high_watermark,
                                     write_low_watermark,
                                 );
-                                return;
                             }
+                        }
+                        Err(error) => {
+                            connection
+                                .write_buffer
+                                .extend_from_slice(format!("-ERR {error}\r\n").as_bytes());
+                            connection.mark_draining();
+                            connection.update_backpressure_state(
+                                write_high_watermark,
+                                write_low_watermark,
+                            );
+                            return;
                         }
                     }
                 }

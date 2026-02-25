@@ -1,7 +1,7 @@
-use super::{ServerApp, ServerConnection};
+use super::ServerApp;
 use dfly_cluster::slot::{SlotRange, key_slot};
 use dfly_common::config::{ClusterMode, RuntimeConfig};
-use dfly_common::error::{DflyError, DflyResult};
+use dfly_common::error::DflyError;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::protocol::ClientProtocol;
 use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
@@ -11,34 +11,6 @@ use googletest::prelude::*;
 use rstest::rstest;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-trait TestConnectionFeedExt {
-    fn feed_connection_bytes(
-        &mut self,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>>;
-}
-
-impl TestConnectionFeedExt for ServerApp {
-    fn feed_connection_bytes(
-        &mut self,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>> {
-        connection.ingress_parser.feed_bytes(bytes);
-        let mut responses = Vec::new();
-        loop {
-            let Some(parsed) = connection.ingress_parser.try_pop_command()? else {
-                break;
-            };
-            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
-                responses.push(encoded);
-            }
-        }
-        Ok(responses)
-    }
-}
 
 #[rstest]
 fn resp_connection_executes_set_then_get() {

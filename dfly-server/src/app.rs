@@ -16,7 +16,6 @@ use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::ConnectionContext;
-#[cfg(test)]
 use dfly_facade::connection::ConnectionState;
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, ParsedCommand, parse_next_command};
 use dfly_replication::ReplicationModule;
@@ -208,8 +207,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             privileged: false,
         };
         ServerConnection {
-            #[cfg(test)]
-            ingress_parser: ConnectionState::new(context.clone()),
+            parser: ConnectionState::new(context.clone()),
             context,
             transaction: TransactionSession::default(),
             replica_endpoint: None,
@@ -228,6 +226,32 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 .replication
                 .remove_replica_endpoint(&endpoint.address, endpoint.listening_port);
         }
+    }
+
+    /// Feeds network bytes into one connection and executes all newly completed commands.
+    ///
+    /// The return vector contains one protocol-encoded reply per decoded command.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Protocol` when connection input bytes violate the active
+    /// wire protocol framing rules.
+    pub fn feed_connection_bytes(
+        &mut self,
+        connection: &mut ServerConnection,
+        bytes: &[u8],
+    ) -> DflyResult<Vec<Vec<u8>>> {
+        connection.parser.feed_bytes(bytes);
+        let mut responses = Vec::new();
+        loop {
+            let Some(parsed) = connection.parser.try_pop_command()? else {
+                break;
+            };
+            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
+                responses.push(encoded);
+            }
+        }
+        Ok(responses)
     }
 
     pub(crate) fn execute_parsed_command(
@@ -1845,11 +1869,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 /// Per-client state stored by the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConnection {
+    /// Per-connection parser state used by ingress read path.
+    pub parser: ConnectionState,
     /// Stable connection metadata shared with worker-owned parser state.
     pub context: ConnectionContext,
-    /// Test-only parser state used by unit tests that drive command bytes directly.
-    #[cfg(test)]
-    pub ingress_parser: ConnectionState,
     /// Connection-local transaction queue (`MULTI` mode).
     pub transaction: TransactionSession,
     /// Replica endpoint identity announced on this connection via `REPLCONF`.
