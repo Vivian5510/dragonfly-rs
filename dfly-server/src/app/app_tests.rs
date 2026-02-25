@@ -1875,7 +1875,12 @@ fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
 
     let queued = vec![CommandFrame::new(
         "MSET",
-        vec![first_key, b"a".to_vec(), second_key, b"b".to_vec()],
+        vec![
+            first_key.clone(),
+            b"a".to_vec(),
+            second_key.clone(),
+            b"b".to_vec(),
+        ],
     )];
     let plan = app.build_exec_plan(&queued);
     assert_that!(plan.mode, eq(TransactionMode::Global));
@@ -1911,8 +1916,18 @@ fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
         .expect("drain should succeed");
     assert_that!(first_runtime.len(), eq(1_usize));
     assert_that!(second_runtime.len(), eq(1_usize));
-    assert_that!(&first_runtime[0].command, eq(&queued[0]));
-    assert_that!(&second_runtime[0].command, eq(&queued[0]));
+    assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
+    assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
+    assert_that!(
+        &first_runtime[0].command.args,
+        eq(&vec![first_key, b"a".to_vec()])
+    );
+    assert_that!(
+        &second_runtime[0].command.args,
+        eq(&vec![second_key, b"b".to_vec()])
+    );
+    assert_that!(first_runtime[0].execute_on_worker, eq(true));
+    assert_that!(second_runtime[0].execute_on_worker, eq(true));
 }
 
 #[rstest]

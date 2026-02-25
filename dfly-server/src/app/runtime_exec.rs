@@ -135,7 +135,7 @@ impl ServerApp {
             let reply = if let Some(worker_reply) = worker_replies_by_command[index].clone() {
                 worker_reply
             } else {
-                self.execute_user_command(db, command, Some(txid))
+                self.execute_command_after_runtime_barrier(db, command)
             };
             self.maybe_append_journal_for_command(Some(txid), db, command, &reply);
             replies.push(reply);
@@ -162,6 +162,14 @@ impl ServerApp {
                 .any(|shard| usize::from(*shard) >= usize::from(self.config.shard_count.get()))
             {
                 per_command_error[index] = Some(out_of_range_error.clone());
+            }
+            if self.command_uses_grouped_worker_post_barrier(command, &target_shards) {
+                // This command will be executed via grouped worker dispatch in the
+                // post-barrier phase, so the pre-dispatch wave should not emit
+                // redundant fanout envelopes.
+                target_shards_by_command.push(Vec::new());
+                execute_on_worker_by_command.push(false);
+                continue;
             }
             let execute_on_worker = self.command_should_execute_on_worker(command, &target_shards);
             target_shards_by_command.push(target_shards);
@@ -198,6 +206,42 @@ impl ServerApp {
             return false;
         };
         target_shards.len() == 1 && target_shards.first().copied() == Some(same_shard)
+    }
+
+    fn command_uses_grouped_worker_post_barrier(
+        &self,
+        command: &CommandFrame,
+        target_shards: &[u16],
+    ) -> bool {
+        if self.cluster.mode != ClusterMode::Disabled {
+            return false;
+        }
+        if target_shards.len() <= 1 {
+            return false;
+        }
+
+        matches!(
+            command.name.as_str(),
+            "MGET" | "MSET" | "MSETNX" | "DEL" | "UNLINK" | "EXISTS" | "TOUCH"
+        )
+    }
+
+    fn execute_command_after_runtime_barrier(
+        &mut self,
+        db: u16,
+        command: &CommandFrame,
+    ) -> CommandReply {
+        if let Some(reply) =
+            self.execute_multikey_string_commands_via_runtime_internal(db, command, false)
+        {
+            return reply;
+        }
+        if let Some(reply) =
+            self.execute_multi_key_counting_command_via_runtime_internal(db, command, false)
+        {
+            return reply;
+        }
+        self.execute_command_without_side_effects(db, command)
     }
 
     pub(super) fn collect_worker_hop_replies(
