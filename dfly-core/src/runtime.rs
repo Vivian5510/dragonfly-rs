@@ -80,6 +80,7 @@ pub trait ShardRuntime: Send + Sync {
 /// execution can follow Dragonfly's "thread + fiber" shape.
 pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
+    queue_soft_limit: usize,
     senders: Vec<mpsc::UnboundedSender<QueuedEnvelope>>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
     queue_metrics_per_shard: Arc<Vec<ShardQueueMetrics>>,
@@ -91,6 +92,7 @@ type RuntimeExecutor = dyn Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync;
 type RuntimeMaintenance = dyn Fn(ShardId) + Send + Sync;
 const SHARD_WORKER_YIELD_INTERVAL: usize = 64;
 const SHARD_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
+const DEFAULT_QUEUE_SOFT_LIMIT: usize = usize::MAX;
 
 fn update_peak_pending(peak: &AtomicUsize, candidate: usize) {
     let mut observed = peak.load(Ordering::Acquire);
@@ -106,6 +108,7 @@ impl std::fmt::Debug for InMemoryShardRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryShardRuntime")
             .field("shard_count", &self.shard_count)
+            .field("queue_soft_limit", &self.queue_soft_limit)
             .field("senders", &self.senders.len())
             .field("execution_per_shard", &self.execution_per_shard.len())
             .field(
@@ -138,7 +141,36 @@ impl InMemoryShardRuntime {
         F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
     {
         let executor: Arc<RuntimeExecutor> = Arc::new(executor);
-        Self::new_internal(shard_count, &executor, None, SHARD_MAINTENANCE_INTERVAL)
+        Self::new_internal(
+            shard_count,
+            &executor,
+            None,
+            SHARD_MAINTENANCE_INTERVAL,
+            DEFAULT_QUEUE_SOFT_LIMIT,
+        )
+    }
+
+    /// Creates one runtime with custom worker executor and bounded submit queue pressure limit.
+    ///
+    /// Calls to `submit_with_sequence` block while per-shard pending depth is at least
+    /// `queue_soft_limit`.
+    #[must_use]
+    pub fn new_with_executor_and_queue_limit<F>(
+        shard_count: ShardCount,
+        queue_soft_limit: usize,
+        executor: F,
+    ) -> Self
+    where
+        F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
+    {
+        let executor: Arc<RuntimeExecutor> = Arc::new(executor);
+        Self::new_internal(
+            shard_count,
+            &executor,
+            None,
+            SHARD_MAINTENANCE_INTERVAL,
+            queue_soft_limit.max(1),
+        )
     }
 
     /// Creates one runtime with custom worker executor and shard maintenance callback.
@@ -177,6 +209,7 @@ impl InMemoryShardRuntime {
             &executor,
             Some(&maintenance),
             maintenance_interval,
+            DEFAULT_QUEUE_SOFT_LIMIT,
         )
     }
 
@@ -185,6 +218,7 @@ impl InMemoryShardRuntime {
         executor: &Arc<RuntimeExecutor>,
         maintenance: Option<&Arc<RuntimeMaintenance>>,
         maintenance_interval: Duration,
+        queue_soft_limit: usize,
     ) -> Self {
         let shard_len = usize::from(shard_count.get());
         let execution_per_shard = Arc::new(
@@ -229,6 +263,7 @@ impl InMemoryShardRuntime {
 
         Self {
             shard_count,
+            queue_soft_limit,
             senders,
             execution_per_shard,
             queue_metrics_per_shard,
@@ -297,9 +332,10 @@ impl InMemoryShardRuntime {
         Ok(metrics.peak_pending.load(Ordering::Acquire))
     }
 
-    /// Returns number of submissions that arrived while shard queue was already non-empty.
+    /// Returns current number of submitters blocked on queue pressure for one shard.
     ///
-    /// This approximates Dragonfly's blocked-submitter pressure signal from task queues.
+    /// Counter semantics mirror Dragonfly task queues where blocked-submitter metrics
+    /// represent in-flight contention, not a cumulative historical total.
     ///
     /// # Errors
     ///
@@ -359,19 +395,33 @@ impl InMemoryShardRuntime {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
+        let mut blocked_submitter_marked = false;
+        while self.queue_soft_limit != usize::MAX
+            && queue_metrics.pending.load(Ordering::Acquire) >= self.queue_soft_limit
+        {
+            if !blocked_submitter_marked {
+                let _ = queue_metrics
+                    .blocked_submitters
+                    .fetch_add(1, Ordering::AcqRel);
+                blocked_submitter_marked = true;
+            }
+            thread::yield_now();
+        }
+        if blocked_submitter_marked {
+            let _ = queue_metrics.blocked_submitters.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |blocked| Some(blocked.saturating_sub(1)),
+            );
+        }
+
         // Keep one per-shard submit lock so sequence assignment matches real queue ingress order.
         // This avoids virtual sequence gaps where one producer reserves a number before enqueue.
         let mut sequence_guard = sequence_counter
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime sequence mutex is poisoned"))?;
         let sequence = (*sequence_guard).saturating_add(1);
-        let previous_pending = queue_metrics.pending.fetch_add(1, Ordering::AcqRel);
-        if previous_pending > 0 {
-            let _ = queue_metrics
-                .blocked_submitters
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        let pending_depth = previous_pending.saturating_add(1);
+        let pending_depth = queue_metrics.pending.fetch_add(1, Ordering::AcqRel) + 1;
         update_peak_pending(&queue_metrics.peak_pending, pending_depth);
         if sender.send(QueuedEnvelope { sequence, envelope }).is_err() {
             let _ = queue_metrics.pending.fetch_update(
@@ -379,13 +429,6 @@ impl InMemoryShardRuntime {
                 Ordering::Acquire,
                 |pending| Some(pending.saturating_sub(1)),
             );
-            if previous_pending > 0 {
-                let _ = queue_metrics.blocked_submitters.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |blocked| Some(blocked.saturating_sub(1)),
-                );
-            }
             return Err(DflyError::InvalidState("shard queue is closed"));
         }
         *sequence_guard = sequence;
@@ -556,17 +599,18 @@ async fn shard_execution_fiber(
 ) {
     let mut processed_since_yield = 0_usize;
     while let Some(queued) = receiver.recv().await {
-        if let Some(metrics) = queue_metrics_per_shard.get(shard) {
-            let _ = metrics
-                .pending
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                    Some(pending.saturating_sub(1))
-                });
-        }
         let envelope = queued.envelope;
         // Keep one explicit shard check so the queue ownership contract is visible
         // and invalid routing data does not pollute another shard log.
         if usize::from(envelope.target_shard) != shard {
+            if let Some(metrics) = queue_metrics_per_shard.get(shard) {
+                let _ =
+                    metrics
+                        .pending
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                            Some(pending.saturating_sub(1))
+                        });
+            }
             continue;
         }
 
@@ -585,6 +629,13 @@ async fn shard_execution_fiber(
             guard.processed_sequence = queued.sequence;
             let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
             state.changed.notify_all();
+        }
+        if let Some(metrics) = queue_metrics_per_shard.get(shard) {
+            let _ = metrics
+                .pending
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    Some(pending.saturating_sub(1))
+                });
         }
 
         processed_since_yield = processed_since_yield.saturating_add(1);
@@ -816,15 +867,15 @@ mod tests {
 
     #[rstest]
     fn runtime_counts_blocked_submitters_when_queue_backlogs() {
-        let runtime = InMemoryShardRuntime::new_with_executor(
+        let runtime = InMemoryShardRuntime::new_with_executor_and_queue_limit(
             ShardCount::new(1).expect("count should be valid"),
+            1_usize,
             |_envelope| {
-                thread::sleep(Duration::from_millis(40));
+                thread::sleep(Duration::from_millis(60));
                 CommandReply::SimpleString("QUEUED".to_owned())
             },
         );
-
-        let _ = runtime
+        let first_sequence = runtime
             .submit_with_sequence(RuntimeEnvelope {
                 target_shard: 0,
                 db: 0,
@@ -832,35 +883,47 @@ mod tests {
                 command: CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
             })
             .expect("first submission should succeed");
-        let _ = runtime
-            .submit_with_sequence(RuntimeEnvelope {
-                target_shard: 0,
-                db: 0,
-                execute_on_worker: true,
-                command: CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
-            })
-            .expect("second submission should succeed");
-        let third_sequence = runtime
-            .submit_with_sequence(RuntimeEnvelope {
-                target_shard: 0,
-                db: 0,
-                execute_on_worker: true,
-                command: CommandFrame::new("SET", vec![b"k3".to_vec(), b"v3".to_vec()]),
-            })
-            .expect("third submission should succeed");
+        std::thread::scope(|scope| {
+            let submitter = scope.spawn(|| {
+                runtime.submit_with_sequence(RuntimeEnvelope {
+                    target_shard: 0,
+                    db: 0,
+                    execute_on_worker: true,
+                    command: CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+                })
+            });
 
-        assert_that!(
-            runtime
-                .wait_until_processed_sequence(0, third_sequence)
-                .is_ok(),
-            eq(true)
-        );
+            let mut observed_blocked = false;
+            for _ in 0..80 {
+                if runtime
+                    .blocked_submitters(0)
+                    .expect("blocked counter should succeed")
+                    > 0
+                {
+                    observed_blocked = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_that!(observed_blocked, eq(true));
+
+            let second_sequence = submitter
+                .join()
+                .expect("submitter thread should complete")
+                .expect("second submission should succeed");
+            assert_that!(second_sequence > first_sequence, eq(true));
+            assert_that!(
+                runtime
+                    .wait_until_processed_sequence(0, second_sequence)
+                    .is_ok(),
+                eq(true)
+            );
+        });
         assert_that!(
             runtime
                 .blocked_submitters(0)
-                .expect("blocked counter should succeed")
-                >= 1,
-            eq(true)
+                .expect("blocked counter should succeed"),
+            eq(0_usize)
         );
     }
 
