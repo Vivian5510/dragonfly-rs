@@ -52,6 +52,8 @@ struct ShardExecutionState {
 struct ShardQueueMetrics {
     pending: AtomicUsize,
     peak_pending: AtomicUsize,
+    pending_bytes: AtomicUsize,
+    peak_pending_bytes: AtomicUsize,
     blocked_submitters: AtomicUsize,
 }
 
@@ -102,6 +104,16 @@ fn update_peak_pending(peak: &AtomicUsize, candidate: usize) {
             Err(current) => observed = current,
         }
     }
+}
+
+fn envelope_queue_bytes(envelope: &RuntimeEnvelope) -> usize {
+    envelope
+        .command
+        .args
+        .iter()
+        .fold(envelope.command.name.len(), |total, arg| {
+            total.saturating_add(arg.len())
+        })
 }
 
 impl std::fmt::Debug for InMemoryShardRuntime {
@@ -332,6 +344,30 @@ impl InMemoryShardRuntime {
         Ok(metrics.peak_pending.load(Ordering::Acquire))
     }
 
+    /// Returns current number of pending payload bytes queued for one shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn pending_queue_bytes(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        Ok(metrics.pending_bytes.load(Ordering::Acquire))
+    }
+
+    /// Returns maximum observed pending payload bytes for one shard queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn peak_pending_queue_bytes(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        Ok(metrics.peak_pending_bytes.load(Ordering::Acquire))
+    }
+
     /// Returns current number of submitters blocked on queue pressure for one shard.
     ///
     /// Counter semantics mirror Dragonfly task queues where blocked-submitter metrics
@@ -397,6 +433,7 @@ impl InMemoryShardRuntime {
         let Some(sequence_counter) = self.submitted_sequence_per_shard.get(shard) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
+        let payload_bytes = envelope_queue_bytes(&envelope);
 
         let queue_soft_limit = self.queue_soft_limit;
         let mut blocked_submitter_marked = false;
@@ -436,11 +473,21 @@ impl InMemoryShardRuntime {
         let sequence = (*sequence_guard).saturating_add(1);
         let pending_depth = queue_metrics.pending.fetch_add(1, Ordering::AcqRel) + 1;
         update_peak_pending(&queue_metrics.peak_pending, pending_depth);
+        let pending_bytes = queue_metrics
+            .pending_bytes
+            .fetch_add(payload_bytes, Ordering::AcqRel)
+            + payload_bytes;
+        update_peak_pending(&queue_metrics.peak_pending_bytes, pending_bytes);
         if sender.send(QueuedEnvelope { sequence, envelope }).is_err() {
             let _ = queue_metrics.pending.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |pending| Some(pending.saturating_sub(1)),
+            );
+            let _ = queue_metrics.pending_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(payload_bytes)),
             );
             return Err(DflyError::InvalidState("shard queue is closed"));
         }
@@ -613,6 +660,7 @@ async fn shard_execution_fiber(
     let mut processed_since_yield = 0_usize;
     while let Some(queued) = receiver.recv().await {
         let envelope = queued.envelope;
+        let payload_bytes = envelope_queue_bytes(&envelope);
         // Keep one explicit shard check so the queue ownership contract is visible
         // and invalid routing data does not pollute another shard log.
         if usize::from(envelope.target_shard) != shard {
@@ -623,6 +671,11 @@ async fn shard_execution_fiber(
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                             Some(pending.saturating_sub(1))
                         });
+                let _ = metrics.pending_bytes.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |pending| Some(pending.saturating_sub(payload_bytes)),
+                );
             }
             if let Some(state) = execution_per_shard.get(shard) {
                 state.changed.notify_all();
@@ -652,6 +705,11 @@ async fn shard_execution_fiber(
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     Some(pending.saturating_sub(1))
                 });
+            let _ = metrics.pending_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(payload_bytes)),
+            );
         }
         if let Some(state) = execution_per_shard.get(shard) {
             state.changed.notify_all();
@@ -827,6 +885,7 @@ mod tests {
 
     #[rstest]
     fn runtime_tracks_pending_queue_depth_and_peak() {
+        let queued_payload_bytes = b"SET".len() + b"k1".len() + b"v1".len();
         let runtime = InMemoryShardRuntime::new_with_executor(
             ShardCount::new(1).expect("count should be valid"),
             |_envelope| {
@@ -872,6 +931,13 @@ mod tests {
         );
         assert_that!(
             runtime
+                .peak_pending_queue_bytes(0)
+                .expect("peak bytes should succeed")
+                >= queued_payload_bytes.saturating_mul(2),
+            eq(true)
+        );
+        assert_that!(
+            runtime
                 .wait_until_processed_sequence(0, third_sequence)
                 .is_ok(),
             eq(true)
@@ -880,6 +946,12 @@ mod tests {
             runtime
                 .pending_queue_depth(0)
                 .expect("pending should succeed"),
+            eq(0_usize)
+        );
+        assert_that!(
+            runtime
+                .pending_queue_bytes(0)
+                .expect("pending bytes should succeed"),
             eq(0_usize)
         );
     }
