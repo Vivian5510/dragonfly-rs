@@ -462,7 +462,11 @@ impl ServerApp {
             }
 
             match self.dispatch_direct_command_runtime(db, frame) {
-                Ok(()) => {}
+                Ok(Some(reply)) => {
+                    self.maybe_append_journal_for_command(txid, db, frame, &reply);
+                    return reply;
+                }
+                Ok(None) => {}
                 Err(error) => {
                     return CommandReply::Error(format!("runtime dispatch failed: {error}"));
                 }
@@ -1072,8 +1076,14 @@ impl ServerApp {
             return reply;
         }
 
-        if let Err(error) = self.dispatch_replay_command_runtime(db, frame) {
-            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+        let runtime_reply = match self.dispatch_replay_command_runtime(db, frame) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+            }
+        };
+        if let Some(reply) = runtime_reply {
+            return reply;
         }
 
         self.execute_command_without_side_effects(db, frame)
@@ -1083,7 +1093,7 @@ impl ServerApp {
         &self,
         db: u16,
         frame: &CommandFrame,
-    ) -> DflyResult<()> {
+    ) -> DflyResult<Option<CommandReply>> {
         self.dispatch_runtime_for_command(db, frame, true)
     }
 
@@ -1091,7 +1101,7 @@ impl ServerApp {
         &self,
         db: u16,
         frame: &CommandFrame,
-    ) -> DflyResult<()> {
+    ) -> DflyResult<Option<CommandReply>> {
         // Recovery replay must stay independent from live transaction queue ownership checks.
         // During restore we rebuild state from persisted journal entries and should not depend
         // on transient in-memory scheduler leases.
@@ -1103,10 +1113,10 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
-    ) -> DflyResult<()> {
+    ) -> DflyResult<Option<CommandReply>> {
         let target_shards = self.runtime_target_shards_for_command(frame);
         if target_shards.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         if enforce_scheduler_barrier {
@@ -1114,20 +1124,37 @@ impl ServerApp {
                 .scheduler
                 .ensure_shards_available(&target_shards)?;
         }
+        let execute_on_worker = self.cluster.mode == ClusterMode::Disabled
+            && self.command_requires_shard_worker_execution(frame);
 
         // Direct command path mirrors Dragonfly's coordinator ingress:
         // 1) push one envelope to each touched shard queue,
         // 2) wait until all shard workers report they consumed the envelope.
         let mut barriers = Vec::with_capacity(target_shards.len());
+        let mut worker_sequence = None;
         for shard in target_shards {
-            let sequence = self.submit_runtime_envelope_with_sequence(shard, db, frame, false)?;
+            let should_execute_on_worker = execute_on_worker && worker_sequence.is_none();
+            let sequence = self.submit_runtime_envelope_with_sequence(
+                shard,
+                db,
+                frame,
+                should_execute_on_worker,
+            )?;
+            if should_execute_on_worker {
+                worker_sequence = Some((shard, sequence));
+            }
             barriers.push((shard, sequence));
         }
         for (shard, sequence) in barriers {
             self.runtime
                 .wait_until_processed_sequence(shard, sequence)?;
         }
-        Ok(())
+        let Some((shard, sequence)) = worker_sequence else {
+            return Ok(None);
+        };
+        let reply = self.runtime.take_processed_reply(shard, sequence)?;
+        let reply = reply.ok_or(DflyError::InvalidState("missing worker reply"))?;
+        Ok(Some(reply))
     }
 
     pub(super) fn runtime_target_shards_for_scheduled_command(

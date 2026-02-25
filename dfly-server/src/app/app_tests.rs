@@ -2448,6 +2448,35 @@ fn direct_command_respects_scheduler_barrier() {
 }
 
 #[rstest]
+fn direct_dispatch_runtime_returns_worker_reply_for_key_fallback() {
+    let app = ServerApp::new(RuntimeConfig::default());
+    let key = b"direct:rt:fallback:key".to_vec();
+    let shard = app.core.resolve_shard_for_key(&key);
+    let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
+
+    let reply = app
+        .dispatch_direct_command_runtime(0, &frame)
+        .expect("fallback runtime dispatch should succeed");
+    assert_that!(
+        &reply,
+        eq(&Some(CommandReply::SimpleString("OK".to_owned())))
+    );
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
+
+    let value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
+    assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
+}
+
+#[rstest]
 fn direct_mget_dispatches_runtime_to_each_touched_shard() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mget:1".to_vec();
