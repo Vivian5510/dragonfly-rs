@@ -163,7 +163,7 @@ impl ServerApp {
             {
                 per_command_error[index] = Some(out_of_range_error.clone());
             }
-            if self.command_uses_grouped_worker_post_barrier(command, &target_shards) {
+            if Self::command_uses_grouped_worker_post_barrier(command, &target_shards) {
                 // This command will be executed via grouped worker dispatch in the
                 // post-barrier phase, so the pre-dispatch wave should not emit
                 // redundant fanout envelopes.
@@ -218,13 +218,9 @@ impl ServerApp {
     }
 
     fn command_uses_grouped_worker_post_barrier(
-        &self,
         command: &CommandFrame,
         target_shards: &[u16],
     ) -> bool {
-        if self.cluster.mode != ClusterMode::Disabled {
-            return false;
-        }
         if target_shards.len() <= 1 {
             return false;
         }
