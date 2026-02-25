@@ -55,14 +55,14 @@ pub trait TransactionScheduler: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryTransactionScheduler {
     shard_queues: Mutex<HashMap<ShardId, Arc<Mutex<VecDeque<TxId>>>>>,
-    key_locks: Mutex<KeyLockMap>,
+    key_locks: Mutex<HashMap<ShardId, Arc<Mutex<KeyLockMap>>>>,
     active: Mutex<ActiveLeaseMap>,
 }
 
 type KeyId = (ShardId, Vec<u8>);
 type KeyAccessList = Vec<(KeyId, SingleKeyAccess)>;
 
-type KeyLockMap = HashMap<KeyId, KeyLockState>;
+type KeyLockMap = HashMap<Vec<u8>, KeyLockState>;
 type ActiveLeaseMap = HashMap<TxId, ActiveLease>;
 
 #[derive(Debug, Default)]
@@ -230,20 +230,55 @@ impl InMemoryTransactionScheduler {
         txid: TxId,
         key_accesses: KeyAccessList,
     ) -> DflyResult<Vec<KeyLease>> {
-        let mut key_locks = self.key_locks.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
-        })?;
-        let mut key_leases = Vec::with_capacity(key_accesses.len());
-        for (key_id, access) in key_accesses {
-            let lock_state = key_locks.entry(key_id.clone()).or_default();
-            if !try_acquire_key_lock(lock_state, txid, access) {
-                for key_lease in &key_leases {
-                    release_key_lease_from_map(&mut key_locks, txid, key_lease);
-                }
-                return Err(DflyError::InvalidState("key lock is busy"));
-            }
-            key_leases.push(KeyLease { key_id, access });
+        if key_accesses.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut accesses_by_shard = HashMap::<ShardId, Vec<(Vec<u8>, SingleKeyAccess)>>::new();
+        for ((shard, key), access) in key_accesses {
+            accesses_by_shard
+                .entry(shard)
+                .or_default()
+                .push((key, access));
+        }
+
+        let mut shard_ids = accesses_by_shard.keys().copied().collect::<Vec<_>>();
+        shard_ids.sort_unstable();
+
+        let mut key_leases = Vec::<KeyLease>::new();
+        for shard in shard_ids {
+            let mut shard_accesses = accesses_by_shard.remove(&shard).unwrap_or_default();
+            shard_accesses.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let shard_lock_handle = self.key_lock_handle(shard)?;
+            let mut shard_locks = shard_lock_handle.lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+            })?;
+            let shard_acquire_start = key_leases.len();
+
+            for (key, access) in shard_accesses {
+                let lock_state = shard_locks.entry(key.clone()).or_default();
+                if !try_acquire_key_lock(lock_state, txid, access) {
+                    for key_lease in key_leases[shard_acquire_start..].iter().rev() {
+                        release_key_lease_from_shard_map(
+                            &mut shard_locks,
+                            txid,
+                            &key_lease.key_id.1,
+                            key_lease.access,
+                        );
+                    }
+                    key_leases.truncate(shard_acquire_start);
+                    drop(shard_locks);
+                    self.release_key_leases(txid, &key_leases)?;
+                    return Err(DflyError::InvalidState("key lock is busy"));
+                }
+                key_leases.push(KeyLease {
+                    key_id: (shard, key),
+                    access,
+                });
+            }
+        }
+
         Ok(key_leases)
     }
 
@@ -262,11 +297,33 @@ impl InMemoryTransactionScheduler {
             return Ok(());
         }
 
-        let mut key_locks = self.key_locks.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
-        })?;
+        let mut leases_by_shard = HashMap::<ShardId, Vec<&KeyLease>>::new();
         for key_lease in key_leases {
-            release_key_lease_from_map(&mut key_locks, txid, key_lease);
+            leases_by_shard
+                .entry(key_lease.key_id.0)
+                .or_default()
+                .push(key_lease);
+        }
+
+        let mut shard_ids = leases_by_shard.keys().copied().collect::<Vec<_>>();
+        shard_ids.sort_unstable();
+        for shard in shard_ids {
+            let Some(shard_lock_handle) = self.key_lock_handle_if_exists(shard)? else {
+                continue;
+            };
+            let mut shard_locks = shard_lock_handle.lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+            })?;
+            let mut shard_leases = leases_by_shard.remove(&shard).unwrap_or_default();
+            shard_leases.sort_by(|left, right| left.key_id.1.cmp(&right.key_id.1));
+            for key_lease in shard_leases {
+                release_key_lease_from_shard_map(
+                    &mut shard_locks,
+                    txid,
+                    &key_lease.key_id.1,
+                    key_lease.access,
+                );
+            }
         }
         Ok(())
     }
@@ -308,6 +365,26 @@ impl InMemoryTransactionScheduler {
             DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
         })?;
         Ok(shard_queues.get(&shard).cloned())
+    }
+
+    fn key_lock_handle(&self, shard: ShardId) -> DflyResult<Arc<Mutex<KeyLockMap>>> {
+        let mut key_locks = self.key_locks.lock().map_err(|_| {
+            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+        })?;
+        Ok(key_locks
+            .entry(shard)
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone())
+    }
+
+    fn key_lock_handle_if_exists(
+        &self,
+        shard: ShardId,
+    ) -> DflyResult<Option<Arc<Mutex<KeyLockMap>>>> {
+        let key_locks = self.key_locks.lock().map_err(|_| {
+            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+        })?;
+        Ok(key_locks.get(&shard).cloned())
     }
 }
 
@@ -443,10 +520,15 @@ fn try_acquire_key_lock(
     }
 }
 
-fn release_key_lease_from_map(key_locks: &mut KeyLockMap, txid: TxId, lease: &KeyLease) {
+fn release_key_lease_from_shard_map(
+    key_locks: &mut KeyLockMap,
+    txid: TxId,
+    key: &[u8],
+    access: SingleKeyAccess,
+) {
     let mut remove_state = false;
-    if let Some(lock_state) = key_locks.get_mut(&lease.key_id) {
-        match lease.access {
+    if let Some(lock_state) = key_locks.get_mut(key) {
+        match access {
             SingleKeyAccess::Read => {
                 let _ = lock_state.readers.remove(&txid);
             }
@@ -460,7 +542,7 @@ fn release_key_lease_from_map(key_locks: &mut KeyLockMap, txid: TxId, lease: &Ke
         remove_state = lock_state.writer.is_none() && lock_state.readers.is_empty();
     }
     if remove_state {
-        let _ = key_locks.remove(&lease.key_id);
+        let _ = key_locks.remove(key);
     }
 }
 
