@@ -1224,8 +1224,6 @@ impl ThreadedServerReactor {
         if let Some(mut connection) = self.logical_connections.remove(&connection_id) {
             app.disconnect_connection(&mut connection);
         }
-        self.pending_runtime_requests
-            .retain(|pending| pending.connection_id != connection_id);
         let _ = self.connection_workers.remove(&connection_id);
         let _ = self.reply_order_by_connection.remove(&connection_id);
     }
@@ -1709,6 +1707,7 @@ mod tests {
     use crate::app::ServerApp;
     use dfly_common::config::RuntimeConfig;
     use dfly_core::command::CommandFrame;
+    use dfly_core::runtime::RuntimeEnvelope;
     use dfly_facade::protocol::ClientProtocol;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -2307,61 +2306,84 @@ mod tests {
     }
 
     #[rstest]
-    fn threaded_reactor_disconnect_removes_pending_runtime_requests_for_connection() {
+    fn threaded_reactor_disconnect_reaps_deferred_runtime_reply_after_ticket_ready() {
         let mut app = ServerApp::new(RuntimeConfig::default());
         let mut reactor = ThreadedServerReactor::bind(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ServerReactorConfig::default(),
         )
         .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-        let _client = TcpStream::connect(listen_addr).expect("connect should succeed");
+        let connection_id = 77_u64;
+        let _ = reactor.logical_connections.insert(
+            connection_id,
+            ServerApp::new_connection(ClientProtocol::Resp),
+        );
+        let _ = reactor.connection_workers.insert(connection_id, 0);
+        let _ = reactor
+            .reply_order_by_connection
+            .insert(connection_id, super::ConnectionReplyOrder::new());
 
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            if !reactor.logical_connections.is_empty() {
-                break;
-            }
-        }
-
-        let (&connection_id, _) = reactor
-            .logical_connections
-            .iter()
-            .next()
-            .expect("logical connection should exist");
-        let worker_id = *reactor
-            .connection_workers
-            .get(&connection_id)
-            .expect("worker mapping should exist");
+        let frame = CommandFrame::new("GET", vec![b"leak-check".to_vec()]);
+        let shard = app.core.resolve_target_shard(&frame);
+        let sequence = app
+            .runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: shard,
+                db: 0,
+                execute_on_worker: true,
+                command: frame.clone(),
+            })
+            .expect("runtime submit should succeed");
 
         reactor
             .pending_runtime_requests
             .push(super::PendingRuntimeRequest {
-                worker_id,
+                worker_id: 0,
                 connection_id,
-                request_id: 7,
+                request_id: 1,
                 ticket: crate::app::RuntimeReplyTicket {
-                    shard: 0,
-                    sequence: 1,
+                    shard,
+                    sequence,
                     protocol: ClientProtocol::Resp,
-                    frame: CommandFrame::new("GET", vec![b"k".to_vec()]),
+                    frame,
                 },
             });
         assert_that!(reactor.pending_runtime_requests.len(), eq(1_usize));
 
         reactor.disconnect_logical_connection(&mut app, connection_id);
-
+        assert_that!(
+            reactor.logical_connections.contains_key(&connection_id),
+            eq(false)
+        );
         assert_that!(
             reactor
                 .pending_runtime_requests
                 .iter()
                 .any(|pending| pending.connection_id == connection_id),
-            eq(false)
+            eq(true)
+        );
+
+        app.runtime
+            .wait_until_processed_sequence(shard, sequence)
+            .expect("runtime should process deferred request");
+        assert_that!(
+            app.runtime
+                .pending_reply_count(shard)
+                .expect("pending reply count should be available")
+                >= 1,
+            eq(true)
+        );
+
+        let drained = reactor
+            .drain_pending_runtime_replies(&mut app)
+            .expect("draining deferred runtime replies should succeed");
+        assert_that!(drained, eq(1_usize));
+        assert_that!(reactor.pending_runtime_requests.is_empty(), eq(true));
+        assert_that!(
+            app.runtime
+                .pending_reply_count(shard)
+                .expect("pending reply count should be available"),
+            eq(0_usize)
         );
     }
 }
