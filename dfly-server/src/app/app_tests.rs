@@ -6511,8 +6511,16 @@ fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command(
     assert_that!(second_runtime.len(), eq(1_usize));
     assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
     assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
-    assert_that!(first_runtime[0].execute_on_worker, eq(false));
-    assert_that!(second_runtime[0].execute_on_worker, eq(false));
+    assert_that!(
+        &first_runtime[0].command.args,
+        eq(&vec![first_key.clone(), b"a".to_vec()])
+    );
+    assert_that!(
+        &second_runtime[0].command.args,
+        eq(&vec![second_key.clone(), b"b".to_vec()])
+    );
+    assert_that!(first_runtime[0].execute_on_worker, eq(true));
+    assert_that!(second_runtime[0].execute_on_worker, eq(true));
 }
 
 #[rstest]

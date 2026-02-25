@@ -492,14 +492,27 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
-        if let Some(reply) = self.execute_same_shard_multikey_string_via_runtime(db, frame) {
+        self.execute_multikey_string_commands_via_runtime_internal(db, frame, true)
+    }
+
+    fn execute_multikey_string_commands_via_runtime_internal(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> Option<CommandReply> {
+        if let Some(reply) = self.execute_same_shard_multikey_string_via_runtime(
+            db,
+            frame,
+            enforce_scheduler_barrier,
+        ) {
             return Some(reply);
         }
 
         match frame.name.as_str() {
-            "MGET" => Some(self.execute_mget_via_runtime(db, frame)),
-            "MSET" => Some(self.execute_mset_via_runtime(db, frame)),
-            "MSETNX" => Some(self.execute_msetnx_via_runtime(db, frame)),
+            "MGET" => Some(self.execute_mget_via_runtime(db, frame, enforce_scheduler_barrier)),
+            "MSET" => Some(self.execute_mset_via_runtime(db, frame, enforce_scheduler_barrier)),
+            "MSETNX" => Some(self.execute_msetnx_via_runtime(db, frame, enforce_scheduler_barrier)),
             _ => None,
         }
     }
@@ -508,6 +521,7 @@ impl ServerApp {
         &mut self,
         db: u16,
         frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
     ) -> Option<CommandReply> {
         let shard = self.same_shard_multikey_string_target_shard(frame)?;
 
@@ -524,10 +538,20 @@ impl ServerApp {
         {
             return Some(error_reply);
         }
-        Some(self.execute_runtime_command_on_worker_shard(db, frame, shard, true))
+        Some(self.execute_runtime_command_on_worker_shard(
+            db,
+            frame,
+            shard,
+            enforce_scheduler_barrier,
+        ))
     }
 
-    fn execute_mget_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_mget_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> CommandReply {
         if frame.args.is_empty() {
             return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
         }
@@ -554,8 +578,11 @@ impl ServerApp {
                 (*shard, CommandFrame::new("MGET", args))
             })
             .collect::<Vec<_>>();
-        let worker_replies = match self.execute_grouped_worker_commands(db, grouped_commands, true)
-        {
+        let worker_replies = match self.execute_grouped_worker_commands(
+            db,
+            grouped_commands,
+            enforce_scheduler_barrier,
+        ) {
             Ok(replies) => replies,
             Err(reply) => return reply,
         };
@@ -602,7 +629,12 @@ impl ServerApp {
         CommandReply::Array(replies)
     }
 
-    fn execute_mset_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_mset_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> CommandReply {
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
         }
@@ -623,8 +655,11 @@ impl ServerApp {
             .into_iter()
             .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
             .collect::<Vec<_>>();
-        let worker_replies = match self.execute_grouped_worker_commands(db, grouped_commands, true)
-        {
+        let worker_replies = match self.execute_grouped_worker_commands(
+            db,
+            grouped_commands,
+            enforce_scheduler_barrier,
+        ) {
             Ok(replies) => replies,
             Err(reply) => return reply,
         };
@@ -647,7 +682,12 @@ impl ServerApp {
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_msetnx_via_runtime(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_msetnx_via_runtime(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> CommandReply {
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error(
                 "wrong number of arguments for 'MSETNX' command".to_owned(),
@@ -671,11 +711,14 @@ impl ServerApp {
             .into_iter()
             .map(|(shard, keys)| (shard, CommandFrame::new("EXISTS", keys)))
             .collect::<Vec<_>>();
-        let exists_replies =
-            match self.execute_grouped_worker_commands(db, grouped_exists_commands, true) {
-                Ok(replies) => replies,
-                Err(reply) => return reply,
-            };
+        let exists_replies = match self.execute_grouped_worker_commands(
+            db,
+            grouped_exists_commands,
+            enforce_scheduler_barrier,
+        ) {
+            Ok(replies) => replies,
+            Err(reply) => return reply,
+        };
 
         let mut existing = 0_i64;
         for reply in exists_replies {
@@ -709,8 +752,11 @@ impl ServerApp {
             .into_iter()
             .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
             .collect::<Vec<_>>();
-        let set_replies = match self.execute_grouped_worker_commands(db, grouped_set_commands, true)
-        {
+        let set_replies = match self.execute_grouped_worker_commands(
+            db,
+            grouped_set_commands,
+            enforce_scheduler_barrier,
+        ) {
             Ok(replies) => replies,
             Err(reply) => return reply,
         };
@@ -736,13 +782,24 @@ impl ServerApp {
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
+        self.execute_multi_key_counting_command_via_runtime_internal(db, frame, true)
+    }
+
+    fn execute_multi_key_counting_command_via_runtime_internal(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> Option<CommandReply> {
         if !matches!(frame.name.as_str(), "DEL" | "UNLINK" | "EXISTS" | "TOUCH")
             || frame.args.len() <= 1
         {
             return None;
         }
 
-        if let Some(reply) = self.execute_same_shard_multikey_count_via_runtime(db, frame) {
+        if let Some(reply) =
+            self.execute_same_shard_multikey_count_via_runtime(db, frame, enforce_scheduler_barrier)
+        {
             return Some(reply);
         }
         if let Some(error_reply) =
@@ -752,7 +809,11 @@ impl ServerApp {
         }
 
         let grouped_commands = self.group_multikey_count_frame_by_shard(frame);
-        let replies = match self.execute_grouped_worker_commands(db, grouped_commands, true) {
+        let replies = match self.execute_grouped_worker_commands(
+            db,
+            grouped_commands,
+            enforce_scheduler_barrier,
+        ) {
             Ok(replies) => replies,
             Err(reply) => return Some(reply),
         };
@@ -785,6 +846,7 @@ impl ServerApp {
         &mut self,
         db: u16,
         frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
     ) -> Option<CommandReply> {
         let shard = self.same_shard_multikey_count_target_shard(frame)?;
 
@@ -793,7 +855,12 @@ impl ServerApp {
         {
             return Some(error_reply);
         }
-        Some(self.execute_runtime_command_on_worker_shard(db, frame, shard, true))
+        Some(self.execute_runtime_command_on_worker_shard(
+            db,
+            frame,
+            shard,
+            enforce_scheduler_barrier,
+        ))
     }
 
     pub(super) fn execute_single_shard_command_via_runtime(
@@ -840,6 +907,16 @@ impl ServerApp {
         }
         if let Some(shard) = self.replay_same_shard_runtime_target(frame) {
             return self.execute_runtime_command_on_worker_shard(db, frame, shard, false);
+        }
+        if let Some(reply) =
+            self.execute_multikey_string_commands_via_runtime_internal(db, frame, false)
+        {
+            return reply;
+        }
+        if let Some(reply) =
+            self.execute_multi_key_counting_command_via_runtime_internal(db, frame, false)
+        {
+            return reply;
         }
 
         if let Err(error) = self.dispatch_replay_command_runtime(db, frame) {
