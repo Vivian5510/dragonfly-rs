@@ -52,6 +52,7 @@ struct ShardExecutionState {
 struct ShardQueueMetrics {
     pending: AtomicUsize,
     peak_pending: AtomicUsize,
+    blocked_submitters: AtomicUsize,
 }
 
 /// Abstract runtime backend that receives coordinator work.
@@ -296,6 +297,20 @@ impl InMemoryShardRuntime {
         Ok(metrics.peak_pending.load(Ordering::Acquire))
     }
 
+    /// Returns number of submissions that arrived while shard queue was already non-empty.
+    ///
+    /// This approximates Dragonfly's blocked-submitter pressure signal from task queues.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn blocked_submitters(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        Ok(metrics.blocked_submitters.load(Ordering::Acquire))
+    }
+
     /// Waits until one shard has processed at least `minimum` envelopes.
     ///
     /// # Errors
@@ -350,7 +365,13 @@ impl InMemoryShardRuntime {
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime sequence mutex is poisoned"))?;
         let sequence = (*sequence_guard).saturating_add(1);
-        let pending_depth = queue_metrics.pending.fetch_add(1, Ordering::AcqRel) + 1;
+        let previous_pending = queue_metrics.pending.fetch_add(1, Ordering::AcqRel);
+        if previous_pending > 0 {
+            let _ = queue_metrics
+                .blocked_submitters
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let pending_depth = previous_pending.saturating_add(1);
         update_peak_pending(&queue_metrics.peak_pending, pending_depth);
         if sender.send(QueuedEnvelope { sequence, envelope }).is_err() {
             let _ = queue_metrics.pending.fetch_update(
@@ -358,6 +379,13 @@ impl InMemoryShardRuntime {
                 Ordering::Acquire,
                 |pending| Some(pending.saturating_sub(1)),
             );
+            if previous_pending > 0 {
+                let _ = queue_metrics.blocked_submitters.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |blocked| Some(blocked.saturating_sub(1)),
+                );
+            }
             return Err(DflyError::InvalidState("shard queue is closed"));
         }
         *sequence_guard = sequence;
@@ -783,6 +811,56 @@ mod tests {
                 .pending_queue_depth(0)
                 .expect("pending should succeed"),
             eq(0_usize)
+        );
+    }
+
+    #[rstest]
+    fn runtime_counts_blocked_submitters_when_queue_backlogs() {
+        let runtime = InMemoryShardRuntime::new_with_executor(
+            ShardCount::new(1).expect("count should be valid"),
+            |_envelope| {
+                thread::sleep(Duration::from_millis(40));
+                CommandReply::SimpleString("QUEUED".to_owned())
+            },
+        );
+
+        let _ = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            })
+            .expect("first submission should succeed");
+        let _ = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            })
+            .expect("second submission should succeed");
+        let third_sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k3".to_vec(), b"v3".to_vec()]),
+            })
+            .expect("third submission should succeed");
+
+        assert_that!(
+            runtime
+                .wait_until_processed_sequence(0, third_sequence)
+                .is_ok(),
+            eq(true)
+        );
+        assert_that!(
+            runtime
+                .blocked_submitters(0)
+                .expect("blocked counter should succeed")
+                >= 1,
+            eq(true)
         );
     }
 
