@@ -321,9 +321,8 @@ impl ProactorPool {
         match self.wait_for_parse_completion(io_worker, sequence)? {
             ProactorParseCompletion::Detached(reply) => Ok(reply),
             ProactorParseCompletion::Bound(_) | ProactorParseCompletion::Released => Err(
-                DflyError::InvalidState(
-                "io worker completion type mismatch",
-            )),
+                DflyError::InvalidState("io worker completion type mismatch"),
+            ),
         }
     }
 
@@ -352,9 +351,8 @@ impl ProactorPool {
         match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
             ProactorParseCompletion::Bound(reply) => Ok(reply),
             ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Released => Err(
-                DflyError::InvalidState(
-                "io worker completion type mismatch",
-            )),
+                DflyError::InvalidState("io worker completion type mismatch"),
+            ),
         }
     }
 

@@ -14,7 +14,7 @@ use dfly_core::SharedCore;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
-use dfly_facade::connection::{ConnectionContext, ConnectionState};
+use dfly_facade::connection::ConnectionContext;
 use dfly_facade::proactor::ConnectionAffinity;
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
 use dfly_replication::ReplicationModule;
@@ -204,11 +204,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     #[must_use]
     pub fn new_connection(protocol: ClientProtocol) -> ServerConnection {
         ServerConnection {
-            parser: ConnectionState::new(ConnectionContext {
+            context: ConnectionContext {
                 protocol,
                 db_index: 0,
                 privileged: false,
-            }),
+            },
             io_affinity: None,
             transaction: TransactionSession::default(),
             replica_endpoint: None,
@@ -260,7 +260,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let affinity = self.ensure_connection_io_affinity(connection);
         let parsed_batch = self.facade.proactor_pool.parse_on_worker_for_connection(
             affinity,
-            &connection.parser.context,
+            &connection.context,
             bytes,
         )?;
         let parsed_commands = parsed_batch.commands;
@@ -274,7 +274,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
             // Redis `MULTI/EXEC/DISCARD` is connection-scoped control flow and is handled
             // before core command execution, matching Dragonfly's high-level transaction entry.
-            if connection.parser.context.protocol == ClientProtocol::Resp {
+            if connection.context.protocol == ClientProtocol::Resp {
                 if let Some(select_reply) = Self::handle_resp_select(connection, &frame) {
                     responses.push(select_reply);
                     continue;
@@ -320,13 +320,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                     // We model the same behavior by consuming successful ACK silently.
                     continue;
                 }
-                let encoded =
-                    encode_reply_for_protocol(connection.parser.context.protocol, &frame, reply);
+                let encoded = encode_reply_for_protocol(connection.context.protocol, &frame, reply);
                 responses.push(encoded);
                 continue;
             }
 
-            let db = connection.parser.context.db_index;
+            let db = connection.context.db_index;
             let reply = self.execute_user_command(db, &frame, None);
             if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
                 // Dragonfly does not interleave ACK replies with journal stream writes.
@@ -336,8 +335,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
             // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
             // where execution result is translated back to client protocol right before writeback.
-            let encoded =
-                encode_reply_for_protocol(connection.parser.context.protocol, &frame, reply);
+            let encoded = encode_reply_for_protocol(connection.context.protocol, &frame, reply);
             responses.push(encoded);
         }
 
@@ -373,7 +371,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             Ok(db_index) => db_index,
             Err(error) => return Some(CommandReply::Error(error).to_resp_bytes()),
         };
-        connection.parser.context.db_index = db_index;
+        connection.context.db_index = db_index;
         Some(CommandReply::SimpleString("OK".to_owned()).to_resp_bytes())
     }
 
@@ -444,7 +442,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
         if connection
             .transaction
-            .watching_other_dbs(connection.parser.context.db_index)
+            .watching_other_dbs(connection.context.db_index)
         {
             let _ = connection.transaction.discard();
             return CommandReply::Error(
@@ -472,7 +470,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 .to_resp_bytes();
         }
 
-        let db = connection.parser.context.db_index;
+        let db = connection.context.db_index;
         let replies = self.execute_transaction_plan(db, &plan);
         if let Err(error) = self.transaction.scheduler.conclude(plan.txid) {
             return CommandReply::Error(format!("transaction completion failed: {error}"))
@@ -495,7 +493,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 .to_resp_bytes();
         }
 
-        let db = connection.parser.context.db_index;
+        let db = connection.context.db_index;
         for key in &frame.args {
             let version = self.core.key_version(db, key);
             let _ = connection.transaction.watch_key(db, key.clone(), version);
@@ -1891,8 +1889,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 /// Per-client state stored by the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConnection {
-    /// Incremental parser and connection metadata.
-    pub parser: ConnectionState,
+    /// Stable connection metadata shared with worker-owned parser state.
+    pub context: ConnectionContext,
     /// Stable proactor worker affinity allocated by the connection ingress path.
     pub io_affinity: Option<ConnectionAffinity>,
     /// Connection-local transaction queue (`MULTI` mode).
