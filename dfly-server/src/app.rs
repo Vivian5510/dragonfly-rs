@@ -15,6 +15,7 @@ use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::{ConnectionContext, ConnectionState};
+use dfly_facade::proactor::ConnectionAffinity;
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
@@ -59,6 +60,8 @@ pub struct ServerApp {
     pub tiering: TieringModule,
     /// Monotonic transaction id allocator.
     next_txid: TxId,
+    /// Monotonic id used for deterministic proactor-worker connection affinity.
+    next_connection_id: u64,
     /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
     next_implicit_replica_id: u64,
 }
@@ -104,6 +107,7 @@ impl ServerApp {
             search,
             tiering,
             next_txid: 1,
+            next_connection_id: 1,
             next_implicit_replica_id: 1,
         }
     }
@@ -112,9 +116,10 @@ impl ServerApp {
     #[must_use]
     pub fn startup_summary(&self) -> String {
         format!(
-            "dfly-server bootstrap: shard_count={}, redis_port={}, memcached_port={:?}, \
+            "dfly-server bootstrap: shard_count={}, io_threads={}, redis_port={}, memcached_port={:?}, \
 core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}, search_enabled={}, tiering_enabled={}",
             self.config.shard_count.get(),
+            self.facade.io_thread_count,
             self.facade.redis_port,
             self.facade.memcached_port,
             self.core,
@@ -204,11 +209,26 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 db_index: 0,
                 privileged: false,
             }),
+            io_affinity: None,
             transaction: TransactionSession::default(),
             replica_endpoint: None,
             replica_client_id: None,
             replica_client_version: None,
         }
+    }
+
+    fn ensure_connection_io_affinity(
+        &mut self,
+        connection: &mut ServerConnection,
+    ) -> ConnectionAffinity {
+        if let Some(affinity) = connection.io_affinity {
+            return affinity;
+        }
+        let connection_id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.saturating_add(1);
+        let affinity = self.facade.proactor_pool.bind_connection(connection_id);
+        connection.io_affinity = Some(affinity);
+        affinity
     }
 
     /// Test-only helper that detaches one connection and releases its replica endpoint identity.
@@ -234,14 +254,17 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         connection: &mut ServerConnection,
         bytes: &[u8],
     ) -> DflyResult<Vec<Vec<u8>>> {
-        connection.parser.feed_bytes(bytes);
+        let affinity = self.ensure_connection_io_affinity(connection);
+        let parsed_batch = self.facade.proactor_pool.parse_on_worker(
+            affinity.io_worker,
+            connection.parser.clone(),
+            bytes,
+        )?;
+        connection.parser = parsed_batch.parser;
+        let parsed_commands = parsed_batch.commands?;
 
         let mut responses = Vec::new();
-        loop {
-            let Some(parsed) = connection.parser.try_pop_command()? else {
-                break;
-            };
-
+        for parsed in parsed_commands {
             // Protocol parser has already normalized command shape, so dispatcher can operate
             // on a stable frame independent from socket/wire details.
             let frame = CommandFrame::new(parsed.name, parsed.args);
@@ -1863,6 +1886,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 pub struct ServerConnection {
     /// Incremental parser and connection metadata.
     pub parser: ConnectionState,
+    /// Stable proactor worker affinity allocated by the connection ingress path.
+    pub io_affinity: Option<ConnectionAffinity>,
     /// Connection-local transaction queue (`MULTI` mode).
     pub transaction: TransactionSession,
     /// Replica endpoint identity announced on this connection via `REPLCONF`.

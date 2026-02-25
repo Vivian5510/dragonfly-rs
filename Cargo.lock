@@ -59,6 +59,7 @@ dependencies = [
  "dfly-common",
  "googletest",
  "rstest",
+ "tokio",
 ]
 
 [[package]]

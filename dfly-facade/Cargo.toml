@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 dfly-common = { path = "../dfly-common" }
+tokio = { workspace = true }
 
 [dev-dependencies]
 googletest = { workspace = true }
