@@ -2481,6 +2481,23 @@ fn direct_dispatch_runtime_returns_worker_reply_for_key_fallback() {
 }
 
 #[rstest]
+fn direct_single_key_execution_drains_worker_reply_buffer() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let key = b"direct:rt:reply:drain".to_vec();
+    let shard = app.core.resolve_shard_for_key(&key);
+    let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
+
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::SimpleString("OK".to_owned())));
+    assert_that!(
+        app.runtime
+            .pending_reply_count(shard)
+            .expect("pending reply count should succeed"),
+        eq(0_usize)
+    );
+}
+
+#[rstest]
 fn direct_mget_dispatches_runtime_to_each_touched_shard() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mget:1".to_vec();

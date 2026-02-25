@@ -320,6 +320,24 @@ impl InMemoryShardRuntime {
         Ok(guard.processed.len())
     }
 
+    /// Returns current number of unconsumed worker replies buffered for one shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range or when
+    /// the shard log mutex is poisoned.
+    pub fn pending_reply_count(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(state) = self.execution_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+
+        let guard = state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+        Ok(guard.replies_by_sequence.len())
+    }
+
     /// Returns current number of queued envelopes that have not reached execution yet.
     ///
     /// # Errors
@@ -1151,6 +1169,12 @@ mod tests {
                 .expect("wait should succeed"),
             eq(true)
         );
+        assert_that!(
+            runtime
+                .pending_reply_count(1)
+                .expect("pending reply count should succeed"),
+            eq(1_usize)
+        );
 
         let reply = runtime
             .take_processed_reply(1, sequence)
@@ -1158,6 +1182,12 @@ mod tests {
         assert_that!(
             &reply,
             eq(&Some(CommandReply::BulkString(b"db7:1:GET".to_vec())))
+        );
+        assert_that!(
+            runtime
+                .pending_reply_count(1)
+                .expect("pending reply count should succeed"),
+            eq(0_usize)
         );
     }
 
