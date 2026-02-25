@@ -9,7 +9,8 @@ use command::{CommandFrame, CommandReply};
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{DbIndex, ShardCount};
 use dispatch::{
-    CommandRegistry, DispatchState, ValueEntry, copy_between_states, rename_between_states,
+    CommandRegistry, DispatchState, SlotStatsSnapshot, ValueEntry, copy_between_states,
+    rename_between_states,
 };
 use sharding::{HashTagShardResolver, ShardResolver};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -155,6 +156,12 @@ impl SharedCore {
     #[must_use]
     pub fn count_keys_in_slot(&self, db: DbIndex, slot: u16) -> usize {
         self.inner.count_keys_in_slot(db, slot)
+    }
+
+    /// Returns slot-level counters for one logical DB and slot.
+    #[must_use]
+    pub fn slot_stats_for_slot(&self, db: DbIndex, slot: u16) -> SlotStatsSnapshot {
+        self.inner.slot_stats_for_slot(db, slot)
     }
 
     /// Runs one active-expiration pass on every shard.
@@ -825,6 +832,24 @@ impl CoreModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .count_live_keys_in_slot(db, slot)
+    }
+
+    /// Returns slot-level counters in selected logical DB for one cluster slot.
+    ///
+    /// Counter reads perform a bounded lazy-expiry pass on the owner shard first,
+    /// so key cardinality and payload bytes stay aligned with live key visibility.
+    #[must_use]
+    pub fn slot_stats_for_slot(&self, db: DbIndex, slot: u16) -> SlotStatsSnapshot {
+        let owner = usize::from(self.resolve_shard_for_slot(slot));
+        let Some(state) = self.shard_states.get(owner) else {
+            return SlotStatsSnapshot::default();
+        };
+
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = state.count_live_keys_in_slot(db, slot);
+        state.slot_stats_snapshot(db, slot)
     }
 
     /// Runs one active-expiration pass on each shard state.
@@ -2082,6 +2107,40 @@ mod tests {
         );
 
         assert_that!(core.count_keys_in_slot(0, slot), eq(2_usize));
+    }
+
+    #[rstest]
+    fn core_slot_stats_for_slot_reports_live_counters() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let key = b"slot:stats:{alpha}:1".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"one".to_vec()]),
+        );
+        let _ = core.execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("GETRANGE", vec![key.clone(), b"0".to_vec(), b"0".to_vec()]),
+        );
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"two".to_vec()]),
+        );
+
+        let stats = core.slot_stats_for_slot(0, slot);
+        assert_that!(stats.key_count, eq(1_usize));
+        assert_that!(stats.total_reads, eq(2_u64));
+        assert_that!(stats.total_writes, eq(2_u64));
+        assert_that!(stats.memory_bytes, eq(key.len().saturating_add(3_usize)));
+
+        let _ = core.execute_in_db(0, &CommandFrame::new("DEL", vec![key.clone()]));
+        let after_delete = core.slot_stats_for_slot(0, slot);
+        assert_that!(after_delete.key_count, eq(0_usize));
+        assert_that!(after_delete.total_reads, eq(2_u64));
+        assert_that!(after_delete.total_writes, eq(3_u64));
+        assert_that!(after_delete.memory_bytes, eq(0_usize));
     }
 
     #[rstest]

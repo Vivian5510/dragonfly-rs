@@ -134,6 +134,25 @@ impl SlotStats {
     pub fn memory_bytes(&self, slot: u16) -> usize {
         self.memory_bytes[usize::from(slot)]
     }
+
+    /// Returns current live key count tracked for one slot.
+    #[must_use]
+    pub fn key_count(&self, slot: u16) -> usize {
+        self.key_counts[usize::from(slot)]
+    }
+}
+
+/// Snapshot view of one slot's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotStatsSnapshot {
+    /// Live key cardinality in this slot.
+    pub key_count: usize,
+    /// Cumulative successful read operations for keys in this slot.
+    pub total_reads: u64,
+    /// Cumulative successful write operations for keys in this slot.
+    pub total_writes: u64,
+    /// Approximate payload bytes (key + value) in this slot.
+    pub memory_bytes: usize,
 }
 
 /// One logical DB table in the shard-local slice.
@@ -437,6 +456,20 @@ impl DispatchState {
     #[must_use]
     pub fn count_live_keys_in_slot(&mut self, db: DbIndex, slot: u16) -> usize {
         self.collect_live_slot_keys(db, slot).len()
+    }
+
+    /// Returns current slot-level counters for one logical DB.
+    #[must_use]
+    pub fn slot_stats_snapshot(&self, db: DbIndex, slot: u16) -> SlotStatsSnapshot {
+        let Some(table) = self.db_table(db) else {
+            return SlotStatsSnapshot::default();
+        };
+        SlotStatsSnapshot {
+            key_count: table.slot_stats.key_count(slot),
+            total_reads: table.slot_stats.total_reads(slot),
+            total_writes: table.slot_stats.total_writes(slot),
+            memory_bytes: table.slot_stats.memory_bytes(slot),
+        }
     }
 
     /// Returns tracked version for one key.
