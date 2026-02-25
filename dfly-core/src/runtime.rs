@@ -687,16 +687,18 @@ async fn shard_execution_fiber(
         // on shard-owned threads. Spawning a local task here keeps that boundary:
         // queue consumer coroutine -> command coroutine within same shard thread.
         let reply = if envelope.execute_on_worker {
-            execute_envelope_in_worker_fiber(&executor, &envelope).await
+            Some(execute_envelope_in_worker_fiber(&executor, &envelope).await)
         } else {
-            CommandReply::SimpleString("QUEUED".to_owned())
+            None
         };
         if let Some(state) = execution_per_shard.get(shard)
             && let Ok(mut guard) = state.inner.lock()
         {
             guard.processed.push(envelope);
             guard.processed_sequence = queued.sequence;
-            let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
+            if let Some(reply) = reply {
+                let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
+            }
             state.changed.notify_all();
         }
         if let Some(metrics) = queue_metrics_per_shard.get(shard) {
@@ -1157,6 +1159,40 @@ mod tests {
             &reply,
             eq(&Some(CommandReply::BulkString(b"db7:1:GET".to_vec())))
         );
+    }
+
+    #[rstest]
+    fn runtime_barrier_envelope_does_not_store_reply_payload() {
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls_for_executor = Arc::clone(&worker_calls);
+        let runtime = InMemoryShardRuntime::new_with_executor(
+            ShardCount::new(2).expect("count should be valid"),
+            move |_envelope| {
+                worker_calls_for_executor.fetch_add(1, Ordering::AcqRel);
+                CommandReply::SimpleString("OK".to_owned())
+            },
+        );
+
+        let sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 1,
+                db: 0,
+                execute_on_worker: false,
+                command: CommandFrame::new("GET", vec![b"k".to_vec()]),
+            })
+            .expect("submission should succeed");
+        assert_that!(
+            runtime
+                .wait_for_processed_sequence(1, sequence, Duration::from_millis(200))
+                .expect("wait should succeed"),
+            eq(true)
+        );
+
+        let reply = runtime
+            .take_processed_reply(1, sequence)
+            .expect("reply fetch should succeed");
+        assert_that!(&reply, eq(&None));
+        assert_that!(worker_calls.load(Ordering::Acquire), eq(0_usize));
     }
 
     #[rstest]
