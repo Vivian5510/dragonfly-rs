@@ -110,11 +110,6 @@ impl AppExecutor {
         self.app.startup_summary()
     }
 
-    /// Runs one mutable closure against the underlying app under synchronization.
-    pub fn with_app_mut<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
-        f(&self.app)
-    }
-
     /// Runs one read-only closure against the underlying app under synchronization.
     pub fn with_app<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
         f(&self.app)
@@ -175,13 +170,6 @@ impl ServerApp {
     fn cluster_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ClusterModule> {
         self.cluster
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    fn cluster_write_guard(&self) -> std::sync::RwLockWriteGuard<'_, ClusterModule> {
-        self.cluster
-            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
@@ -2297,7 +2285,7 @@ pub fn run() -> DflyResult<()> {
     let app = AppExecutor::new(ServerApp::new(config));
 
     // Keep subsystem initialization paths exercised in regular server startup.
-    app.with_app_mut(|server| -> DflyResult<()> {
+    app.with_app(|server| -> DflyResult<()> {
         let snapshot = server.create_snapshot_bytes()?;
         server.load_snapshot_bytes(&snapshot)?;
         let _ = server.recover_from_replication_journal()?;

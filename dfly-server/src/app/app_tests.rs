@@ -6911,13 +6911,16 @@ fn resp_cluster_shards_reports_single_master_descriptor() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster_write_guard().set_owned_ranges(vec![
-        SlotRange { start: 0, end: 99 },
-        SlotRange {
-            start: 200,
-            end: 300,
-        },
-    ]);
+    app.cluster
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let reply = ingress_connection_bytes(
@@ -6947,13 +6950,16 @@ fn resp_cluster_slots_returns_owned_ranges() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster_write_guard().set_owned_ranges(vec![
-        SlotRange { start: 0, end: 99 },
-        SlotRange {
-            start: 200,
-            end: 300,
-        },
-    ]);
+    app.cluster
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let command = resp_command(&[b"CLUSTER", b"SLOTS"]);
@@ -6972,13 +6978,16 @@ fn resp_cluster_info_reports_slot_summary() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster_write_guard().set_owned_ranges(vec![
-        SlotRange { start: 0, end: 99 },
-        SlotRange {
-            start: 200,
-            end: 300,
-        },
-    ]);
+    app.cluster
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let reply = ingress_connection_bytes(
@@ -7001,13 +7010,16 @@ fn resp_cluster_nodes_reports_myself_master_topology() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster_write_guard().set_owned_ranges(vec![
-        SlotRange { start: 0, end: 99 },
-        SlotRange {
-            start: 200,
-            end: 300,
-        },
-    ]);
+    app.cluster
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_owned_ranges(vec![
+            SlotRange { start: 0, end: 99 },
+            SlotRange {
+                start: 200,
+                end: 300,
+            },
+        ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let reply = ingress_connection_bytes(
@@ -7069,7 +7081,10 @@ fn cluster_mode_redirects_unowned_single_key_command_with_moved() {
             end: slot - 1,
         }
     };
-    app.cluster_write_guard().set_owned_ranges(vec![owned]);
+    app.cluster
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_owned_ranges(vec![owned]);
 
     let command = resp_command(&[b"GET", key]);
     let reply =
