@@ -2418,6 +2418,25 @@ fn runtime_post_barrier_recovers_single_key_via_worker_execution() {
 }
 
 #[rstest]
+fn runtime_post_barrier_dispatches_global_command_when_not_pre_dispatched() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let frame = CommandFrame::new("FLUSHDB", Vec::new());
+
+    let reply = app.execute_command_after_runtime_barrier(0, &frame);
+    assert_that!(&reply, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+    for shard in 0_u16..app.config.shard_count.get() {
+        let runtime = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+        assert_that!(runtime.len(), eq(1_usize));
+        assert_that!(&runtime[0].command, eq(&frame));
+        assert_that!(runtime[0].execute_on_worker, eq(false));
+    }
+}
+
+#[rstest]
 fn direct_command_respects_scheduler_barrier() {
     let app = ServerApp::new(RuntimeConfig::default());
     let key = b"direct:rt:block".to_vec();

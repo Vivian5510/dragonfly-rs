@@ -134,8 +134,10 @@ impl ServerApp {
         for (index, (_, command)) in hop.per_shard.iter().enumerate() {
             let reply = if let Some(worker_reply) = worker_replies_by_command[index].clone() {
                 worker_reply
-            } else {
+            } else if target_shards_by_command[index].is_empty() {
                 self.execute_command_after_runtime_barrier(db, command)
+            } else {
+                self.execute_command_after_runtime_barrier_internal(db, command, true)
             };
             self.maybe_append_journal_for_command(Some(txid), db, command, &reply);
             replies.push(reply);
@@ -235,6 +237,15 @@ impl ServerApp {
         db: u16,
         command: &CommandFrame,
     ) -> CommandReply {
+        self.execute_command_after_runtime_barrier_internal(db, command, false)
+    }
+
+    fn execute_command_after_runtime_barrier_internal(
+        &mut self,
+        db: u16,
+        command: &CommandFrame,
+        pre_dispatched: bool,
+    ) -> CommandReply {
         // If pre-dispatch did not assign a worker callback for one key-affine command, try
         // to recover by routing it through the shard worker now instead of falling back to
         // coordinator-local execution.
@@ -257,6 +268,11 @@ impl ServerApp {
         {
             return reply;
         }
+        if !pre_dispatched
+            && let Some(reply) = self.dispatch_runtime_command_post_barrier(db, command)
+        {
+            return reply;
+        }
         if self.cluster.mode == ClusterMode::Disabled
             && self.command_requires_shard_worker_execution(command)
         {
@@ -265,6 +281,20 @@ impl ServerApp {
             );
         }
         self.execute_command_without_side_effects(db, command)
+    }
+
+    fn dispatch_runtime_command_post_barrier(
+        &self,
+        db: u16,
+        command: &CommandFrame,
+    ) -> Option<CommandReply> {
+        match self.dispatch_runtime_for_command(db, command, false) {
+            Ok(Some(reply)) => Some(reply),
+            Ok(None) => None,
+            Err(error) => Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            ))),
+        }
     }
 
     fn command_requires_shard_worker_execution(&self, command: &CommandFrame) -> bool {
