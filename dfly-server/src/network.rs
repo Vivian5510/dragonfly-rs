@@ -1,8 +1,8 @@
-//! Reactor-style network event loop for RESP ingress.
+//! Reactor-style network event loop for RESP and Memcache ingress.
 //!
 //! Dragonfly keeps socket ownership in dedicated I/O threads and advances parsing/execution
 //! from readiness events. This module provides the same shape for `dragonfly-rs`:
-//! one listener + per-connection state machine driven by `mio::Poll`.
+//! per-protocol listeners + per-connection state machine driven by `mio::Poll`.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -16,8 +16,9 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::app::{ServerApp, ServerConnection};
 
-const LISTENER_TOKEN: Token = Token(0);
-const CONNECTION_TOKEN_START: usize = 1;
+const RESP_LISTENER_TOKEN: Token = Token(0);
+const MEMCACHE_LISTENER_TOKEN: Token = Token(1);
+const CONNECTION_TOKEN_START: usize = 2;
 const READ_CHUNK_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,10 +92,10 @@ struct ReactorConnection {
 }
 
 impl ReactorConnection {
-    fn new(socket: TcpStream) -> Self {
+    fn new(socket: TcpStream, protocol: ClientProtocol) -> Self {
         Self {
             socket,
-            logical: ServerApp::new_connection(ClientProtocol::Resp),
+            logical: ServerApp::new_connection(protocol),
             write_buffer: Vec::new(),
             closing: false,
             interest: Interest::READABLE,
@@ -102,12 +103,19 @@ impl ReactorConnection {
     }
 }
 
-/// One reactor instance managing a single RESP listener and all accepted connections.
+#[derive(Debug)]
+struct ReactorListener {
+    token: Token,
+    protocol: ClientProtocol,
+    socket: TcpListener,
+}
+
+/// One reactor instance managing protocol listeners and all accepted connections.
 #[derive(Debug)]
 pub struct ServerReactor {
     poll: Poll,
     events: Events,
-    listener: TcpListener,
+    listeners: Vec<ReactorListener>,
     next_token: usize,
     connections: HashMap<Token, ReactorConnection>,
 }
@@ -119,18 +127,62 @@ impl ServerReactor {
     ///
     /// Returns `DflyError::InvalidState` if the listener or poll registration fails.
     pub fn bind(addr: SocketAddr, config: ServerReactorConfig) -> DflyResult<Self> {
-        let mut listener = TcpListener::bind(addr)
-            .map_err(|error| DflyError::Io(format!("bind listener failed: {error}")))?;
+        Self::bind_with_memcache(addr, None, config)
+    }
+
+    /// Binds RESP listener and optional Memcache listener in one reactor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` if any listener bind/registration fails.
+    pub fn bind_with_memcache(
+        resp_addr: SocketAddr,
+        memcache_addr: Option<SocketAddr>,
+        config: ServerReactorConfig,
+    ) -> DflyResult<Self> {
         let poll =
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
+        let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
+
+        let mut resp_listener = TcpListener::bind(resp_addr)
+            .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
         poll.registry()
-            .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)
-            .map_err(|error| DflyError::Io(format!("register listener in poll failed: {error}")))?;
+            .register(&mut resp_listener, RESP_LISTENER_TOKEN, Interest::READABLE)
+            .map_err(|error| {
+                DflyError::Io(format!("register RESP listener in poll failed: {error}"))
+            })?;
+        listeners.push(ReactorListener {
+            token: RESP_LISTENER_TOKEN,
+            protocol: ClientProtocol::Resp,
+            socket: resp_listener,
+        });
+
+        if let Some(addr) = memcache_addr {
+            let mut memcache_listener = TcpListener::bind(addr).map_err(|error| {
+                DflyError::Io(format!("bind Memcache listener failed: {error}"))
+            })?;
+            poll.registry()
+                .register(
+                    &mut memcache_listener,
+                    MEMCACHE_LISTENER_TOKEN,
+                    Interest::READABLE,
+                )
+                .map_err(|error| {
+                    DflyError::Io(format!(
+                        "register Memcache listener in poll failed: {error}"
+                    ))
+                })?;
+            listeners.push(ReactorListener {
+                token: MEMCACHE_LISTENER_TOKEN,
+                protocol: ClientProtocol::Memcache,
+                socket: memcache_listener,
+            });
+        }
 
         Ok(Self {
             poll,
             events: Events::with_capacity(config.normalized_max_events()),
-            listener,
+            listeners,
             next_token: CONNECTION_TOKEN_START,
             connections: HashMap::new(),
         })
@@ -156,8 +208,8 @@ impl ServerReactor {
             .collect::<Vec<_>>();
 
         for snapshot in &snapshots {
-            if snapshot.token == LISTENER_TOKEN {
-                self.accept_new_connections()?;
+            if let Some(listener_index) = self.listener_index(snapshot.token) {
+                self.accept_new_connections(listener_index)?;
                 continue;
             }
             self.handle_connection_event(app, *snapshot)?;
@@ -168,9 +220,12 @@ impl ServerReactor {
 
     #[cfg(test)]
     fn local_addr(&self) -> DflyResult<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|error| DflyError::Io(format!("query local address failed: {error}")))
+        self.listener_local_addr(ClientProtocol::Resp)
+    }
+
+    #[cfg(test)]
+    fn memcache_local_addr(&self) -> DflyResult<SocketAddr> {
+        self.listener_local_addr(ClientProtocol::Memcache)
     }
 
     #[cfg(test)]
@@ -178,9 +233,51 @@ impl ServerReactor {
         self.connections.len()
     }
 
-    fn accept_new_connections(&mut self) -> DflyResult<()> {
+    fn listener_index(&self, token: Token) -> Option<usize> {
+        self.listeners
+            .iter()
+            .position(|listener| listener.token == token)
+    }
+
+    #[cfg(test)]
+    fn listener_local_addr(&self, protocol: ClientProtocol) -> DflyResult<SocketAddr> {
+        let Some(listener) = self
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == protocol)
+        else {
+            return Err(DflyError::InvalidState(
+                "network listener protocol is not enabled",
+            ));
+        };
+
+        listener
+            .socket
+            .local_addr()
+            .map_err(|error| DflyError::Io(format!("query local address failed: {error}")))
+    }
+
+    fn accept_new_connections(&mut self, listener_index: usize) -> DflyResult<()> {
+        let protocol = self
+            .listeners
+            .get(listener_index)
+            .map(|listener| listener.protocol)
+            .ok_or(DflyError::InvalidState(
+                "reactor listener index is out of range",
+            ))?;
+
         loop {
-            match self.listener.accept() {
+            let accept_result = {
+                let listener =
+                    self.listeners
+                        .get_mut(listener_index)
+                        .ok_or(DflyError::InvalidState(
+                            "reactor listener index is out of range",
+                        ))?;
+                listener.socket.accept()
+            };
+
+            match accept_result {
                 Ok((mut socket, _peer)) => {
                     let token = self.allocate_connection_token();
                     self.poll
@@ -194,7 +291,7 @@ impl ServerReactor {
                     let _ = socket.set_nodelay(true);
                     let _ = self
                         .connections
-                        .insert(token, ReactorConnection::new(socket));
+                        .insert(token, ReactorConnection::new(socket, protocol));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) => {
@@ -387,6 +484,56 @@ mod tests {
         }
 
         assert_that!(&response, eq(&b"+PONG\r\n".to_vec()));
+    }
+
+    #[rstest]
+    fn reactor_executes_memcache_roundtrip_on_optional_listener() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let resp_bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let memcache_bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut reactor = ServerReactor::bind_with_memcache(
+            resp_bind_addr,
+            Some(memcache_bind_addr),
+            ServerReactorConfig::default(),
+        )
+        .expect("reactor bind with memcache should succeed");
+        let memcache_addr = reactor
+            .memcache_local_addr()
+            .expect("memcache local addr should be available");
+
+        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("nonblocking client should be configurable");
+        client
+            .write_all(b"set user:42 0 0 5\r\nalice\r\nget user:42\r\n")
+            .expect("write memcache commands should succeed");
+
+        let deadline = Instant::now() + Duration::from_millis(600);
+        let mut response = Vec::new();
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(&mut app, Some(Duration::from_millis(5)))
+                .expect("reactor poll should succeed");
+
+            let mut chunk = [0_u8; 128];
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read_len) => {
+                    response.extend_from_slice(&chunk[..read_len]);
+                    if response.ends_with(b"END\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read from memcache client failed: {error}"),
+            }
+        }
+
+        assert_that!(
+            &response,
+            eq(&b"STORED\r\nVALUE user:42 0 5\r\nalice\r\nEND\r\n".to_vec())
+        );
     }
 
     #[rstest]
