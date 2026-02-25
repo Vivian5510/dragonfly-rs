@@ -209,6 +209,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 db_index: 0,
                 privileged: false,
             },
+            io_context_synced: None,
             io_affinity: None,
             transaction: TransactionSession::default(),
             replica_endpoint: None,
@@ -237,6 +238,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if let Some(affinity) = connection.io_affinity.take() {
             let _ = self.facade.proactor_pool.release_connection(affinity);
         }
+        connection.io_context_synced = None;
         if let Some(endpoint) = connection.replica_endpoint.take() {
             let _ = self
                 .replication
@@ -258,11 +260,19 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         bytes: &[u8],
     ) -> DflyResult<Vec<Vec<u8>>> {
         let affinity = self.ensure_connection_io_affinity(connection);
-        let parsed_batch = self.facade.proactor_pool.parse_on_worker_for_connection(
-            affinity,
-            &connection.context,
-            bytes,
-        )?;
+        let parsed_batch = if connection.io_context_synced.as_ref() == Some(&connection.context) {
+            self.facade
+                .proactor_pool
+                .parse_on_worker_for_bound_connection(affinity, bytes)?
+        } else {
+            let parsed = self.facade.proactor_pool.parse_on_worker_for_connection(
+                affinity,
+                &connection.context,
+                bytes,
+            )?;
+            connection.io_context_synced = Some(connection.context.clone());
+            parsed
+        };
         let parsed_commands = parsed_batch.commands;
         let parse_error = parsed_batch.parse_error;
 
@@ -1891,6 +1901,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 pub struct ServerConnection {
     /// Stable connection metadata shared with worker-owned parser state.
     pub context: ConnectionContext,
+    /// Last connection metadata synchronized into worker-owned parser state.
+    pub io_context_synced: Option<ConnectionContext>,
     /// Stable proactor worker affinity allocated by the connection ingress path.
     pub io_affinity: Option<ConnectionAffinity>,
     /// Connection-local transaction queue (`MULTI` mode).

@@ -26,7 +26,7 @@ enum ParseRequest {
     Bound {
         sequence: u64,
         connection_id: u64,
-        context: ConnectionContext,
+        context: Option<ConnectionContext>,
         bytes: Vec<u8>,
     },
     Release {
@@ -344,7 +344,36 @@ impl ProactorPool {
         let request = ParseRequest::Bound {
             sequence: 0,
             connection_id: affinity.connection_id,
-            context: context.clone(),
+            context: Some(context.clone()),
+            bytes: bytes.to_vec(),
+        };
+        let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
+        match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
+            ProactorParseCompletion::Bound(reply) => Ok(reply),
+            ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Released => Err(
+                DflyError::InvalidState("io worker completion type mismatch"),
+            ),
+        }
+    }
+
+    /// Advances parser state for one already-initialized bound connection.
+    ///
+    /// This fast path mirrors Dragonfly's per-connection parser ownership where metadata updates
+    /// are infrequent and most reads only push incremental bytes into worker-local parser state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when worker id is invalid or queue/completion
+    /// state is unavailable.
+    pub fn parse_on_worker_for_bound_connection(
+        &self,
+        affinity: ConnectionAffinity,
+        bytes: &[u8],
+    ) -> DflyResult<ProactorBoundParseBatch> {
+        let request = ParseRequest::Bound {
+            sequence: 0,
+            connection_id: affinity.connection_id,
+            context: None,
             bytes: bytes.to_vec(),
         };
         let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
@@ -622,10 +651,36 @@ fn handle_parse_request(
             bytes,
         } => {
             let request_bytes = bytes.len();
-            let parser = parsers_by_connection
-                .entry(connection_id)
-                .or_insert_with(|| ConnectionState::new(context.clone()));
-            parser.context = context;
+            let parser = match parsers_by_connection.entry(connection_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let parser = entry.into_mut();
+                    if let Some(context) = context {
+                        parser.context = context;
+                    }
+                    parser
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let Some(context) = context else {
+                        finalize_parse_request(
+                            io_worker,
+                            sequence,
+                            request_bytes,
+                            ProactorParseCompletion::Bound(ProactorBoundParseBatch {
+                                commands: Vec::new(),
+                                parse_error: Some(DflyError::InvalidState(
+                                    "bound connection parser state is missing",
+                                )),
+                                io_worker,
+                            }),
+                            queue_metrics_per_worker,
+                            queue_state_per_worker,
+                            completion_per_worker,
+                        );
+                        return;
+                    };
+                    entry.insert(ConnectionState::new(context))
+                }
+            };
             parser.feed_bytes(&bytes);
             let (commands, parse_error) = drain_commands(parser);
             finalize_parse_request(
@@ -851,6 +906,49 @@ mod tests {
         assert_that!(parsed.commands.len(), eq(1_usize));
         assert_that!(parsed.commands[0].name.as_str(), eq("PING"));
         assert_that!(parsed.parse_error.is_none(), eq(true));
+    }
+
+    #[rstest]
+    fn proactor_pool_bound_fast_path_uses_existing_worker_parser_state() {
+        let pool = ProactorPool::new(1);
+        let affinity = pool.bind_connection(88);
+        let context = ConnectionContext {
+            protocol: ClientProtocol::Resp,
+            db_index: 0,
+            privileged: false,
+        };
+
+        let partial = pool
+            .parse_on_worker_for_connection(affinity, &context, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
+            .expect("partial parse should initialize worker parser");
+        assert_that!(partial.commands.is_empty(), eq(true));
+        assert_that!(partial.parse_error.is_none(), eq(true));
+
+        let completed = pool
+            .parse_on_worker_for_bound_connection(affinity, b"llo\r\n")
+            .expect("fast path should continue worker parser buffer");
+        assert_that!(completed.commands.len(), eq(1_usize));
+        assert_that!(completed.commands[0].name.as_str(), eq("ECHO"));
+        assert_that!(&completed.commands[0].args, eq(&vec![b"hello".to_vec()]));
+        assert_that!(completed.parse_error.is_none(), eq(true));
+    }
+
+    #[rstest]
+    fn proactor_pool_bound_fast_path_requires_existing_worker_parser_state() {
+        let pool = ProactorPool::new(1);
+        let affinity = pool.bind_connection(99);
+
+        let parsed = pool
+            .parse_on_worker_for_bound_connection(affinity, b"*1\r\n$4\r\nPING\r\n")
+            .expect("request should still complete with parser-state error");
+        assert_that!(parsed.commands.is_empty(), eq(true));
+        let error = parsed
+            .parse_error
+            .expect("missing parser state should be surfaced as parse error");
+        assert_that!(
+            format!("{error}").contains("bound connection parser state is missing"),
+            eq(true)
+        );
     }
 
     #[rstest]
