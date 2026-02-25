@@ -1554,6 +1554,30 @@ fn resp_connection_handles_partial_input() {
 }
 
 #[rstest]
+fn resp_connection_applies_parsed_prefix_before_protocol_error_in_same_chunk() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let mut broken_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    let error = app
+        .feed_connection_bytes(
+            &mut broken_connection,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$A\r\nPING\r\n",
+        )
+        .expect_err("malformed second command should fail");
+    let DflyError::Protocol(_) = error else {
+        panic!("expected protocol error");
+    };
+
+    // Keep readback on a clean connection because malformed bytes remain buffered on the
+    // failing connection, while keyspace mutations from parsed prefix command must persist.
+    let mut reader = ServerApp::new_connection(ClientProtocol::Resp);
+    let get = app
+        .feed_connection_bytes(&mut reader, &resp_command(&[b"GET", b"foo"]))
+        .expect("GET should execute after malformed write chunk");
+    assert_that!(&get, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
+}
+
+#[rstest]
 fn memcache_connection_executes_set_then_get() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Memcache);
