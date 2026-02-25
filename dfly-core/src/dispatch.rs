@@ -10,7 +10,7 @@ use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dfly_cluster::slot::key_slot;
-use dfly_common::ids::DbIndex;
+use dfly_common::ids::{DbIndex, MAX_SLOT_ID};
 
 use crate::command::{CommandFrame, CommandReply};
 
@@ -37,6 +37,48 @@ pub struct CommandSpec {
     pub handler: CommandHandler,
 }
 
+/// Redis cluster defines a fixed 16384-slot hash space.
+const CLUSTER_SLOT_COUNT: usize = (MAX_SLOT_ID as usize) + 1;
+
+/// Dense per-slot key cardinality table.
+///
+/// Dragonfly tracks slot-level stats in a fixed slot domain, so we keep a direct-indexed
+/// structure instead of a sparse hashmap to avoid allocator and hash overhead on hot paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotStats {
+    counts: Box<[usize]>,
+}
+
+impl Default for SlotStats {
+    fn default() -> Self {
+        Self {
+            counts: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
+        }
+    }
+}
+
+impl SlotStats {
+    fn increment(&mut self, slot: u16) {
+        let index = usize::from(slot);
+        self.counts[index] = self.counts[index].saturating_add(1);
+    }
+
+    fn decrement(&mut self, slot: u16) -> usize {
+        let index = usize::from(slot);
+        self.counts[index] = self.counts[index].saturating_sub(1);
+        self.counts[index]
+    }
+
+    #[must_use]
+    fn get(&self, slot: u16) -> usize {
+        self.counts[usize::from(slot)]
+    }
+
+    fn clear(&mut self, slot: u16) {
+        self.counts[usize::from(slot)] = 0;
+    }
+}
+
 /// One logical DB table in the shard-local slice.
 ///
 /// This shape mirrors Dragonfly's `DbTable` layering:
@@ -53,7 +95,7 @@ pub struct DbTable {
     /// Reverse expiration index ordered by deadline for active-expiry scans.
     pub expire_order: BTreeMap<u64, HashSet<Vec<u8>>>,
     /// Key cardinality by Redis cluster slot.
-    pub slot_stats: HashMap<u16, usize>,
+    pub slot_stats: SlotStats,
     /// Key membership by Redis cluster slot.
     pub slot_keys: HashMap<u16, HashSet<Vec<u8>>>,
 }
@@ -152,24 +194,23 @@ impl DispatchState {
             .or_default()
             .insert(key.to_vec());
         if inserted {
-            let cardinality = table.slot_stats.entry(slot).or_default();
-            *cardinality = cardinality.saturating_add(1);
+            table.slot_stats.increment(slot);
         }
     }
 
     fn decrement_slot_stat(table: &mut DbTable, key: &[u8]) {
         let slot = key_slot(key);
-        let mut should_remove = false;
-        if let Some(cardinality) = table.slot_stats.get_mut(&slot) {
-            *cardinality = cardinality.saturating_sub(1);
-            should_remove = *cardinality == 0;
-        }
+        let mut should_remove_slot = false;
         if let Some(keys) = table.slot_keys.get_mut(&slot) {
-            let _ = keys.remove(key);
-            should_remove |= keys.is_empty();
+            if keys.remove(key) {
+                should_remove_slot = table.slot_stats.decrement(slot) == 0;
+            }
+            should_remove_slot |= keys.is_empty();
+        } else if table.slot_stats.get(slot) > 0 {
+            should_remove_slot = table.slot_stats.decrement(slot) == 0;
         }
-        if should_remove {
-            let _ = table.slot_stats.remove(&slot);
+        if should_remove_slot {
+            table.slot_stats.clear(slot);
             let _ = table.slot_keys.remove(&slot);
         }
     }
@@ -2100,7 +2141,7 @@ mod tests {
         let Some(table) = state.db_tables.get(&0) else {
             panic!("db table must exist after SET");
         };
-        assert_that!(table.slot_stats.get(&slot).copied(), eq(Some(1_usize)));
+        assert_that!(table.slot_stats.get(slot), eq(1_usize));
         assert_that!(
             table.slot_keys.get(&slot).map(HashSet::len),
             eq(Some(1_usize))
@@ -2111,7 +2152,7 @@ mod tests {
         let Some(table) = state.db_tables.get(&0) else {
             panic!("db table should be kept after key deletion");
         };
-        assert_that!(table.slot_stats.get(&slot).copied(), eq(None));
+        assert_that!(table.slot_stats.get(slot), eq(0_usize));
         assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
         assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
     }
