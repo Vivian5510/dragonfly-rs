@@ -196,15 +196,29 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             return Ok(());
         }
 
-        for shard in shards {
-            let segment = shard_queue_segment_index(*shard);
+        let mut unique_shards = shards.to_vec();
+        unique_shards.sort_unstable();
+        unique_shards.dedup();
+
+        let mut shards_by_segment = HashMap::<usize, Vec<ShardId>>::new();
+        for shard in unique_shards {
+            let segment = shard_queue_segment_index(shard);
+            shards_by_segment.entry(segment).or_default().push(shard);
+        }
+
+        let mut segment_entries = shards_by_segment.into_iter().collect::<Vec<_>>();
+        segment_entries.sort_unstable_by_key(|(segment, _)| *segment);
+
+        for (segment, segment_shards) in segment_entries {
             let shard_queues = self.shard_queues[segment].lock().map_err(|_| {
                 DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
             })?;
-            if let Some(queue) = shard_queues.get(shard)
-                && !queue.is_empty()
-            {
-                return Err(DflyError::InvalidState("transaction shard queue is busy"));
+            for shard in segment_shards {
+                if let Some(queue) = shard_queues.get(&shard)
+                    && !queue.is_empty()
+                {
+                    return Err(DflyError::InvalidState("transaction shard queue is busy"));
+                }
             }
         }
         Ok(())
@@ -718,6 +732,13 @@ mod tests {
                 .is_ok(),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn scheduler_ensure_shards_available_deduplicates_input() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let shards = vec![2_u16, 2_u16, 1_u16, 1_u16];
+        assert_that!(scheduler.ensure_shards_available(&shards).is_ok(), eq(true));
     }
 
     #[rstest]
