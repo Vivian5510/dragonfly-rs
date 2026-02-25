@@ -9,8 +9,7 @@ use command::{CommandFrame, CommandReply};
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{DbIndex, ShardCount};
 use dispatch::{
-    CommandRegistry, DispatchState, SlotStatsSnapshot, ValueEntry, copy_between_states,
-    rename_between_states,
+    CommandRegistry, DispatchState, SlotStatsSnapshot, copy_between_states, rename_between_states,
 };
 use sharding::{HashTagShardResolver, ShardResolver};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -637,14 +636,12 @@ impl CoreModule {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for entry in entries {
-                state.db_tables.entry(entry.db).or_default().prime.insert(
-                    entry.key.clone(),
-                    ValueEntry {
-                        value: entry.value,
-                        expire_at_unix_secs: entry.expire_at_unix_secs,
-                    },
+                state.load_snapshot_entry(
+                    entry.db,
+                    &entry.key,
+                    entry.value,
+                    entry.expire_at_unix_secs,
                 );
-                state.mark_key_loaded(entry.db, &entry.key);
             }
         }
         Ok(())
@@ -1602,6 +1599,65 @@ mod tests {
             .expect("snapshot import should succeed");
 
         assert_that!(restored.key_version(0, &key), eq(1_u64));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_rebuilds_slot_memory_counters() {
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let key = b"snapshot:slot:memory".to_vec();
+        let slot = key_slot(&key);
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![SnapshotEntry {
+                shard: 0,
+                db: 0,
+                key: key.clone(),
+                value: b"payload".to_vec(),
+                expire_at_unix_secs: None,
+            }],
+        })
+        .expect("snapshot import should succeed");
+
+        let stats = core.slot_stats_for_slot(0, slot);
+        assert_that!(stats.key_count, eq(1_usize));
+        assert_that!(
+            stats.memory_bytes,
+            eq(key.len().saturating_add(b"payload".len()))
+        );
+        assert_that!(stats.total_writes, eq(0_u64));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_duplicate_key_keeps_latest_slot_memory() {
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let key = b"snapshot:slot:duplicate".to_vec();
+        let slot = key_slot(&key);
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: key.clone(),
+                    value: b"first".to_vec(),
+                    expire_at_unix_secs: None,
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: key.clone(),
+                    value: b"x".to_vec(),
+                    expire_at_unix_secs: None,
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        let get = core.execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
+        assert_that!(&get, eq(&CommandReply::BulkString(b"x".to_vec())));
+        let stats = core.slot_stats_for_slot(0, slot);
+        assert_that!(stats.key_count, eq(1_usize));
+        assert_that!(stats.memory_bytes, eq(key.len().saturating_add(1_usize)));
     }
 
     #[rstest]

@@ -489,20 +489,32 @@ impl DispatchState {
         versions.insert(key.to_vec(), next);
     }
 
-    /// Marks one key as loaded from snapshot and advances its mutation version.
+    /// Loads one snapshot key into a DB table and rebuilds derived indexes/counters.
     ///
-    /// This keeps optimistic watch checks consistent after `LOAD`/snapshot import.
-    pub fn mark_key_loaded(&mut self, db: DbIndex, key: &[u8]) {
-        self.bump_key_version(db, key);
-        let Some(table) = self.db_tables.get_mut(&db) else {
-            return;
-        };
-        let Some(entry) = table.prime.get(key) else {
-            return;
-        };
-        let expire_at = entry.expire_at_unix_secs;
-        Self::update_expire_index(table, key, expire_at);
+    /// Snapshot recovery mutates the underlying `prime` table directly instead of going through
+    /// user command handlers. This helper keeps layered state aligned (`expire` index, slot
+    /// cardinality, slot memory accounting, and key versions) without incrementing runtime
+    /// write counters that represent live command traffic only.
+    pub fn load_snapshot_entry(
+        &mut self,
+        db: DbIndex,
+        key: &[u8],
+        value: Vec<u8>,
+        expire_at_unix_secs: Option<u64>,
+    ) {
+        let next_value_len = value.len();
+        let table = self.db_table_mut(db);
+        let previous = table.prime.insert(
+            key.to_vec(),
+            ValueEntry {
+                value,
+                expire_at_unix_secs,
+            },
+        );
+        Self::update_expire_index(table, key, expire_at_unix_secs);
         Self::increment_slot_stat(table, key);
+        Self::account_upsert_slot_memory(table, key, previous.as_ref(), next_value_len);
+        self.bump_key_version(db, key);
     }
 
     /// Removes one key when its expiration timestamp has already passed.
