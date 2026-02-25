@@ -5,12 +5,13 @@
 //! protocol parsing produces a canonical command frame, then a registry resolves and executes
 //! the matching handler.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::str;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dfly_cluster::slot::key_slot;
 use dfly_common::ids::{DbIndex, MAX_SLOT_ID};
+use hashbrown::{HashMap, HashSet};
 
 use crate::command::{CommandFrame, CommandReply};
 
@@ -2265,8 +2266,8 @@ mod tests {
     use crate::command::{CommandFrame, CommandReply};
     use dfly_cluster::slot::key_slot;
     use googletest::prelude::*;
+    use hashbrown::HashSet;
     use rstest::rstest;
-    use std::collections::HashSet;
 
     #[rstest]
     fn dispatch_rebuilds_expire_index_for_layered_db_table() {
@@ -2388,7 +2389,7 @@ mod tests {
             table
                 .expire_order
                 .values()
-                .flat_map(HashSet::iter)
+                .flat_map(|keys| keys.iter())
                 .any(|indexed_key| indexed_key == &key),
             eq(false)
         );
