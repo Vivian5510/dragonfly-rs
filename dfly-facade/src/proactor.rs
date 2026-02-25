@@ -5,7 +5,6 @@
 //! executing parser advancement on that worker thread.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -19,9 +18,9 @@ use crate::protocol::ParsedCommand;
 
 #[derive(Debug)]
 struct ParseRequest {
+    sequence: u64,
     parser: ConnectionState,
     bytes: Vec<u8>,
-    response: std_mpsc::Sender<ProactorParseBatch>,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +35,17 @@ struct IoWorkerQueueMetrics {
 #[derive(Debug, Default)]
 struct IoWorkerQueueState {
     gate: Mutex<()>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct IoWorkerCompletionInner {
+    replies_by_sequence: std::collections::HashMap<u64, ProactorParseBatch>,
+}
+
+#[derive(Debug, Default)]
+struct IoWorkerCompletionState {
+    inner: Mutex<IoWorkerCompletionInner>,
     changed: Condvar,
 }
 
@@ -71,6 +81,8 @@ pub struct ProactorPool {
     senders: Vec<mpsc::UnboundedSender<ParseRequest>>,
     queue_metrics_per_worker: Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: Arc<Vec<IoWorkerQueueState>>,
+    completion_per_worker: Arc<Vec<IoWorkerCompletionState>>,
+    submitted_sequence_per_worker: Vec<Mutex<u64>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 const PROACTOR_WORKER_YIELD_INTERVAL: usize = 64;
@@ -97,6 +109,11 @@ impl std::fmt::Debug for ProactorPool {
                 &self.queue_metrics_per_worker.len(),
             )
             .field("queue_state_per_worker", &self.queue_state_per_worker.len())
+            .field("completion_per_worker", &self.completion_per_worker.len())
+            .field(
+                "submitted_sequence_per_worker",
+                &self.submitted_sequence_per_worker.len(),
+            )
             .field("workers", &self.workers.len())
             .finish()
     }
@@ -129,6 +146,14 @@ impl ProactorPool {
                 .map(|_| IoWorkerQueueState::default())
                 .collect::<Vec<_>>(),
         );
+        let completion_per_worker = Arc::new(
+            (0..worker_len)
+                .map(|_| IoWorkerCompletionState::default())
+                .collect::<Vec<_>>(),
+        );
+        let submitted_sequence_per_worker = (0..worker_len)
+            .map(|_| Mutex::new(0_u64))
+            .collect::<Vec<_>>();
         let mut senders = Vec::with_capacity(worker_len);
         let mut workers = Vec::with_capacity(worker_len);
 
@@ -138,8 +163,15 @@ impl ProactorPool {
             let io_worker = u16::try_from(worker).unwrap_or(0);
             let queue_metrics = Arc::clone(&queue_metrics_per_worker);
             let queue_state = Arc::clone(&queue_state_per_worker);
+            let completion = Arc::clone(&completion_per_worker);
             let handle = thread::spawn(move || {
-                proactor_worker_thread_main(io_worker, receiver, queue_metrics, queue_state);
+                proactor_worker_thread_main(
+                    io_worker,
+                    receiver,
+                    queue_metrics,
+                    queue_state,
+                    completion,
+                );
             });
             workers.push(handle);
         }
@@ -150,6 +182,8 @@ impl ProactorPool {
             senders,
             queue_metrics_per_worker,
             queue_state_per_worker,
+            completion_per_worker,
+            submitted_sequence_per_worker,
             workers,
         }
     }
@@ -257,6 +291,15 @@ impl ProactorPool {
         let Some(queue_state) = self.queue_state_per_worker.get(usize::from(io_worker)) else {
             return Err(DflyError::InvalidState("io worker is out of range"));
         };
+        let Some(completion_state) = self.completion_per_worker.get(usize::from(io_worker)) else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
+        let Some(sequence_counter) = self
+            .submitted_sequence_per_worker
+            .get(usize::from(io_worker))
+        else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
         let queue_soft_limit = self.queue_soft_limit;
         let request_bytes = bytes.len();
 
@@ -297,12 +340,16 @@ impl ProactorPool {
             + request_bytes;
         update_peak_pending(&queue_metrics.peak_pending_bytes, pending_bytes);
 
-        let (response_tx, response_rx) = std_mpsc::channel::<ProactorParseBatch>();
+        // Keep per-worker submission ordering explicit so completion wait can target one sequence.
+        let mut sequence_guard = sequence_counter
+            .lock()
+            .map_err(|_| DflyError::InvalidState("io worker sequence mutex is poisoned"))?;
+        let sequence = (*sequence_guard).saturating_add(1);
         sender
             .send(ParseRequest {
+                sequence,
                 parser,
                 bytes: bytes.to_vec(),
-                response: response_tx,
             })
             .map_err(|_| {
                 let _ = queue_metrics.pending.fetch_update(
@@ -318,20 +365,27 @@ impl ProactorPool {
                 queue_state.changed.notify_all();
                 DflyError::InvalidState("io worker queue is closed")
             })?;
-        response_rx.recv().map_err(|_| {
-            let _ = queue_metrics.pending.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |pending| Some(pending.saturating_sub(1)),
-            );
-            let _ = queue_metrics.pending_bytes.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |pending| Some(pending.saturating_sub(request_bytes)),
-            );
-            queue_state.changed.notify_all();
-            DflyError::InvalidState("io worker reply channel is closed")
-        })
+        *sequence_guard = sequence;
+        drop(sequence_guard);
+
+        let completion = completion_state
+            .inner
+            .lock()
+            .map_err(|_| DflyError::InvalidState("io worker completion mutex is poisoned"))?;
+        let mut completion = completion_state
+            .changed
+            .wait_while(completion, |inner| {
+                !inner.replies_by_sequence.contains_key(&sequence)
+            })
+            .map_err(|_| DflyError::InvalidState("io worker completion mutex is poisoned"))?;
+        let reply =
+            completion
+                .replies_by_sequence
+                .remove(&sequence)
+                .ok_or(DflyError::InvalidState(
+                    "io worker completion for sequence is missing",
+                ))?;
+        Ok(reply)
     }
 }
 
@@ -349,6 +403,7 @@ fn proactor_worker_thread_main(
     receiver: mpsc::UnboundedReceiver<ParseRequest>,
     queue_metrics_per_worker: Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: Arc<Vec<IoWorkerQueueState>>,
+    completion_per_worker: Arc<Vec<IoWorkerCompletionState>>,
 ) {
     let Ok(runtime) = TokioBuilder::new_current_thread().enable_time().build() else {
         return;
@@ -365,6 +420,7 @@ fn proactor_worker_thread_main(
             dispatch_receiver,
             queue_metrics_per_worker,
             queue_state_per_worker,
+            completion_per_worker,
         ));
         let _ = ingress_fiber.await;
         let _ = parse_fiber.await;
@@ -387,13 +443,21 @@ async fn proactor_parse_fiber(
     mut receiver: mpsc::UnboundedReceiver<ParseRequest>,
     queue_metrics_per_worker: Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: Arc<Vec<IoWorkerQueueState>>,
+    completion_per_worker: Arc<Vec<IoWorkerCompletionState>>,
 ) {
     let mut processed_since_yield = 0_usize;
     while let Some(request) = receiver.recv().await {
         let queue_metrics = Arc::clone(&queue_metrics_per_worker);
         let queue_state = Arc::clone(&queue_state_per_worker);
+        let completion = Arc::clone(&completion_per_worker);
         let _ = tokio::task::spawn_local(async move {
-            handle_parse_request(io_worker, request, &queue_metrics, &queue_state);
+            handle_parse_request(
+                io_worker,
+                request,
+                &queue_metrics,
+                &queue_state,
+                &completion,
+            );
         })
         .await;
 
@@ -410,11 +474,12 @@ fn handle_parse_request(
     request: ParseRequest,
     queue_metrics_per_worker: &Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: &Arc<Vec<IoWorkerQueueState>>,
+    completion_per_worker: &Arc<Vec<IoWorkerCompletionState>>,
 ) {
     let ParseRequest {
+        sequence,
         mut parser,
         bytes,
-        response,
     } = request;
     let request_bytes = bytes.len();
     parser.feed_bytes(&bytes);
@@ -435,12 +500,22 @@ fn handle_parse_request(
     if let Some(queue_state) = queue_state_per_worker.get(usize::from(io_worker)) {
         queue_state.changed.notify_all();
     }
-    let _ = response.send(ProactorParseBatch {
-        parser,
-        commands,
-        parse_error,
-        io_worker,
-    });
+    if let Some(completion_state) = completion_per_worker.get(usize::from(io_worker)) {
+        let mut completion = completion_state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = completion.replies_by_sequence.insert(
+            sequence,
+            ProactorParseBatch {
+                parser,
+                commands,
+                parse_error,
+                io_worker,
+            },
+        );
+        completion_state.changed.notify_all();
+    }
 }
 
 fn drain_commands(parser: &mut ConnectionState) -> (Vec<ParsedCommand>, Option<DflyError>) {
