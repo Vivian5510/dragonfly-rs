@@ -228,11 +228,31 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_parsed_command(
         &mut self,
         connection: &mut ServerConnection,
         parsed: ParsedCommand,
     ) -> Option<Vec<u8>> {
+        match self.execute_parsed_command_deferred(connection, parsed) {
+            ParsedCommandExecution::Immediate(reply) => reply,
+            ParsedCommandExecution::Deferred(ticket) => {
+                match self.wait_and_take_runtime_reply_ticket(&ticket) {
+                    Ok(reply) => Some(reply),
+                    Err(error) => Some(
+                        CommandReply::Error(format!("runtime dispatch failed: {error}"))
+                            .to_resp_bytes(),
+                    ),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn execute_parsed_command_deferred(
+        &mut self,
+        connection: &mut ServerConnection,
+        parsed: ParsedCommand,
+    ) -> ParsedCommandExecution {
         // Protocol parser has already normalized command shape, so dispatcher can operate
         // on a stable frame independent from socket/wire details.
         let frame = CommandFrame::new(parsed.name, parsed.args);
@@ -241,31 +261,33 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         // before core command execution, matching Dragonfly's high-level transaction entry.
         if connection.context.protocol == ClientProtocol::Resp {
             if let Some(select_reply) = Self::handle_resp_select(connection, &frame) {
-                return Some(select_reply);
+                return ParsedCommandExecution::Immediate(Some(select_reply));
             }
 
             if let Some(transaction_reply) =
                 self.handle_resp_transaction_control(connection, &frame)
             {
-                return Some(transaction_reply);
+                return ParsedCommandExecution::Immediate(Some(transaction_reply));
             }
 
             if connection.transaction.in_multi() {
-                return Some(match self.validate_queued_command(&frame) {
-                    Ok(()) => {
-                        let queued = connection.transaction.queue_command(frame);
-                        if queued {
-                            CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes()
-                        } else {
-                            CommandReply::Error("transaction queue is unavailable".to_owned())
-                                .to_resp_bytes()
+                return ParsedCommandExecution::Immediate(Some(
+                    match self.validate_queued_command(&frame) {
+                        Ok(()) => {
+                            let queued = connection.transaction.queue_command(frame);
+                            if queued {
+                                CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes()
+                            } else {
+                                CommandReply::Error("transaction queue is unavailable".to_owned())
+                                    .to_resp_bytes()
+                            }
                         }
-                    }
-                    Err(message) => {
-                        connection.transaction.mark_queued_error();
-                        CommandReply::Error(message).to_resp_bytes()
-                    }
-                });
+                        Err(message) => {
+                            connection.transaction.mark_queued_error();
+                            CommandReply::Error(message).to_resp_bytes()
+                        }
+                    },
+                ));
             }
         }
 
@@ -274,13 +296,27 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
                 // Dragonfly does not interleave ACK replies with journal stream writes.
                 // We model the same behavior by consuming successful ACK silently.
-                return None;
+                return ParsedCommandExecution::Immediate(None);
             }
-            return Some(encode_reply_for_protocol(
+            return ParsedCommandExecution::Immediate(Some(encode_reply_for_protocol(
                 connection.context.protocol,
                 &frame,
                 reply,
-            ));
+            )));
+        }
+
+        match self.try_dispatch_parsed_command_runtime_deferred(connection, &frame) {
+            Ok(Some(ticket)) => {
+                return ParsedCommandExecution::Deferred(ticket);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return ParsedCommandExecution::Immediate(Some(encode_reply_for_protocol(
+                    connection.context.protocol,
+                    &frame,
+                    CommandReply::Error(format!("runtime dispatch failed: {error}")),
+                )));
+            }
         }
 
         let db = connection.context.db_index;
@@ -288,16 +324,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
             // Dragonfly does not interleave ACK replies with journal stream writes.
             // We model the same behavior by consuming successful ACK silently.
-            return None;
+            return ParsedCommandExecution::Immediate(None);
         }
 
         // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
         // where execution result is translated back to client protocol right before writeback.
-        Some(encode_reply_for_protocol(
+        ParsedCommandExecution::Immediate(Some(encode_reply_for_protocol(
             connection.context.protocol,
             &frame,
             reply,
-        ))
+        )))
     }
 
     fn handle_resp_select(
@@ -1838,6 +1874,28 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             payload,
         });
     }
+}
+
+/// Deferred reply handle for one command already submitted to a shard runtime queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeReplyTicket {
+    /// Target shard that owns the command execution.
+    pub(crate) shard: u16,
+    /// Monotonic sequence assigned at submit time on that shard queue.
+    pub(crate) sequence: u64,
+    /// Client protocol used to encode the command reply.
+    pub(crate) protocol: ClientProtocol,
+    /// Canonical command frame needed for protocol-aware reply encoding.
+    pub(crate) frame: CommandFrame,
+}
+
+/// Result shape for parsed-command execution in threaded network mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedCommandExecution {
+    /// Command completed in coordinator context and can be written back immediately.
+    Immediate(Option<Vec<u8>>),
+    /// Command was submitted to shard runtime and will complete asynchronously.
+    Deferred(RuntimeReplyTicket),
 }
 
 /// Per-client state stored by the server.

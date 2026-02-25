@@ -1,12 +1,13 @@
 //! Runtime dispatch/execution path for transactions and direct command ingress.
 
-use super::{ServerApp, is_runtime_dispatch_error};
+use super::{RuntimeReplyTicket, ServerApp, ServerConnection, is_runtime_dispatch_error};
 use dfly_common::config::ClusterMode;
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::RuntimeEnvelope;
+use dfly_facade::protocol::ClientProtocol;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -372,6 +373,83 @@ impl ServerApp {
             execute_on_worker,
             command: command.clone(),
         })
+    }
+
+    pub(crate) fn try_dispatch_parsed_command_runtime_deferred(
+        &self,
+        connection: &ServerConnection,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        // Start with one narrowly-scoped async fast path so coordinator writeback can
+        // run without blocking on shard barriers. This keeps behavior predictable while
+        // we expand deferred execution to more command families.
+        if connection.context.protocol != ClientProtocol::Resp {
+            return Ok(None);
+        }
+        if self.cluster.mode != ClusterMode::Disabled {
+            return Ok(None);
+        }
+        if connection.transaction.in_multi() {
+            return Ok(None);
+        }
+        if frame.name != "GET" || frame.args.len() != 1 {
+            return Ok(None);
+        }
+
+        let shard = self.core.resolve_target_shard(frame);
+        let ready = self
+            .transaction
+            .scheduler
+            .wait_for_shards_available(&[shard], DIRECT_BARRIER_WAIT_TIMEOUT)?;
+        if !ready {
+            return Err(DflyError::InvalidState("transaction shard queue is busy"));
+        }
+
+        let sequence = self.submit_runtime_envelope_with_sequence(
+            shard,
+            connection.context.db_index,
+            frame,
+            true,
+        )?;
+        Ok(Some(RuntimeReplyTicket {
+            shard,
+            sequence,
+            protocol: connection.context.protocol,
+            frame: frame.clone(),
+        }))
+    }
+
+    pub(crate) fn runtime_reply_ticket_ready(
+        &self,
+        ticket: &RuntimeReplyTicket,
+    ) -> DflyResult<bool> {
+        self.runtime
+            .wait_for_processed_sequence(ticket.shard, ticket.sequence, Duration::ZERO)
+    }
+
+    pub(crate) fn take_runtime_reply_ticket(
+        &self,
+        ticket: &RuntimeReplyTicket,
+    ) -> DflyResult<Vec<u8>> {
+        let reply = self
+            .runtime
+            .take_processed_reply(ticket.shard, ticket.sequence)?;
+        let reply = reply.ok_or(DflyError::InvalidState("missing worker reply"))?;
+        Ok(super::encode_reply_for_protocol(
+            ticket.protocol,
+            &ticket.frame,
+            reply,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_and_take_runtime_reply_ticket(
+        &self,
+        ticket: &RuntimeReplyTicket,
+    ) -> DflyResult<Vec<u8>> {
+        self.runtime
+            .wait_until_processed_sequence(ticket.shard, ticket.sequence)?;
+        self.take_runtime_reply_ticket(ticket)
     }
 
     fn execute_runtime_command_on_worker_shard(
