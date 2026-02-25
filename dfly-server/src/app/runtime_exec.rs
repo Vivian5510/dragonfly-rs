@@ -208,8 +208,7 @@ impl ServerApp {
         }
 
         let same_shard = self
-            .same_shard_copy_rename_target_shard(command)
-            .or_else(|| self.same_shard_multikey_count_target_shard(command))
+            .same_shard_multikey_count_target_shard(command)
             .or_else(|| self.same_shard_multikey_string_target_shard(command));
         let Some(same_shard) = same_shard else {
             return false;
@@ -447,7 +446,7 @@ impl ServerApp {
                 return reply;
             }
 
-            if let Some(reply) = self.execute_same_shard_copy_rename_via_runtime(db, frame) {
+            if let Some(reply) = self.execute_copy_rename_via_runtime(db, frame, true) {
                 self.maybe_append_journal_for_command(txid, db, frame, &reply);
                 return reply;
             }
@@ -475,12 +474,13 @@ impl ServerApp {
         reply
     }
 
-    pub(super) fn execute_same_shard_copy_rename_via_runtime(
+    pub(super) fn execute_copy_rename_via_runtime(
         &mut self,
         db: u16,
         frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
     ) -> Option<CommandReply> {
-        let shard = self.same_shard_copy_rename_target_shard(frame)?;
+        let (source_shard, destination_shard) = self.copy_rename_shards(frame)?;
 
         let keys_for_cluster_check: Vec<&[u8]> = match frame.name.as_str() {
             "COPY" => frame.args.iter().take(2).map(Vec::as_slice).collect(),
@@ -490,17 +490,102 @@ impl ServerApp {
         {
             return Some(error_reply);
         }
-        Some(self.execute_runtime_command_on_worker_shard(db, frame, shard, true))
+        Some(self.execute_copy_rename_on_owner_worker(
+            db,
+            frame,
+            source_shard,
+            destination_shard,
+            enforce_scheduler_barrier,
+        ))
     }
 
-    fn same_shard_copy_rename_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
-        if !matches!(frame.name.as_str(), "COPY" | "RENAME" | "RENAMENX") || frame.args.len() < 2 {
-            return None;
+    fn execute_copy_rename_on_owner_worker(
+        &mut self,
+        db: u16,
+        frame: &CommandFrame,
+        source_shard: u16,
+        destination_shard: u16,
+        enforce_scheduler_barrier: bool,
+    ) -> CommandReply {
+        let mut touched_shards = vec![source_shard];
+        if destination_shard != source_shard {
+            touched_shards.push(destination_shard);
+        }
+        if enforce_scheduler_barrier
+            && let Err(error) = self
+                .transaction
+                .scheduler
+                .ensure_shards_available(&touched_shards)
+        {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
         }
 
+        let source_sequence =
+            match self.submit_runtime_envelope_with_sequence(source_shard, db, frame, true) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+                }
+            };
+
+        let destination_barrier_sequence = if destination_shard == source_shard {
+            None
+        } else {
+            match self.submit_runtime_envelope_with_sequence(destination_shard, db, frame, false) {
+                Ok(sequence) => Some(sequence),
+                Err(error) => {
+                    return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+                }
+            }
+        };
+
+        if let Err(error) = self
+            .runtime
+            .wait_until_processed_sequence(source_shard, source_sequence)
+        {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+        }
+        if let Some(sequence) = destination_barrier_sequence
+            && let Err(error) = self
+                .runtime
+                .wait_until_processed_sequence(destination_shard, sequence)
+        {
+            return CommandReply::Error(format!("runtime dispatch failed: {error}"));
+        }
+
+        match self
+            .runtime
+            .take_processed_reply(source_shard, source_sequence)
+        {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                CommandReply::Error("runtime dispatch failed: missing worker reply".to_owned())
+            }
+            Err(error) => CommandReply::Error(format!("runtime dispatch failed: {error}")),
+        }
+    }
+
+    fn copy_rename_shards(&self, frame: &CommandFrame) -> Option<(u16, u16)> {
+        let valid_shape = match frame.name.as_str() {
+            "COPY" => frame.args.len() >= 2,
+            "RENAME" | "RENAMENX" => frame.args.len() == 2,
+            _ => false,
+        };
+        if !valid_shape {
+            return None;
+        }
         let source_shard = self.core.resolve_shard_for_key(&frame.args[0]);
         let destination_shard = self.core.resolve_shard_for_key(&frame.args[1]);
-        (source_shard == destination_shard).then_some(source_shard)
+        Some((source_shard, destination_shard))
+    }
+
+    fn copy_rename_runtime_target_shards(&self, frame: &CommandFrame) -> Option<Vec<u16>> {
+        let (source_shard, destination_shard) = self.copy_rename_shards(frame)?;
+        if source_shard == destination_shard {
+            return Some(vec![source_shard]);
+        }
+        // Keep source owner first so cross-shard copy/rename executes on source worker.
+        Some(vec![source_shard, destination_shard])
     }
 
     fn same_shard_multikey_count_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
@@ -955,8 +1040,7 @@ impl ServerApp {
     }
 
     fn replay_same_shard_runtime_target(&self, frame: &CommandFrame) -> Option<u16> {
-        self.same_shard_copy_rename_target_shard(frame)
-            .or_else(|| self.same_shard_multikey_count_target_shard(frame))
+        self.same_shard_multikey_count_target_shard(frame)
             .or_else(|| self.same_shard_multikey_string_target_shard(frame))
     }
 
@@ -970,6 +1054,9 @@ impl ServerApp {
             CommandRouting::SingleKey { .. }
         ) {
             return self.execute_single_shard_command_via_runtime_internal(db, frame, false);
+        }
+        if let Some(reply) = self.execute_copy_rename_via_runtime(db, frame, false) {
+            return reply;
         }
         if let Some(shard) = self.replay_same_shard_runtime_target(frame) {
             return self.execute_runtime_command_on_worker_shard(db, frame, shard, false);
@@ -1062,6 +1149,9 @@ impl ServerApp {
         ) {
             return vec![self.core.resolve_target_shard(frame)];
         }
+        if let Some(shards) = self.copy_rename_runtime_target_shards(frame) {
+            return shards;
+        }
 
         match frame.name.as_str() {
             // Multi-key fanout commands: each key can belong to a different shard owner.
@@ -1074,16 +1164,6 @@ impl ServerApp {
                     frame.args.iter().step_by(2).map(Vec::as_slice),
                 )
             }
-            // COPY/RENAME family touches source and destination owners.
-            "COPY" if frame.args.len() >= 2 => self.collect_unique_runtime_shards_for_keys([
-                frame.args[0].as_slice(),
-                frame.args[1].as_slice(),
-            ]),
-            "RENAME" | "RENAMENX" if frame.args.len() == 2 => self
-                .collect_unique_runtime_shards_for_keys([
-                    frame.args[0].as_slice(),
-                    frame.args[1].as_slice(),
-                ]),
             // Global keyspace commands must observe a full-shard barrier.
             "FLUSHDB" | "FLUSHALL" | "DBSIZE" | "KEYS" | "RANDOMKEY" => self.all_runtime_shards(),
             _ => Vec::new(),
