@@ -49,6 +49,7 @@ pub struct SlotStats {
     key_counts: Box<[usize]>,
     total_reads: Box<[u64]>,
     total_writes: Box<[u64]>,
+    memory_bytes: Box<[usize]>,
 }
 
 impl Default for SlotStats {
@@ -57,6 +58,7 @@ impl Default for SlotStats {
             key_counts: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
             total_reads: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
             total_writes: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
+            memory_bytes: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
         }
     }
 }
@@ -92,6 +94,16 @@ impl SlotStats {
         self.total_reads[index] = self.total_reads[index].saturating_add(1);
     }
 
+    fn add_memory_bytes(&mut self, slot: u16, bytes: usize) {
+        let index = usize::from(slot);
+        self.memory_bytes[index] = self.memory_bytes[index].saturating_add(bytes);
+    }
+
+    fn sub_memory_bytes(&mut self, slot: u16, bytes: usize) {
+        let index = usize::from(slot);
+        self.memory_bytes[index] = self.memory_bytes[index].saturating_sub(bytes);
+    }
+
     /// Returns cumulative successful read count for one slot.
     ///
     /// Counter shape mirrors Dragonfly's slot stats bookkeeping that tracks
@@ -108,6 +120,15 @@ impl SlotStats {
     #[must_use]
     pub fn total_writes(&self, slot: u16) -> u64 {
         self.total_writes[usize::from(slot)]
+    }
+
+    /// Returns current approximate user payload bytes in one slot.
+    ///
+    /// This learning counter accounts for key bytes + value bytes and updates
+    /// synchronously with key mutations.
+    #[must_use]
+    pub fn memory_bytes(&self, slot: u16) -> usize {
+        self.memory_bytes[usize::from(slot)]
     }
 }
 
@@ -238,6 +259,36 @@ impl DispatchState {
         table.slot_stats.increment_read(key_slot(key));
     }
 
+    fn slot_payload_bytes(key: &[u8], entry: &ValueEntry) -> usize {
+        key.len().saturating_add(entry.value.len())
+    }
+
+    fn account_upsert_slot_memory(
+        table: &mut DbTable,
+        key: &[u8],
+        previous: Option<&ValueEntry>,
+        next_value_len: usize,
+    ) {
+        let slot = key_slot(key);
+        let next_bytes = key.len().saturating_add(next_value_len);
+        let previous_bytes = previous.map_or(0, |entry| Self::slot_payload_bytes(key, entry));
+        if next_bytes >= previous_bytes {
+            table
+                .slot_stats
+                .add_memory_bytes(slot, next_bytes.saturating_sub(previous_bytes));
+        } else {
+            table
+                .slot_stats
+                .sub_memory_bytes(slot, previous_bytes.saturating_sub(next_bytes));
+        }
+    }
+
+    fn account_remove_slot_memory(table: &mut DbTable, key: &[u8], removed: &ValueEntry) {
+        table
+            .slot_stats
+            .sub_memory_bytes(key_slot(key), Self::slot_payload_bytes(key, removed));
+    }
+
     fn decrement_slot_stat(table: &mut DbTable, key: &[u8]) {
         let slot = key_slot(key);
         let mut should_remove_slot = false;
@@ -258,10 +309,12 @@ impl DispatchState {
     fn upsert_key(&mut self, db: DbIndex, key: &[u8], value: ValueEntry) -> Option<ValueEntry> {
         let key_bytes = key.to_vec();
         let expire_at = value.expire_at_unix_secs;
+        let next_value_len = value.value.len();
         let table = self.db_table_mut(db);
         let previous = table.prime.insert(key_bytes.clone(), value);
         Self::update_expire_index(table, key, expire_at);
         Self::increment_slot_stat(table, key);
+        Self::account_upsert_slot_memory(table, key, previous.as_ref(), next_value_len);
         Self::increment_slot_write_stat(table, key);
         previous
     }
@@ -272,6 +325,7 @@ impl DispatchState {
         if let Some(previous_expire) = table.expire.remove(key) {
             Self::remove_expire_deadline(table, key, previous_expire);
         }
+        Self::account_remove_slot_memory(table, key, &removed);
         Self::decrement_slot_stat(table, key);
         Self::increment_slot_write_stat(table, key);
         Some(removed)
@@ -2219,6 +2273,10 @@ mod tests {
         assert_that!(table.slot_stats.get(slot), eq(1_usize));
         assert_that!(table.slot_stats.total_writes(slot), eq(1_u64));
         assert_that!(
+            table.slot_stats.memory_bytes(slot),
+            eq(key.len().saturating_add(b"value".len()))
+        );
+        assert_that!(
             table.slot_keys.get(&slot).map(HashSet::len),
             eq(Some(1_usize))
         );
@@ -2230,6 +2288,7 @@ mod tests {
         };
         assert_that!(table.slot_stats.get(slot), eq(0_usize));
         assert_that!(table.slot_stats.total_writes(slot), eq(2_u64));
+        assert_that!(table.slot_stats.memory_bytes(slot), eq(0_usize));
         assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
         assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
     }
@@ -2275,6 +2334,35 @@ mod tests {
         assert_that!(table.slot_stats.get(slot), eq(1_usize));
         assert_that!(table.slot_stats.total_writes(slot), eq(1_u64));
         assert_that!(table.slot_stats.total_reads(slot), eq(6_u64));
+    }
+
+    #[rstest]
+    fn dispatch_slot_memory_counter_tracks_overwrite_delta() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:slot:memory".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"first".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"x".to_vec()]),
+            &mut state,
+        );
+
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table must exist after overwrite sequence");
+        };
+        assert_that!(table.slot_stats.get(slot), eq(1_usize));
+        assert_that!(table.slot_stats.total_writes(slot), eq(2_u64));
+        assert_that!(
+            table.slot_stats.memory_bytes(slot),
+            eq(key.len().saturating_add(b"x".len()))
+        );
     }
 
     #[rstest]
