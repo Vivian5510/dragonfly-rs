@@ -1,6 +1,7 @@
 //! Scheduler interfaces for transaction execution.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use dfly_common::error::{DflyError, DflyResult};
@@ -52,23 +53,22 @@ pub trait TransactionScheduler: Send + Sync {
 ///
 /// The current learning implementation executes transactions synchronously right after scheduling,
 /// so we allow only one active transaction per shard queue head at a time.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryTransactionScheduler {
-    state: Mutex<SchedulerState>,
+    shard_queues: ShardQueueSegments,
+    key_locks: KeyLockSegments,
+    active: Mutex<HashMap<TxId, ActiveLease>>,
 }
 
-#[derive(Debug, Default)]
-struct SchedulerState {
-    /// Pending queue per shard, ordered by scheduling time.
-    shard_queues: HashMap<ShardId, VecDeque<TxId>>,
-    /// Key owner map `(shard, key) -> read/write lock state`.
-    key_locks: HashMap<KeyId, KeyLockState>,
-    /// Lease descriptors for active transactions.
-    active: HashMap<TxId, ActiveLease>,
-}
+const SCHEDULER_SEGMENT_COUNT: usize = 64;
 
 type KeyId = (ShardId, Vec<u8>);
 type KeyAccessList = Vec<(KeyId, SingleKeyAccess)>;
+
+type ShardQueueMap = HashMap<ShardId, VecDeque<TxId>>;
+type KeyLockMap = HashMap<KeyId, KeyLockState>;
+type ShardQueueSegments = [Mutex<ShardQueueMap>; SCHEDULER_SEGMENT_COUNT];
+type KeyLockSegments = [Mutex<KeyLockMap>; SCHEDULER_SEGMENT_COUNT];
 
 #[derive(Debug, Default)]
 struct KeyLockState {
@@ -90,6 +90,16 @@ struct ActiveLease {
     reserved_shards: Vec<ShardId>,
     /// Key locks held by this transaction.
     key_leases: Vec<KeyLease>,
+}
+
+impl Default for InMemoryTransactionScheduler {
+    fn default() -> Self {
+        Self {
+            shard_queues: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            key_locks: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            active: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl TransactionScheduler for InMemoryTransactionScheduler {
@@ -125,43 +135,35 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
         let mut shards = touched_shards.into_iter().collect::<Vec<_>>();
         shards.sort_unstable();
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
-
-        if state.active.contains_key(&plan.txid) {
+        if self.is_active_txid(plan.txid)? {
             return Err(DflyError::InvalidState(
                 "transaction txid is already active",
             ));
         }
 
-        let mut reserved_shards = Vec::new();
-        for shard in &shards {
-            let queue = state.shard_queues.entry(*shard).or_default();
-
-            // Unit-level model: a queued transaction is considered "active". If queue is non-empty,
-            // next transaction must retry later instead of running immediately.
-            if !queue.is_empty() {
-                rollback_leases(&mut state, plan.txid, &reserved_shards, &[]);
-                return Err(DflyError::InvalidState("shard queue is busy"));
-            }
-
-            queue.push_back(plan.txid);
-            reserved_shards.push(*shard);
-        }
+        let reserved_shards = self.reserve_shards_for_tx(plan.txid, &shards)?;
 
         let mut key_leases = Vec::new();
         for (key_id, access) in key_accesses {
-            let lock_state = state.key_locks.entry(key_id.clone()).or_default();
-            if !try_acquire_key_lock(lock_state, plan.txid, access) {
-                rollback_leases(&mut state, plan.txid, &reserved_shards, &key_leases);
+            if !self.try_acquire_segmented_key_lock(plan.txid, key_id.clone(), access)? {
+                self.rollback_tx_leases(plan.txid, &reserved_shards, &key_leases)?;
                 return Err(DflyError::InvalidState("key lock is busy"));
             }
             key_leases.push(KeyLease { key_id, access });
         }
 
-        let _ = state.active.insert(
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
+        if active.contains_key(&plan.txid) {
+            drop(active);
+            self.rollback_tx_leases(plan.txid, &reserved_shards, &key_leases)?;
+            return Err(DflyError::InvalidState(
+                "transaction txid is already active",
+            ));
+        }
+        let _ = active.insert(
             plan.txid,
             ActiveLease {
                 reserved_shards,
@@ -172,17 +174,18 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
     }
 
     fn conclude(&self, txid: TxId) -> DflyResult<()> {
-        let mut state = self
-            .state
+        let mut active = self
+            .active
             .lock()
             .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
 
-        let Some(lease) = state.active.remove(&txid) else {
+        let Some(lease) = active.remove(&txid) else {
             // Non-atomic plans keep no scheduler lease, so this path is intentionally a no-op.
             return Ok(());
         };
+        drop(active);
 
-        rollback_leases(&mut state, txid, &lease.reserved_shards, &lease.key_leases);
+        self.rollback_tx_leases(txid, &lease.reserved_shards, &lease.key_leases)?;
         Ok(())
     }
 
@@ -191,16 +194,117 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             return Ok(());
         }
 
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
-
         for shard in shards {
-            if let Some(queue) = state.shard_queues.get(shard)
+            let segment = shard_queue_segment_index(*shard);
+            let shard_queues = self.shard_queues[segment].lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
+            })?;
+            if let Some(queue) = shard_queues.get(shard)
                 && !queue.is_empty()
             {
                 return Err(DflyError::InvalidState("transaction shard queue is busy"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl InMemoryTransactionScheduler {
+    fn is_active_txid(&self, txid: TxId) -> DflyResult<bool> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
+        Ok(active.contains_key(&txid))
+    }
+
+    fn reserve_shards_for_tx(&self, txid: TxId, shards: &[ShardId]) -> DflyResult<Vec<ShardId>> {
+        let mut reserved_shards = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let segment = shard_queue_segment_index(*shard);
+            let mut shard_queues = self.shard_queues[segment].lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
+            })?;
+            let queue = shard_queues.entry(*shard).or_default();
+
+            // Unit-level model: a queued transaction is considered "active". If queue is non-empty,
+            // next transaction must retry later instead of running immediately.
+            if !queue.is_empty() {
+                drop(shard_queues);
+                self.rollback_tx_leases(txid, &reserved_shards, &[])?;
+                return Err(DflyError::InvalidState("shard queue is busy"));
+            }
+
+            queue.push_back(txid);
+            reserved_shards.push(*shard);
+        }
+        Ok(reserved_shards)
+    }
+
+    fn try_acquire_segmented_key_lock(
+        &self,
+        txid: TxId,
+        key_id: KeyId,
+        access: SingleKeyAccess,
+    ) -> DflyResult<bool> {
+        let segment = key_lock_segment_index(&key_id);
+        let mut key_locks = self.key_locks[segment].lock().map_err(|_| {
+            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+        })?;
+        let lock_state = key_locks.entry(key_id).or_default();
+        Ok(try_acquire_key_lock(lock_state, txid, access))
+    }
+
+    fn release_segmented_key_lease(&self, txid: TxId, lease: &KeyLease) -> DflyResult<()> {
+        let segment = key_lock_segment_index(&lease.key_id);
+        let mut key_locks = self.key_locks[segment].lock().map_err(|_| {
+            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
+        })?;
+        let mut remove_state = false;
+        if let Some(lock_state) = key_locks.get_mut(&lease.key_id) {
+            match lease.access {
+                SingleKeyAccess::Read => {
+                    let _ = lock_state.readers.remove(&txid);
+                }
+                SingleKeyAccess::Write => {
+                    if lock_state.writer == Some(txid) {
+                        lock_state.writer = None;
+                    }
+                    let _ = lock_state.readers.remove(&txid);
+                }
+            }
+            remove_state = lock_state.writer.is_none() && lock_state.readers.is_empty();
+        }
+        if remove_state {
+            let _ = key_locks.remove(&lease.key_id);
+        }
+        Ok(())
+    }
+
+    fn rollback_tx_leases(
+        &self,
+        txid: TxId,
+        reserved_shards: &[ShardId],
+        key_leases: &[KeyLease],
+    ) -> DflyResult<()> {
+        for key_lease in key_leases {
+            self.release_segmented_key_lease(txid, key_lease)?;
+        }
+
+        for shard in reserved_shards {
+            let segment = shard_queue_segment_index(*shard);
+            let mut shard_queues = self.shard_queues[segment].lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
+            })?;
+            let mut should_remove_queue = false;
+            if let Some(queue) = shard_queues.get_mut(shard) {
+                if let Some(position) = queue.iter().position(|queued_txid| *queued_txid == txid) {
+                    let _ = queue.remove(position);
+                }
+                should_remove_queue = queue.is_empty();
+            }
+            if should_remove_queue {
+                let _ = shard_queues.remove(shard);
             }
         }
         Ok(())
@@ -308,49 +412,17 @@ fn try_acquire_key_lock(
     }
 }
 
-fn release_key_lease(state: &mut SchedulerState, txid: TxId, lease: &KeyLease) {
-    let mut remove_state = false;
-    if let Some(lock_state) = state.key_locks.get_mut(&lease.key_id) {
-        match lease.access {
-            SingleKeyAccess::Read => {
-                let _ = lock_state.readers.remove(&txid);
-            }
-            SingleKeyAccess::Write => {
-                if lock_state.writer == Some(txid) {
-                    lock_state.writer = None;
-                }
-                let _ = lock_state.readers.remove(&txid);
-            }
-        }
-        remove_state = lock_state.writer.is_none() && lock_state.readers.is_empty();
-    }
-    if remove_state {
-        let _ = state.key_locks.remove(&lease.key_id);
-    }
+fn shard_queue_segment_index(shard: ShardId) -> usize {
+    usize::from(shard) % SCHEDULER_SEGMENT_COUNT
 }
 
-fn rollback_leases(
-    state: &mut SchedulerState,
-    txid: TxId,
-    reserved_shards: &[ShardId],
-    key_leases: &[KeyLease],
-) {
-    for key_lease in key_leases {
-        release_key_lease(state, txid, key_lease);
-    }
-
-    for shard in reserved_shards {
-        let mut should_remove_queue = false;
-        if let Some(queue) = state.shard_queues.get_mut(shard) {
-            if let Some(position) = queue.iter().position(|queued_txid| *queued_txid == txid) {
-                let _ = queue.remove(position);
-            }
-            should_remove_queue = queue.is_empty();
-        }
-        if should_remove_queue {
-            let _ = state.shard_queues.remove(shard);
-        }
-    }
+fn key_lock_segment_index(key_id: &KeyId) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key_id.hash(&mut hasher);
+    let segment_count_u64 =
+        u64::try_from(SCHEDULER_SEGMENT_COUNT).expect("segment count must fit into u64");
+    let segment = hasher.finish() % segment_count_u64;
+    usize::try_from(segment).expect("segment index must fit into usize")
 }
 
 #[cfg(test)]
