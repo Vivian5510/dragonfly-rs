@@ -1,5 +1,6 @@
 //! Runtime envelopes for coordinator-to-shard dispatch.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -47,6 +48,12 @@ struct ShardExecutionState {
     changed: Condvar,
 }
 
+#[derive(Debug, Default)]
+struct ShardQueueMetrics {
+    pending: AtomicUsize,
+    peak_pending: AtomicUsize,
+}
+
 /// Abstract runtime backend that receives coordinator work.
 pub trait ShardRuntime: Send + Sync {
     /// Number of shard workers served by this runtime.
@@ -74,6 +81,7 @@ pub struct InMemoryShardRuntime {
     shard_count: ShardCount,
     senders: Vec<mpsc::UnboundedSender<QueuedEnvelope>>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
+    queue_metrics_per_shard: Arc<Vec<ShardQueueMetrics>>,
     submitted_sequence_per_shard: Vec<Mutex<u64>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -83,12 +91,26 @@ type RuntimeMaintenance = dyn Fn(ShardId) + Send + Sync;
 const SHARD_WORKER_YIELD_INTERVAL: usize = 64;
 const SHARD_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
 
+fn update_peak_pending(peak: &AtomicUsize, candidate: usize) {
+    let mut observed = peak.load(Ordering::Acquire);
+    while candidate > observed {
+        match peak.compare_exchange_weak(observed, candidate, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(current) => observed = current,
+        }
+    }
+}
+
 impl std::fmt::Debug for InMemoryShardRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryShardRuntime")
             .field("shard_count", &self.shard_count)
             .field("senders", &self.senders.len())
             .field("execution_per_shard", &self.execution_per_shard.len())
+            .field(
+                "queue_metrics_per_shard",
+                &self.queue_metrics_per_shard.len(),
+            )
             .field(
                 "submitted_sequence_per_shard",
                 &self.submitted_sequence_per_shard.len(),
@@ -169,6 +191,11 @@ impl InMemoryShardRuntime {
                 .map(|_| ShardExecutionState::default())
                 .collect::<Vec<_>>(),
         );
+        let queue_metrics_per_shard = Arc::new(
+            (0..shard_len)
+                .map(|_| ShardQueueMetrics::default())
+                .collect::<Vec<_>>(),
+        );
         let submitted_sequence_per_shard = (0..shard_len)
             .map(|_| Mutex::new(0_u64))
             .collect::<Vec<_>>();
@@ -182,6 +209,7 @@ impl InMemoryShardRuntime {
             senders.push(sender);
 
             let execution = Arc::clone(&execution_per_shard);
+            let queue_metrics = Arc::clone(&queue_metrics_per_shard);
             let shard_executor = Arc::clone(executor);
             let shard_maintenance = maintenance.map(Arc::clone);
             let handle = thread::spawn(move || {
@@ -189,6 +217,7 @@ impl InMemoryShardRuntime {
                     shard,
                     receiver,
                     execution,
+                    queue_metrics,
                     shard_executor,
                     shard_maintenance,
                     maintenance_interval,
@@ -201,6 +230,7 @@ impl InMemoryShardRuntime {
             shard_count,
             senders,
             execution_per_shard,
+            queue_metrics_per_shard,
             submitted_sequence_per_shard,
             workers,
         }
@@ -240,6 +270,30 @@ impl InMemoryShardRuntime {
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
         Ok(guard.processed.len())
+    }
+
+    /// Returns current number of queued envelopes that have not reached execution yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn pending_queue_depth(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        Ok(metrics.pending.load(Ordering::Acquire))
+    }
+
+    /// Returns maximum observed pending queue depth for one shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when shard id is out of range.
+    pub fn peak_pending_queue_depth(&self, shard: ShardId) -> DflyResult<usize> {
+        let Some(metrics) = self.queue_metrics_per_shard.get(usize::from(shard)) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
+        Ok(metrics.peak_pending.load(Ordering::Acquire))
     }
 
     /// Waits until one shard has processed at least `minimum` envelopes.
@@ -283,6 +337,9 @@ impl InMemoryShardRuntime {
         let Some(sender) = self.senders.get(shard) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
+        let Some(queue_metrics) = self.queue_metrics_per_shard.get(shard) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
         let Some(sequence_counter) = self.submitted_sequence_per_shard.get(shard) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
@@ -293,9 +350,16 @@ impl InMemoryShardRuntime {
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime sequence mutex is poisoned"))?;
         let sequence = (*sequence_guard).saturating_add(1);
-        sender
-            .send(QueuedEnvelope { sequence, envelope })
-            .map_err(|_| DflyError::InvalidState("shard queue is closed"))?;
+        let pending_depth = queue_metrics.pending.fetch_add(1, Ordering::AcqRel) + 1;
+        update_peak_pending(&queue_metrics.peak_pending, pending_depth);
+        if sender.send(QueuedEnvelope { sequence, envelope }).is_err() {
+            let _ = queue_metrics.pending.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(1)),
+            );
+            return Err(DflyError::InvalidState("shard queue is closed"));
+        }
         *sequence_guard = sequence;
         Ok(sequence)
     }
@@ -401,6 +465,7 @@ fn shard_worker_thread_main(
     shard: usize,
     receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
+    queue_metrics_per_shard: Arc<Vec<ShardQueueMetrics>>,
     executor: Arc<RuntimeExecutor>,
     maintenance: Option<Arc<RuntimeMaintenance>>,
     maintenance_interval: Duration,
@@ -423,6 +488,7 @@ fn shard_worker_thread_main(
             shard,
             execution_receiver,
             execution_per_shard,
+            queue_metrics_per_shard,
             executor,
         ));
         let maintenance_fiber = maintenance.map(|maintenance| {
@@ -457,10 +523,18 @@ async fn shard_execution_fiber(
     shard: usize,
     mut receiver: mpsc::UnboundedReceiver<QueuedEnvelope>,
     execution_per_shard: Arc<Vec<ShardExecutionState>>,
+    queue_metrics_per_shard: Arc<Vec<ShardQueueMetrics>>,
     executor: Arc<RuntimeExecutor>,
 ) {
     let mut processed_since_yield = 0_usize;
     while let Some(queued) = receiver.recv().await {
+        if let Some(metrics) = queue_metrics_per_shard.get(shard) {
+            let _ = metrics
+                .pending
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    Some(pending.saturating_sub(1))
+                });
+        }
         let envelope = queued.envelope;
         // Keep one explicit shard check so the queue ownership contract is visible
         // and invalid routing data does not pollute another shard log.
@@ -650,6 +724,65 @@ mod tests {
         assert_that!(
             runtime.processed_count(0).expect("count should succeed"),
             eq(2)
+        );
+    }
+
+    #[rstest]
+    fn runtime_tracks_pending_queue_depth_and_peak() {
+        let runtime = InMemoryShardRuntime::new_with_executor(
+            ShardCount::new(1).expect("count should be valid"),
+            |_envelope| {
+                thread::sleep(Duration::from_millis(40));
+                CommandReply::SimpleString("QUEUED".to_owned())
+            },
+        );
+
+        let first_sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k1".to_vec(), b"v1".to_vec()]),
+            })
+            .expect("submission should succeed");
+        thread::sleep(Duration::from_millis(5));
+        let second_sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k2".to_vec(), b"v2".to_vec()]),
+            })
+            .expect("submission should succeed");
+        let third_sequence = runtime
+            .submit_with_sequence(RuntimeEnvelope {
+                target_shard: 0,
+                db: 0,
+                execute_on_worker: true,
+                command: CommandFrame::new("SET", vec![b"k3".to_vec(), b"v3".to_vec()]),
+            })
+            .expect("submission should succeed");
+        assert_that!(third_sequence > second_sequence, eq(true));
+        assert_that!(second_sequence > first_sequence, eq(true));
+
+        assert_that!(
+            runtime
+                .peak_pending_queue_depth(0)
+                .expect("peak should succeed")
+                >= 2,
+            eq(true)
+        );
+        assert_that!(
+            runtime
+                .wait_until_processed_sequence(0, third_sequence)
+                .is_ok(),
+            eq(true)
+        );
+        assert_that!(
+            runtime
+                .pending_queue_depth(0)
+                .expect("pending should succeed"),
+            eq(0_usize)
         );
     }
 
