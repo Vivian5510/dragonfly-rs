@@ -1818,12 +1818,15 @@ fn resp_exec_with_empty_queue_returns_empty_array() {
     let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should succeed");
     assert_that!(&exec, eq(&vec![b"*0\r\n".to_vec()]));
-    assert_that!(app.replication.journal_entries().is_empty(), eq(true));
+    assert_that!(
+        app.replication_guard().journal_entries().is_empty(),
+        eq(true)
+    );
 }
 
 #[rstest]
 fn exec_plan_groups_commands_without_duplicate_shards_per_hop() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
 
     let first_key = b"plan:key:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
@@ -1864,7 +1867,7 @@ fn exec_plan_groups_commands_without_duplicate_shards_per_hop() {
 
 #[rstest]
 fn exec_plan_selects_non_atomic_for_single_key_reads() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
 
     let first_key = b"plan:ro:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
@@ -1902,7 +1905,7 @@ fn exec_plan_selects_non_atomic_for_single_key_reads() {
 
 #[rstest]
 fn exec_plan_falls_back_to_global_mode_for_non_key_commands() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let queued = vec![
         CommandFrame::new("PING", Vec::new()),
         CommandFrame::new("SET", vec![b"plan:key".to_vec(), b"value".to_vec()]),
@@ -1929,7 +1932,7 @@ fn exec_plan_falls_back_to_global_mode_for_non_key_commands() {
 
 #[rstest]
 fn exec_plan_global_mode_layers_by_runtime_shard_dependencies() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
 
     let first_key = b"plan:global:mset:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
@@ -1984,7 +1987,7 @@ fn exec_plan_global_mode_layers_by_runtime_shard_dependencies() {
 
 #[rstest]
 fn exec_plan_dispatches_lockahead_commands_into_runtime_queues() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
 
     let first_key = b"plan:rt:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
@@ -2044,7 +2047,7 @@ fn exec_plan_dispatches_lockahead_commands_into_runtime_queues() {
 
 #[rstest]
 fn exec_plan_lockahead_single_key_runs_once_in_worker() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:worker:single:incr".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let plan = TransactionPlan {
@@ -2074,7 +2077,7 @@ fn exec_plan_lockahead_single_key_runs_once_in_worker() {
 
 #[rstest]
 fn exec_plan_non_atomic_enqueues_runtime_commands() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:readonly".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let command = CommandFrame::new("GET", vec![key.clone()]);
@@ -2099,7 +2102,7 @@ fn exec_plan_non_atomic_enqueues_runtime_commands() {
 
 #[rstest]
 fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"plan:rt:global:mset:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"plan:rt:global:mset:2".to_vec();
@@ -2170,7 +2173,7 @@ fn exec_plan_global_multikey_commands_dispatch_runtime_to_all_touched_shards() {
 
 #[rstest]
 fn exec_plan_global_same_shard_copy_executes_on_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"plan:rt:global:copy:source".to_vec();
     let shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"plan:rt:global:copy:destination".to_vec();
@@ -2230,7 +2233,7 @@ fn exec_plan_global_same_shard_copy_executes_on_worker_fiber() {
 
 #[rstest]
 fn exec_plan_global_cross_shard_copy_executes_on_owner_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"plan:rt:global:copy:cross:source".to_vec();
     let source_shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"plan:rt:global:copy:cross:destination".to_vec();
@@ -2305,7 +2308,7 @@ fn exec_plan_global_cross_shard_copy_executes_on_owner_worker_fiber() {
 
 #[rstest]
 fn exec_plan_global_cross_shard_rename_executes_on_owner_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"plan:rt:global:rename:cross:source".to_vec();
     let source_shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"plan:rt:global:rename:cross:destination".to_vec();
@@ -2387,7 +2390,7 @@ fn exec_plan_global_cross_shard_rename_executes_on_owner_worker_fiber() {
 
 #[rstest]
 fn exec_plan_global_same_shard_multikey_count_executes_on_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"plan:rt:global:del:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"plan:rt:global:del:2".to_vec();
@@ -2450,7 +2453,7 @@ fn exec_plan_global_same_shard_multikey_count_executes_on_worker_fiber() {
 
 #[rstest]
 fn exec_plan_global_same_shard_multikey_string_executes_on_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"plan:rt:global:mset:same:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"plan:rt:global:mset:same:2".to_vec();
@@ -2529,7 +2532,7 @@ fn exec_plan_global_same_shard_multikey_string_executes_on_worker_fiber() {
 
 #[rstest]
 fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let queued = vec![CommandFrame::new("PING", Vec::new())];
     let plan = app.build_exec_plan(&queued);
     assert_that!(plan.mode, eq(TransactionMode::Global));
@@ -2557,7 +2560,7 @@ fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
 
 #[rstest]
 fn runtime_post_barrier_recovers_single_key_via_worker_execution() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:fallback:single:key".to_vec();
     let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
     let shard = app.core.resolve_shard_for_key(&key);
@@ -2581,7 +2584,7 @@ fn runtime_post_barrier_recovers_single_key_via_worker_execution() {
 
 #[rstest]
 fn runtime_post_barrier_dispatches_global_command_when_not_pre_dispatched() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let frame = CommandFrame::new("FLUSHDB", Vec::new());
 
     let reply = app.execute_command_after_runtime_barrier(0, &frame);
@@ -2663,7 +2666,7 @@ fn direct_dispatch_runtime_returns_worker_reply_for_key_fallback() {
 
 #[rstest]
 fn direct_single_key_execution_drains_worker_reply_buffer() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"direct:rt:reply:drain".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
@@ -2680,7 +2683,7 @@ fn direct_single_key_execution_drains_worker_reply_buffer() {
 
 #[rstest]
 fn direct_mget_dispatches_runtime_to_each_touched_shard() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mget:1".to_vec();
     let first_key_for_assert = first_key.clone();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
@@ -2742,7 +2745,7 @@ fn direct_mget_dispatches_runtime_to_each_touched_shard() {
 
 #[rstest]
 fn direct_mget_groups_keys_by_shard_worker_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mget:group:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:mget:group:2".to_vec();
@@ -2833,7 +2836,7 @@ fn direct_mget_groups_keys_by_shard_worker_command() {
 
 #[rstest]
 fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:same:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:same:2".to_vec();
@@ -2872,7 +2875,7 @@ fn direct_mget_dispatches_runtime_once_when_keys_share_same_shard() {
 
 #[rstest]
 fn direct_mset_dispatches_runtime_to_each_touched_shard() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mset:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:mset:2".to_vec();
@@ -2934,7 +2937,7 @@ fn direct_mset_dispatches_runtime_to_each_touched_shard() {
 
 #[rstest]
 fn direct_mset_groups_pairs_by_shard_worker_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mset:group:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:mset:group:2".to_vec();
@@ -3024,7 +3027,7 @@ fn direct_mset_groups_pairs_by_shard_worker_command() {
 
 #[rstest]
 fn direct_mset_same_shard_executes_single_worker_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:mset:same:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:mset:same:2".to_vec();
@@ -3074,7 +3077,7 @@ fn direct_mset_same_shard_executes_single_worker_command() {
 
 #[rstest]
 fn direct_copy_same_shard_executes_on_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"direct:rt:copy:source".to_vec();
     let shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"direct:rt:copy:destination".to_vec();
@@ -3128,7 +3131,7 @@ fn direct_copy_same_shard_executes_on_worker_fiber() {
 
 #[rstest]
 fn direct_copy_cross_shard_executes_on_source_worker_with_destination_barrier() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"direct:rt:copy:cross:source".to_vec();
     let source_shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"direct:rt:copy:cross:destination".to_vec();
@@ -3196,7 +3199,7 @@ fn direct_copy_cross_shard_executes_on_source_worker_with_destination_barrier() 
 
 #[rstest]
 fn direct_rename_cross_shard_executes_on_source_worker_with_destination_barrier() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let source_key = b"direct:rt:rename:cross:source".to_vec();
     let source_shard = app.core.resolve_shard_for_key(&source_key);
     let mut destination_key = b"direct:rt:rename:cross:destination".to_vec();
@@ -3268,7 +3271,7 @@ fn direct_rename_cross_shard_executes_on_source_worker_with_destination_barrier(
 
 #[rstest]
 fn direct_del_multikey_executes_each_key_on_worker_fiber() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:del:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:del:2".to_vec();
@@ -3340,7 +3343,7 @@ fn direct_del_multikey_executes_each_key_on_worker_fiber() {
 
 #[rstest]
 fn direct_del_multikey_groups_keys_by_shard_worker_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:del:group:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
 
@@ -3426,7 +3429,7 @@ fn direct_del_multikey_groups_keys_by_shard_worker_command() {
 
 #[rstest]
 fn direct_del_same_shard_executes_single_worker_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:del:same:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"direct:rt:del:same:2".to_vec();
@@ -3476,7 +3479,7 @@ fn direct_del_same_shard_executes_single_worker_command() {
 
 #[rstest]
 fn direct_mset_with_odd_arity_does_not_dispatch_runtime() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let frame = CommandFrame::new(
         "MSET",
         vec![
@@ -3504,7 +3507,7 @@ fn direct_mset_with_odd_arity_does_not_dispatch_runtime() {
 
 #[rstest]
 fn direct_flushall_dispatches_runtime_to_all_shards() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let frame = CommandFrame::new("FLUSHALL", Vec::new());
 
     let reply = app.execute_user_command(0, &frame, None);
@@ -3527,7 +3530,7 @@ fn direct_flushall_dispatches_runtime_to_all_shards() {
 
 #[rstest]
 fn direct_ping_does_not_dispatch_runtime() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let frame = CommandFrame::new("PING", Vec::new());
 
     let reply = app.execute_user_command(0, &frame, None);
@@ -3543,7 +3546,7 @@ fn direct_ping_does_not_dispatch_runtime() {
 
 #[rstest]
 fn exec_plan_reports_runtime_dispatch_error_for_invalid_shard() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let plan = TransactionPlan {
         txid: 1,
         mode: TransactionMode::Global,
@@ -3565,7 +3568,7 @@ fn exec_plan_reports_runtime_dispatch_error_for_invalid_shard() {
 
 #[rstest]
 fn exec_plan_aborts_whole_hop_when_runtime_dispatch_fails() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:abort".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let plan = TransactionPlan {
@@ -3603,7 +3606,7 @@ fn exec_plan_aborts_whole_hop_when_runtime_dispatch_fails() {
 
 #[rstest]
 fn exec_plan_aborts_following_hops_after_runtime_dispatch_failure() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:skip-next-hop".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let plan = TransactionPlan {
@@ -3645,7 +3648,7 @@ fn exec_plan_aborts_following_hops_after_runtime_dispatch_failure() {
 
 #[rstest]
 fn exec_plan_keeps_following_hops_when_previous_command_error_is_not_runtime_failure() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:continue-after-command-error".to_vec();
     let key_shard = app.core.resolve_shard_for_key(&key);
     let plan = TransactionPlan {
@@ -3685,7 +3688,7 @@ fn exec_plan_keeps_following_hops_when_previous_command_error_is_not_runtime_fai
 
 #[rstest]
 fn exec_non_atomic_execution_rejects_non_single_key_read_only_commands() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let plan = TransactionPlan {
         txid: 1,
         mode: TransactionMode::NonAtomic,
@@ -3716,7 +3719,7 @@ fn resp_exec_read_only_queue_uses_non_mutating_path() {
         &resp_command(&[b"SET", b"k", b"v"]),
     )
     .expect("seed SET should succeed");
-    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
 
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
@@ -3731,7 +3734,7 @@ fn resp_exec_read_only_queue_uses_non_mutating_path() {
     assert_that!(&exec, eq(&expected));
 
     // Read-only transaction must not create new journal records.
-    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
 }
 
 #[rstest]
@@ -4142,9 +4145,9 @@ fn journal_records_only_successful_write_commands() {
     )
     .expect("GET should succeed");
 
-    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
     assert_that!(
-        app.replication.journal_entries()[0].op,
+        app.replication_guard().journal_entries()[0].op,
         eq(JournalOp::Command),
     );
 }
@@ -4191,7 +4194,7 @@ fn journal_records_set_only_when_mutation_happens_with_conditions_and_get() {
     )
     .expect("SET GET should execute");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SET"),
@@ -4225,7 +4228,7 @@ fn journal_records_setex_only_for_successful_updates() {
     )
     .expect("SETEX should parse");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4252,7 +4255,7 @@ fn journal_records_psetex_only_for_successful_updates() {
     )
     .expect("PSETEX should parse");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4291,7 +4294,7 @@ fn journal_records_pexpire_as_command_or_expired_by_argument() {
     )
     .expect("PEXPIRE with zero timeout should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(4_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[3].op, eq(JournalOp::Expired));
@@ -4333,7 +4336,7 @@ fn journal_records_expire_options_only_when_update_is_applied() {
     )
     .expect("EXPIRE LT delete should execute");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[2].op, eq(JournalOp::Expired));
@@ -4376,7 +4379,7 @@ fn journal_records_pexpireat_as_command_or_expired_by_timestamp() {
     )
     .expect("PEXPIREAT past should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(4_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[3].op, eq(JournalOp::Expired));
@@ -4391,7 +4394,7 @@ fn journal_records_mset_as_single_write_command() {
     let _ =
         ingress_connection_bytes(&mut app, &mut connection, &mset).expect("MSET should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4418,7 +4421,7 @@ fn journal_records_msetnx_only_on_successful_insert_batch() {
     )
     .expect("second MSETNX should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("MSETNX"),
@@ -4456,7 +4459,7 @@ fn journal_records_rename_family_only_for_effective_mutations() {
     )
     .expect("RENAME same key should execute");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(entries[1].op, eq(JournalOp::Command));
@@ -4502,7 +4505,7 @@ fn journal_records_copy_only_when_destination_is_written() {
     )
     .expect("COPY REPLACE should execute");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("COPY"),
@@ -4534,7 +4537,7 @@ fn journal_records_del_only_when_keyspace_changes() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"DEL", b"k"]))
         .expect("DEL existing should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
@@ -4562,7 +4565,7 @@ fn journal_records_unlink_only_when_keyspace_changes() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"UNLINK", b"k"]))
         .expect("UNLINK existing should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("UNLINK"),
@@ -4594,7 +4597,7 @@ fn journal_records_move_only_when_transfer_happens() {
     )
     .expect("MOVE existing should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("MOVE"),
@@ -4632,7 +4635,7 @@ fn journal_records_persist_only_when_it_changes_expiry() {
     )
     .expect("PERSIST should clear expiry");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[2].payload).contains("PERSIST"),
@@ -4666,7 +4669,7 @@ fn journal_records_incr_family_only_on_success() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"INCR", b"bad"]))
         .expect("INCR bad should parse");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("INCR"),
@@ -4696,7 +4699,7 @@ fn journal_records_setnx_only_when_insert_happens() {
     )
     .expect("second SETNX should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SETNX"),
@@ -4726,7 +4729,7 @@ fn journal_records_getset_and_getdel_only_when_key_is_deleted() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
         .expect("GETDEL missing key should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("GETSET"),
@@ -4760,7 +4763,7 @@ fn journal_records_append_writes() {
     )
     .expect("second APPEND should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("APPEND"),
@@ -4790,7 +4793,7 @@ fn journal_records_setrange_only_when_payload_is_non_empty() {
     )
     .expect("SETRANGE with payload should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SETRANGE"),
@@ -4814,7 +4817,7 @@ fn journal_records_flush_commands() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHALL"]))
         .expect("FLUSHALL should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("FLUSHDB"),
@@ -4848,7 +4851,7 @@ fn journal_uses_same_txid_for_exec_batch_entries() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should succeed");
 
-    let entries = app.replication.journal_entries();
+    let entries = app.replication_guard().journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(entries[0].txid, eq(entries[1].txid));
     assert_that!(entries[1].op, eq(JournalOp::Expired));
@@ -5254,7 +5257,7 @@ fn resp_replconf_ack_is_silent_and_tracks_ack_lsn() {
     )
     .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
-    assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
 
     let info = ingress_connection_bytes(
         &mut app,
@@ -5285,7 +5288,7 @@ fn resp_replconf_ack_without_registered_endpoint_is_tracked_via_implicit_endpoin
     )
     .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
-    assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
 
     let info = ingress_connection_bytes(
         &mut app,
@@ -5837,7 +5840,7 @@ fn resp_dfly_flow_returns_partial_when_lsn_is_available() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5860,7 +5863,7 @@ fn resp_dfly_flow_returns_partial_when_lsn_is_available() {
 #[rstest]
 fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let handshake = ingress_connection_bytes(
@@ -5870,7 +5873,7 @@ fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5898,7 +5901,7 @@ fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
 #[rstest]
 fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let handshake = ingress_connection_bytes(
@@ -5909,7 +5912,7 @@ fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id_text = extract_sync_id_from_capa_reply(&handshake[0]);
     let sync_id = sync_id_text.as_bytes().to_vec();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5933,12 +5936,16 @@ fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("FULL"));
 
-    let flow = app
-        .replication
-        .state
-        .sync_flow(&sync_id_text, 0)
-        .expect("flow must be registered");
-    assert_that!(flow.start_offset.is_none(), eq(true));
+    let flow_start_offset_is_none = {
+        let replication = app.replication_guard();
+        replication
+            .state
+            .sync_flow(&sync_id_text, 0)
+            .expect("flow must be registered")
+            .start_offset
+            .is_none()
+    };
+    assert_that!(flow_start_offset_is_none, eq(true));
 }
 
 #[rstest]
@@ -5960,7 +5967,7 @@ fn resp_dfly_sync_and_startstable_update_replica_role_state() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
         let flow_reply = ingress_connection_bytes(
@@ -6015,7 +6022,7 @@ fn resp_dfly_sync_requires_all_flows_registered() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     let flow_reply = ingress_connection_bytes(
         &mut app,
@@ -6059,7 +6066,7 @@ fn resp_dfly_replicaoffset_reports_offsets_for_all_shards() {
         &resp_command(&[b"DFLY", b"REPLICAOFFSET"]),
     )
     .expect("DFLY REPLICAOFFSET should execute");
-    let expected_entry = format!(":{}\r\n", app.replication.replication_offset());
+    let expected_entry = format!(":{}\r\n", app.replication_guard().replication_offset());
     let expected = format!(
         "*{}\r\n{}",
         app.config.shard_count.get(),
@@ -6081,7 +6088,7 @@ fn resp_dfly_flow_rejects_after_session_leaves_preparation() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
@@ -6120,7 +6127,7 @@ fn resp_dfly_flow_accepts_master_lsn_vector_argument() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -6162,7 +6169,7 @@ fn resp_dfly_flow_rejects_invalid_lastmaster_marker() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
     let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
         .join("-")
         .into_bytes();
@@ -6196,7 +6203,7 @@ fn resp_dfly_flow_rejects_duplicate_flow_registration() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication.master_replid().as_bytes().to_vec();
+    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
     let first = ingress_connection_bytes(
         &mut app,
         &mut connection,
@@ -6303,7 +6310,7 @@ fn resp_replconf_endpoint_identity_update_replaces_stale_endpoint_row() {
         &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
     )
     .expect("replica ACK should parse");
-    assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -6356,7 +6363,7 @@ fn disconnect_connection_unregisters_replica_endpoint_and_ack_progress() {
         &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
     )
     .expect("replica ACK should parse");
-    assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
+    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
 
     app.disconnect_connection(&mut replica);
 
@@ -6387,7 +6394,11 @@ fn resp_psync_with_unknown_replid_returns_full_resync_header() {
         &resp_command(&[b"PSYNC", b"?", b"-1"]),
     )
     .expect("PSYNC should succeed");
-    let expected = format!("+FULLRESYNC {} 0\r\n", app.replication.master_replid()).into_bytes();
+    let expected = format!(
+        "+FULLRESYNC {} 0\r\n",
+        app.replication_guard().master_replid()
+    )
+    .into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
 }
 
@@ -6403,7 +6414,7 @@ fn resp_psync_returns_continue_when_offset_is_available() {
     )
     .expect("SET should succeed");
 
-    let replid = app.replication.master_replid().as_bytes().to_vec();
+    let replid = app.replication_guard().master_replid().as_bytes().to_vec();
     let reply = ingress_connection_bytes(
         &mut app,
         &mut connection,
@@ -6416,7 +6427,7 @@ fn resp_psync_returns_continue_when_offset_is_available() {
 #[rstest]
 fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let _ = ingress_connection_bytes(
@@ -6432,14 +6443,18 @@ fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     )
     .expect("second SET should succeed");
 
-    let replid = app.replication.master_replid().as_bytes().to_vec();
+    let replid = app.replication_guard().master_replid().as_bytes().to_vec();
     let reply = ingress_connection_bytes(
         &mut app,
         &mut connection,
         &resp_command(&[b"PSYNC", &replid, b"0"]),
     )
     .expect("PSYNC should succeed");
-    let expected = format!("+FULLRESYNC {} 2\r\n", app.replication.master_replid()).into_bytes();
+    let expected = format!(
+        "+FULLRESYNC {} 2\r\n",
+        app.replication_guard().master_replid()
+    )
+    .into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
 }
 
@@ -6502,7 +6517,7 @@ fn server_snapshot_roundtrip_restores_data_across_databases() {
 
 #[rstest]
 fn server_snapshot_load_rejects_malformed_payload() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let error = app
         .load_snapshot_bytes(b"not-a-snapshot")
         .expect_err("invalid bytes should fail");
@@ -6547,7 +6562,7 @@ fn resp_cluster_myid_returns_local_node_id() {
     .expect("CLUSTER MYID should execute");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
-    assert_that!(body.as_str(), eq(app.cluster.node_id.as_str()));
+    assert_that!(body.as_str(), eq(app.cluster_read_guard().node_id.as_str()));
 }
 
 #[rstest]
@@ -6896,7 +6911,7 @@ fn resp_cluster_shards_reports_single_master_descriptor() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster.set_owned_ranges(vec![
+    app.cluster_write_guard().set_owned_ranges(vec![
         SlotRange { start: 0, end: 99 },
         SlotRange {
             start: 200,
@@ -6917,7 +6932,10 @@ fn resp_cluster_shards_reports_single_master_descriptor() {
     assert_that!(payload.starts_with("*1\r\n*4\r\n$5\r\nslots\r\n"), eq(true));
     assert_that!(payload.contains(":0\r\n:99\r\n:200\r\n:300\r\n"), eq(true));
     assert_that!(payload.contains("$5\r\nnodes\r\n"), eq(true));
-    assert_that!(payload.contains(&app.cluster.node_id), eq(true));
+    assert_that!(
+        payload.contains(&app.cluster_read_guard().node_id),
+        eq(true)
+    );
     assert_that!(payload.contains("$6\r\nmaster\r\n"), eq(true));
     assert_that!(payload.contains("$6\r\nonline\r\n"), eq(true));
 }
@@ -6929,7 +6947,7 @@ fn resp_cluster_slots_returns_owned_ranges() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster.set_owned_ranges(vec![
+    app.cluster_write_guard().set_owned_ranges(vec![
         SlotRange { start: 0, end: 99 },
         SlotRange {
             start: 200,
@@ -6954,7 +6972,7 @@ fn resp_cluster_info_reports_slot_summary() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster.set_owned_ranges(vec![
+    app.cluster_write_guard().set_owned_ranges(vec![
         SlotRange { start: 0, end: 99 },
         SlotRange {
             start: 200,
@@ -6983,7 +7001,7 @@ fn resp_cluster_nodes_reports_myself_master_topology() {
         ..RuntimeConfig::default()
     };
     let mut app = ServerApp::new(config);
-    app.cluster.set_owned_ranges(vec![
+    app.cluster_write_guard().set_owned_ranges(vec![
         SlotRange { start: 0, end: 99 },
         SlotRange {
             start: 200,
@@ -7000,7 +7018,7 @@ fn resp_cluster_nodes_reports_myself_master_topology() {
     .expect("CLUSTER NODES should execute");
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("myself,master"), eq(true));
-    assert_that!(body.contains(&app.cluster.node_id), eq(true));
+    assert_that!(body.contains(&app.cluster_read_guard().node_id), eq(true));
     assert_that!(body.contains("0-99 200-300"), eq(true));
 }
 
@@ -7051,7 +7069,7 @@ fn cluster_mode_redirects_unowned_single_key_command_with_moved() {
             end: slot - 1,
         }
     };
-    app.cluster.set_owned_ranges(vec![owned]);
+    app.cluster_write_guard().set_owned_ranges(vec![owned]);
 
     let command = resp_command(&[b"GET", key]);
     let reply =
@@ -7178,7 +7196,7 @@ fn resp_dfly_load_resets_replication_state() {
         &resp_command(&[b"SET", b"load:reset:key", b"initial"]),
     )
     .expect("initial SET should succeed");
-    assert_that!(app.replication.replication_offset(), gt(0_u64));
+    assert_that!(app.replication_guard().replication_offset(), gt(0_u64));
 
     let path = unique_test_snapshot_path("dfly-load-reset");
     let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7197,7 +7215,7 @@ fn resp_dfly_load_resets_replication_state() {
         &resp_command(&[b"SET", b"load:reset:key", b"new"]),
     )
     .expect("second SET should succeed");
-    assert_that!(app.replication.replication_offset(), gt(1_u64));
+    assert_that!(app.replication_guard().replication_offset(), gt(1_u64));
 
     let load_reply = ingress_connection_bytes(
         &mut app,
@@ -7207,9 +7225,12 @@ fn resp_dfly_load_resets_replication_state() {
     .expect("DFLY LOAD should execute");
     assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    assert_that!(app.replication.replication_offset(), eq(0_u64));
-    assert_that!(app.replication.journal_entries().is_empty(), eq(true));
-    assert_that!(app.replication.journal_lsn(), eq(1_u64));
+    assert_that!(app.replication_guard().replication_offset(), eq(0_u64));
+    assert_that!(
+        app.replication_guard().journal_entries().is_empty(),
+        eq(true)
+    );
+    assert_that!(app.replication_guard().journal_lsn(), eq(1_u64));
 
     let _ = std::fs::remove_file(path);
 }
@@ -7238,11 +7259,11 @@ fn journal_replay_restores_state_in_fresh_server() {
     )
     .expect("SET should succeed");
 
-    let entries = source.replication.journal_entries();
+    let entries = source.replication_guard().journal_entries();
 
     let mut restored = ServerApp::new(RuntimeConfig::default());
     for entry in entries {
-        restored.replication.append_journal(entry);
+        restored.replication_guard().append_journal(entry);
     }
     let applied = restored
         .recover_from_replication_journal()
@@ -7284,7 +7305,7 @@ fn journal_replay_from_lsn_applies_only_suffix() {
         b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
     )
     .expect("first SET should succeed");
-    let start_lsn = source.replication.journal_lsn();
+    let start_lsn = source.replication_guard().journal_lsn();
     let _ = ingress_connection_bytes(
         &mut source,
         &mut source_connection,
@@ -7292,10 +7313,10 @@ fn journal_replay_from_lsn_applies_only_suffix() {
     )
     .expect("second SET should succeed");
 
-    let entries = source.replication.journal_entries();
+    let entries = source.replication_guard().journal_entries();
     let mut restored = ServerApp::new(RuntimeConfig::default());
     for entry in entries {
-        restored.replication.append_journal(entry);
+        restored.replication_guard().append_journal(entry);
     }
 
     let applied = restored
@@ -7315,15 +7336,15 @@ fn journal_replay_from_lsn_applies_only_suffix() {
 
 #[rstest]
 fn journal_replay_from_lsn_rejects_stale_cursor() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.journal = InMemoryJournal::with_backlog(1);
-    app.replication.append_journal(JournalEntry {
+    let app = ServerApp::new(RuntimeConfig::default());
+    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
         payload: resp_command(&[b"SET", b"a", b"1"]),
     });
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 2,
         db: 0,
         op: JournalOp::Command,
@@ -7341,23 +7362,23 @@ fn journal_replay_from_lsn_rejects_stale_cursor() {
 
 #[rstest]
 fn journal_replay_dispatches_runtime_for_single_key_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"journal:rt:set".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let payload = resp_command(&[b"SET", &key, b"value"]);
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
         payload,
     });
-    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
 
     let applied = app
         .recover_from_replication_journal()
         .expect("journal replay should succeed");
     assert_that!(applied, eq(1_usize));
-    assert_that!(app.replication.journal_entries().len(), eq(1_usize));
+    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
     assert_that!(
         app.runtime
             .wait_for_processed_count(shard, 1, Duration::from_millis(200))
@@ -7375,7 +7396,7 @@ fn journal_replay_dispatches_runtime_for_single_key_command() {
 
 #[rstest]
 fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"journal:rt:mset:1".to_vec();
     let first_shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"journal:rt:mset:2".to_vec();
@@ -7388,7 +7409,7 @@ fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command(
     }
 
     let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
@@ -7437,7 +7458,7 @@ fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command(
 
 #[rstest]
 fn journal_replay_executes_same_shard_multikey_command_on_worker() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"journal:rt:mset:same:1".to_vec();
     let shard = app.core.resolve_shard_for_key(&first_key);
     let mut second_key = b"journal:rt:mset:same:2".to_vec();
@@ -7450,7 +7471,7 @@ fn journal_replay_executes_same_shard_multikey_command_on_worker() {
     }
 
     let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
@@ -7487,7 +7508,7 @@ fn journal_replay_executes_same_shard_multikey_command_on_worker() {
 
 #[rstest]
 fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
+    let app = ServerApp::new(RuntimeConfig::default());
     let key = b"journal:recovery:barrier".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let blocking_plan = TransactionPlan {
@@ -7506,7 +7527,7 @@ fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
         eq(true)
     );
 
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
@@ -7533,8 +7554,8 @@ fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
 
 #[rstest]
 fn journal_replay_rejects_malformed_payload() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.append_journal(JournalEntry {
+    let app = ServerApp::new(RuntimeConfig::default());
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Command,
@@ -7552,14 +7573,14 @@ fn journal_replay_rejects_malformed_payload() {
 
 #[rstest]
 fn journal_replay_skips_ping_and_lsn_entries() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication.append_journal(JournalEntry {
+    let app = ServerApp::new(RuntimeConfig::default());
+    app.replication_guard().append_journal(JournalEntry {
         txid: 1,
         db: 0,
         op: JournalOp::Ping,
         payload: Vec::new(),
     });
-    app.replication.append_journal(JournalEntry {
+    app.replication_guard().append_journal(JournalEntry {
         txid: 2,
         db: 0,
         op: JournalOp::Lsn,

@@ -29,7 +29,8 @@ use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use dfly_transaction::session::TransactionSession;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 const ACTIVE_EXPIRE_KEYS_PER_TICK: usize = 64;
@@ -53,85 +54,70 @@ pub struct ServerApp {
     /// Storage layer.
     pub storage: StorageModule,
     /// Replication layer.
-    pub replication: ReplicationModule,
+    pub replication: Mutex<ReplicationModule>,
     /// Cluster orchestration layer.
-    pub cluster: ClusterModule,
+    pub cluster: RwLock<ClusterModule>,
     /// Search subsystem.
     pub search: SearchModule,
     /// Tiered-storage subsystem.
     pub tiering: TieringModule,
     /// Monotonic transaction id allocator.
-    next_txid: TxId,
+    next_txid: AtomicU64,
     /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
-    next_implicit_replica_id: u64,
+    next_implicit_replica_id: AtomicU64,
 }
 
 /// Thread-safe execution handle used by I/O workers.
 #[derive(Clone, Debug)]
 pub struct AppExecutor {
-    app: Arc<Mutex<ServerApp>>,
+    app: Arc<ServerApp>,
 }
 
 impl AppExecutor {
     /// Wraps one server app instance with shared synchronization for worker threads.
     #[must_use]
     pub fn new(app: ServerApp) -> Self {
-        Self {
-            app: Arc::new(Mutex::new(app)),
-        }
+        Self { app: Arc::new(app) }
     }
 
-    fn lock_app(&self) -> std::sync::MutexGuard<'_, ServerApp> {
-        self.app
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Executes one parsed command while holding the shared app mutex.
+    /// Executes one parsed command on shared server state.
     pub fn execute_parsed_command_deferred(
         &self,
         connection: &mut ServerConnection,
         parsed: ParsedCommand,
     ) -> ParsedCommandExecution {
-        let mut app = self.lock_app();
-        app.execute_parsed_command_deferred(connection, parsed)
+        self.app.execute_parsed_command_deferred(connection, parsed)
     }
 
     /// Checks whether one deferred runtime reply is ready.
     pub fn runtime_reply_ticket_ready(&self, ticket: &RuntimeReplyTicket) -> DflyResult<bool> {
-        let app = self.lock_app();
-        app.runtime_reply_ticket_ready(ticket)
+        self.app.runtime_reply_ticket_ready(ticket)
     }
 
     /// Takes one deferred runtime reply and encodes it for client protocol.
     pub fn take_runtime_reply_ticket(&self, ticket: &RuntimeReplyTicket) -> DflyResult<Vec<u8>> {
-        let app = self.lock_app();
-        app.take_runtime_reply_ticket(ticket)
+        self.app.take_runtime_reply_ticket(ticket)
     }
 
     /// Runs disconnect cleanup for one connection-owned replica endpoint.
     pub fn disconnect_connection(&self, connection: &mut ServerConnection) {
-        let mut app = self.lock_app();
-        app.disconnect_connection(connection);
+        self.app.disconnect_connection(connection);
     }
 
     /// Returns server startup summary from the shared app instance.
     #[must_use]
     pub fn startup_summary(&self) -> String {
-        let app = self.lock_app();
-        app.startup_summary()
+        self.app.startup_summary()
     }
 
     /// Runs one mutable closure against the underlying app under synchronization.
-    pub fn with_app_mut<R>(&self, f: impl FnOnce(&mut ServerApp) -> R) -> R {
-        let mut app = self.lock_app();
-        f(&mut app)
+    pub fn with_app_mut<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
+        f(&self.app)
     }
 
     /// Runs one read-only closure against the underlying app under synchronization.
     pub fn with_app<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
-        let app = self.lock_app();
-        f(&app)
+        f(&self.app)
     }
 }
 
@@ -171,13 +157,32 @@ impl ServerApp {
             runtime,
             transaction,
             storage,
-            replication,
-            cluster,
+            replication: Mutex::new(replication),
+            cluster: RwLock::new(cluster),
             search,
             tiering,
-            next_txid: 1,
-            next_implicit_replica_id: 1,
+            next_txid: AtomicU64::new(1),
+            next_implicit_replica_id: AtomicU64::new(1),
         }
+    }
+
+    fn replication_guard(&self) -> std::sync::MutexGuard<'_, ReplicationModule> {
+        self.replication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cluster_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ClusterModule> {
+        self.cluster
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn cluster_write_guard(&self) -> std::sync::RwLockWriteGuard<'_, ClusterModule> {
+        self.cluster
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Human-readable startup summary.
@@ -193,8 +198,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             self.core,
             self.transaction,
             self.storage,
-            self.replication.enabled,
-            self.cluster.mode,
+            self.replication_guard().enabled,
+            self.cluster_read_guard().mode,
             self.search.enabled,
             self.tiering.enabled
         )
@@ -215,14 +220,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// # Errors
     ///
     /// Returns `DflyError::Protocol` when payload cannot be decoded or contains invalid shard ids.
-    pub fn load_snapshot_bytes(&mut self, payload: &[u8]) -> DflyResult<()> {
+    pub fn load_snapshot_bytes(&self, payload: &[u8]) -> DflyResult<()> {
         let snapshot = self.storage.deserialize_snapshot(payload)?;
         self.install_snapshot(&snapshot)
     }
 
-    fn install_snapshot(&mut self, snapshot: &CoreSnapshot) -> DflyResult<()> {
+    fn install_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
         self.core.import_snapshot(snapshot)?;
-        self.replication.reset_after_snapshot_load();
+        self.replication_guard().reset_after_snapshot_load();
         Ok(())
     }
 
@@ -232,8 +237,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ///
     /// Returns `DflyError::Protocol` when a journal payload is not a valid single RESP command
     /// or when command execution returns an error reply.
-    pub fn recover_from_replication_journal(&mut self) -> DflyResult<usize> {
-        let entries = self.replication.journal_entries();
+    pub fn recover_from_replication_journal(&self) -> DflyResult<usize> {
+        let entries = self.replication_guard().journal_entries();
         self.replay_journal_entries(&entries)
     }
 
@@ -243,21 +248,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ///
     /// Returns `DflyError::Protocol` when starting LSN is stale (already evicted from backlog),
     /// when payload parsing fails, or when replayed command execution fails.
-    pub fn recover_from_replication_journal_from_lsn(
-        &mut self,
-        start_lsn: u64,
-    ) -> DflyResult<usize> {
-        let current_lsn = self.replication.journal_lsn();
+    pub fn recover_from_replication_journal_from_lsn(&self, start_lsn: u64) -> DflyResult<usize> {
+        let current_lsn = self.replication_guard().journal_lsn();
         if start_lsn == current_lsn {
             return Ok(0);
         }
-        if !self.replication.journal_contains_lsn(start_lsn) {
+        if !self.replication_guard().journal_contains_lsn(start_lsn) {
             return Err(DflyError::Protocol(format!(
                 "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
             )));
         }
 
-        let Some(entries) = self.replication.journal_entries_from_lsn(start_lsn) else {
+        let Some(entries) = self.replication_guard().journal_entries_from_lsn(start_lsn) else {
             return Err(DflyError::Protocol(format!(
                 "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
             )));
@@ -290,16 +292,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ///
     /// Network ingress uses this when a TCP peer disconnects so worker-local parser state and
     /// replica endpoint identity do not leak across reused OS sockets.
-    pub fn disconnect_connection(&mut self, connection: &mut ServerConnection) {
+    pub fn disconnect_connection(&self, connection: &mut ServerConnection) {
         if let Some(endpoint) = connection.replica_endpoint.take() {
             let _ = self
-                .replication
+                .replication_guard()
                 .remove_replica_endpoint(&endpoint.address, endpoint.listening_port);
         }
     }
 
     pub(crate) fn execute_parsed_command_deferred(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         parsed: ParsedCommand,
     ) -> ParsedCommandExecution {
@@ -419,7 +421,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ///
     /// Returns `Some(encoded_reply)` when the command is a transaction control verb.
     fn handle_resp_transaction_control(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         frame: &CommandFrame,
     ) -> Option<Vec<u8>> {
@@ -462,7 +464,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Error("DISCARD without MULTI".to_owned()).to_resp_bytes()
     }
 
-    fn handle_exec(&mut self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+    fn handle_exec(&self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
         let in_multi = connection.transaction.in_multi();
         if !frame.args.is_empty() {
             if in_multi {
@@ -519,7 +521,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Array(replies).to_resp_bytes()
     }
 
-    fn handle_watch(&mut self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
+    fn handle_watch(&self, connection: &mut ServerConnection, frame: &CommandFrame) -> Vec<u8> {
         let in_multi = connection.transaction.in_multi();
         if frame.args.is_empty() {
             if in_multi {
@@ -608,7 +610,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    fn build_exec_plan(&mut self, queued_commands: &[CommandFrame]) -> TransactionPlan {
+    fn build_exec_plan(&self, queued_commands: &[CommandFrame]) -> TransactionPlan {
         let txid = self.allocate_txid();
         let touched_shards = self.collect_plan_touched_shards(queued_commands);
         let mut all_single_key = true;
@@ -755,11 +757,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.all_runtime_shards()
     }
 
-    fn execute_command_without_side_effects(
-        &mut self,
-        db: u16,
-        frame: &CommandFrame,
-    ) -> CommandReply {
+    fn execute_command_without_side_effects(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         match frame.name.as_str() {
             "INFO" => self.execute_info(frame),
             "TIME" => Self::execute_time(frame),
@@ -818,18 +816,28 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let mut info = String::new();
         if include_replication {
+            let (
+                connected_replicas,
+                master_replid,
+                replication_offset,
+                last_acked_lsn,
+                replica_rows,
+            ) = {
+                let replication = self.replication_guard();
+                (
+                    replication.connected_replicas(),
+                    replication.master_replid().to_owned(),
+                    replication.replication_offset(),
+                    replication.last_acked_lsn(),
+                    replication.replica_info_rows(),
+                )
+            };
             write!(
                 info,
-                "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\nlast_ack_lsn:{}\r\n",
-                self.replication.connected_replicas(),
-                self.replication.master_replid(),
-                self.replication.replication_offset(),
-                self.replication.last_acked_lsn(),
+                "# Replication\r\nrole:master\r\nconnected_slaves:{connected_replicas}\r\nmaster_replid:{master_replid}\r\nmaster_repl_offset:{replication_offset}\r\nlast_ack_lsn:{last_acked_lsn}\r\n",
             )
             .expect("writing to String should not fail");
-            for (index, (address, port, state, lag)) in
-                self.replication.replica_info_rows().into_iter().enumerate()
-            {
+            for (index, (address, port, state, lag)) in replica_rows.into_iter().enumerate() {
                 write!(
                     info,
                     "slave{index}:ip={address},port={port},state={state},lag={lag}\r\n"
@@ -876,7 +884,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 "wrong number of arguments for 'READWRITE' command".to_owned(),
             );
         }
-        if self.cluster.mode != ClusterMode::Emulated {
+        if self.cluster_read_guard().mode != ClusterMode::Emulated {
             return CommandReply::Error(
                 "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
             );
@@ -884,7 +892,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_flushdb(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_flushdb(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if !frame.args.is_empty() {
             return CommandReply::Error(
                 "wrong number of arguments for 'FLUSHDB' command".to_owned(),
@@ -929,7 +937,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Array(replies)
     }
 
-    fn execute_flushall(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_flushall(&self, frame: &CommandFrame) -> CommandReply {
         if !frame.args.is_empty() {
             return CommandReply::Error(
                 "wrong number of arguments for 'FLUSHALL' command".to_owned(),
@@ -939,24 +947,24 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_del(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_del(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "DEL")
     }
 
-    fn execute_unlink(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_unlink(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "UNLINK")
     }
 
-    fn execute_exists(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_exists(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "EXISTS")
     }
 
-    fn execute_touch(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_touch(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         self.execute_counting_key_command(db, frame, "TOUCH")
     }
 
     fn execute_counting_key_command(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         command: &str,
@@ -990,7 +998,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         let replicas = self
-            .replication
+            .replication_guard()
             .replica_role_rows()
             .into_iter()
             .map(|(address, listening_port, state)| {
@@ -1010,7 +1018,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_replconf(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         frame: &CommandFrame,
     ) -> CommandReply {
@@ -1023,10 +1031,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             && frame.args[1].eq_ignore_ascii_case(b"dragonfly")
         {
             let sync_id = self
-                .replication
+                .replication_guard()
                 .create_sync_session(usize::from(self.config.shard_count.get()));
             return CommandReply::Array(vec![
-                CommandReply::BulkString(self.replication.master_replid().as_bytes().to_vec()),
+                CommandReply::BulkString(
+                    self.replication_guard().master_replid().as_bytes().to_vec(),
+                ),
                 CommandReply::BulkString(sync_id.into_bytes()),
                 CommandReply::Integer(i64::from(self.config.shard_count.get())),
                 CommandReply::Integer(1),
@@ -1112,7 +1122,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn handle_replconf_ack(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         value: &[u8],
     ) -> Result<(), CommandReply> {
@@ -1128,7 +1138,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
         self.ensure_replica_endpoint_for_ack(connection);
         if let Some(endpoint) = connection.replica_endpoint.as_ref() {
-            let _ = self.replication.record_replica_ack_for_endpoint(
+            let _ = self.replication_guard().record_replica_ack_for_endpoint(
                 &endpoint.address,
                 endpoint.listening_port,
                 ack_lsn,
@@ -1137,23 +1147,23 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         Ok(())
     }
 
-    fn ensure_replica_endpoint_for_ack(&mut self, connection: &mut ServerConnection) {
+    fn ensure_replica_endpoint_for_ack(&self, connection: &mut ServerConnection) {
         if connection.replica_endpoint.is_some() {
             return;
         }
 
         // Some replicas may ACK before announcing LISTENING-PORT/IP metadata.
         // Register a stable synthetic endpoint so WAIT/INFO can account for that replica.
+        let implicit_id = self.next_implicit_replica_id.fetch_add(1, Ordering::AcqRel);
         let endpoint = ReplicaEndpointIdentity {
-            address: format!("implicit-replica-{}", self.next_implicit_replica_id),
+            address: format!("implicit-replica-{implicit_id}"),
             listening_port: 0,
         };
-        self.next_implicit_replica_id = self.next_implicit_replica_id.saturating_add(1);
         self.register_connection_replica_endpoint(connection, endpoint);
     }
 
     fn register_connection_replica_endpoint(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         endpoint: ReplicaEndpointIdentity,
     ) {
@@ -1161,17 +1171,17 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             && existing != endpoint
         {
             let _ = self
-                .replication
+                .replication_guard()
                 .remove_replica_endpoint(&existing.address, existing.listening_port);
         }
 
-        self.replication
+        self.replication_guard()
             .register_replica_endpoint(endpoint.address.clone(), endpoint.listening_port);
         connection.replica_endpoint = Some(endpoint);
     }
 
     fn apply_replconf_endpoint_update(
-        &mut self,
+        &self,
         connection: &mut ServerConnection,
         announced_port: Option<u16>,
         announced_ip: Option<String>,
@@ -1211,7 +1221,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    fn execute_psync(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_psync(&self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error("wrong number of arguments for 'PSYNC' command".to_owned());
         }
@@ -1226,18 +1236,20 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("PSYNC offset must be a valid integer".to_owned());
         };
 
-        let master_replid = self.replication.master_replid().to_owned();
-        let master_offset = self.replication.replication_offset();
+        let master_replid = self.replication_guard().master_replid().to_owned();
+        let master_offset = self.replication_guard().replication_offset();
         let requested_offset_u64 = u64::try_from(requested_offset).ok();
         if requested_replid == master_replid
-            && requested_offset_u64
-                .is_some_and(|offset| self.replication.can_partial_sync_from_offset(offset))
+            && requested_offset_u64.is_some_and(|offset| {
+                self.replication_guard()
+                    .can_partial_sync_from_offset(offset)
+            })
         {
-            self.replication.mark_replicas_stable_sync();
+            self.replication_guard().mark_replicas_stable_sync();
             return CommandReply::SimpleString("CONTINUE".to_owned());
         }
 
-        self.replication.mark_replicas_full_sync();
+        self.replication_guard().mark_replicas_full_sync();
         CommandReply::SimpleString(format!("FULLRESYNC {master_replid} {master_offset}"))
     }
 
@@ -1261,12 +1273,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         // WAIT returns the number of replicas that acknowledged the master offset captured at
         // WAIT entry time. We block on replication ACK progress notifications instead of polling.
-        let target_offset = self.replication.replication_offset();
+        let target_offset = self.replication_guard().replication_offset();
         let timeout = Duration::from_millis(timeout_millis);
         let wait_started_at = std::time::Instant::now();
         let current_replica_count = || {
             u64::try_from(
-                self.replication
+                self.replication_guard()
                     .acked_replica_count_at_or_above(target_offset),
             )
             .unwrap_or(u64::MAX)
@@ -1275,7 +1287,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             |replicated: u64| CommandReply::Integer(i64::try_from(replicated).unwrap_or(i64::MAX));
 
         loop {
-            let observed_progress = self.replication.ack_progress_token();
+            let observed_progress = self.replication_guard().ack_progress_token();
             let replicated = current_replica_count();
             if replicated >= required || timeout.is_zero() {
                 return integer_reply(replicated);
@@ -1288,7 +1300,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
             let remaining = timeout.saturating_sub(elapsed);
             let progress = self
-                .replication
+                .replication_guard()
                 .wait_for_ack_progress(observed_progress, remaining);
             if !progress {
                 return integer_reply(current_replica_count());
@@ -1296,7 +1308,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    fn execute_dfly_flow(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_flow(&self, frame: &CommandFrame) -> CommandReply {
         if !(frame.args.len() == 4 || frame.args.len() == 5 || frame.args.len() == 6) {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY FLOW' command".to_owned(),
@@ -1306,14 +1318,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(master_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY FLOW master id must be valid UTF-8".to_owned());
         };
-        if master_id != self.replication.master_replid() {
+        if master_id != self.replication_guard().master_replid() {
             return CommandReply::Error("bad master id".to_owned());
         }
 
         let Ok(sync_id) = std::str::from_utf8(&frame.args[2]) else {
             return CommandReply::Error("DFLY FLOW sync id must be valid UTF-8".to_owned());
         };
-        if !self.replication.is_known_sync_session(sync_id) {
+        if !self.replication_guard().is_known_sync_session(sync_id) {
             return CommandReply::Error("syncid not found".to_owned());
         }
 
@@ -1362,13 +1374,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         let (sync_type, flow_start_offset) = requested_offset
-            .filter(|offset| self.replication.can_partial_sync_from_offset(*offset))
+            .filter(|offset| {
+                self.replication_guard()
+                    .can_partial_sync_from_offset(*offset)
+            })
             .map_or((FlowSyncType::Full, None), |offset| {
                 (FlowSyncType::Partial, Some(offset))
             });
 
-        let eof_token = self.replication.allocate_flow_eof_token();
-        if let Err(error) = self.replication.register_sync_flow(
+        let eof_token = self.replication_guard().allocate_flow_eof_token();
+        if let Err(error) = self.replication_guard().register_sync_flow(
             sync_id,
             flow_id,
             sync_type,
@@ -1387,7 +1402,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         ])
     }
 
-    fn execute_dfly_sync(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_sync(&self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY SYNC' command".to_owned(),
@@ -1396,15 +1411,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY SYNC sync id must be valid UTF-8".to_owned());
         };
-        if let Err(error) = self.replication.mark_sync_session_full_sync(sync_id) {
+        if let Err(error) = self
+            .replication_guard()
+            .mark_sync_session_full_sync(sync_id)
+        {
             return sync_session_error_reply(error);
         }
 
-        self.replication.mark_replicas_full_sync();
+        self.replication_guard().mark_replicas_full_sync();
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_dfly_startstable(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_startstable(&self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY STARTSTABLE' command".to_owned(),
@@ -1413,15 +1431,18 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(sync_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY STARTSTABLE sync id must be valid UTF-8".to_owned());
         };
-        if let Err(error) = self.replication.mark_sync_session_stable_sync(sync_id) {
+        if let Err(error) = self
+            .replication_guard()
+            .mark_sync_session_stable_sync(sync_id)
+        {
             return sync_session_error_reply(error);
         }
 
-        self.replication.mark_replicas_stable_sync();
+        self.replication_guard().mark_replicas_stable_sync();
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_dfly_admin(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_admin(&self, frame: &CommandFrame) -> CommandReply {
         let Some(subcommand_raw) = frame.args.first() else {
             return CommandReply::Error("wrong number of arguments for 'DFLY' command".to_owned());
         };
@@ -1447,14 +1468,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let offset = self.replication.replication_offset();
+        let offset = self.replication_guard().replication_offset();
         let offsets = (0..usize::from(self.config.shard_count.get()))
             .map(|_| CommandReply::Integer(i64::try_from(offset).unwrap_or(i64::MAX)))
             .collect::<Vec<_>>();
         CommandReply::Array(offsets)
     }
 
-    fn execute_dfly_save(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_save(&self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY SAVE' command".to_owned(),
@@ -1471,7 +1492,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    fn execute_dfly_load(&mut self, frame: &CommandFrame) -> CommandReply {
+    fn execute_dfly_load(&self, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() != 2 {
             return CommandReply::Error(
                 "wrong number of arguments for 'DFLY LOAD' command".to_owned(),
@@ -1491,7 +1512,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_key_command(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_key_command(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         let Some(key) = frame.args.first() else {
             return self.core.execute_in_db(db, frame);
         };
@@ -1502,7 +1523,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_cluster(&self, db: u16, frame: &CommandFrame) -> CommandReply {
-        if self.cluster.mode == ClusterMode::Disabled {
+        if self.cluster_read_guard().mode == ClusterMode::Disabled {
             return CommandReply::Error(
                 "Cluster is disabled. Use --cluster_mode=yes to enable.".to_owned(),
             );
@@ -1640,9 +1661,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
-        let slots = self
-            .cluster
+        let cluster = self.cluster_read_guard();
+        let (host, port) = split_endpoint_host_port(&cluster.redirect_endpoint);
+        let slots = cluster
             .owned_ranges()
             .iter()
             .map(|range| {
@@ -1665,7 +1686,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 "wrong number of arguments for 'CLUSTER MYID' command".to_owned(),
             );
         }
-        CommandReply::BulkString(self.cluster.node_id.as_bytes().to_vec())
+        CommandReply::BulkString(self.cluster_read_guard().node_id.as_bytes().to_vec())
     }
 
     fn execute_cluster_shards(&self, frame: &CommandFrame) -> CommandReply {
@@ -1675,9 +1696,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
-        let slots = self
-            .cluster
+        let cluster = self.cluster_read_guard();
+        let (host, port) = split_endpoint_host_port(&cluster.redirect_endpoint);
+        let slots = cluster
             .owned_ranges()
             .iter()
             .flat_map(|range| {
@@ -1689,7 +1710,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             .collect::<Vec<_>>();
         let nodes = vec![CommandReply::Array(vec![
             CommandReply::BulkString(b"id".to_vec()),
-            CommandReply::BulkString(self.cluster.node_id.as_bytes().to_vec()),
+            CommandReply::BulkString(self.cluster_read_guard().node_id.as_bytes().to_vec()),
             CommandReply::BulkString(b"endpoint".to_vec()),
             CommandReply::BulkString(host.as_bytes().to_vec()),
             CommandReply::BulkString(b"ip".to_vec()),
@@ -1719,11 +1740,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let assigned = self.cluster.assigned_slots();
+        let cluster = self.cluster_read_guard();
+        let assigned = cluster.assigned_slots();
         let state = if assigned > 0 { "ok" } else { "fail" };
         let body = format!(
             "cluster_state:{state}\r\ncluster_slots_assigned:{assigned}\r\ncluster_slots_ok:{assigned}\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:1\r\ncluster_size:1\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\n",
-            self.cluster.config_epoch, self.cluster.config_epoch
+            cluster.config_epoch, cluster.config_epoch
         );
         CommandReply::BulkString(body.into_bytes())
     }
@@ -1735,10 +1757,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let (host, port) = split_endpoint_host_port(&self.cluster.redirect_endpoint);
+        let cluster = self.cluster_read_guard();
+        let (host, port) = split_endpoint_host_port(&cluster.redirect_endpoint);
         let bus_port = port.saturating_add(10_000);
-        let ranges = self
-            .cluster
+        let ranges = cluster
             .owned_ranges()
             .iter()
             .map(|range| format!("{}-{}", range.start, range.end))
@@ -1747,7 +1769,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let mut line = format!(
             "{} {}:{}@{} myself,master - 0 0 {} connected",
-            self.cluster.node_id, host, port, bus_port, self.cluster.config_epoch
+            cluster.node_id, host, port, bus_port, cluster.config_epoch
         );
         if !ranges.is_empty() {
             line.push(' ');
@@ -1757,7 +1779,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::BulkString(line.into_bytes())
     }
 
-    fn execute_mget(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_mget(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if frame.args.is_empty() {
             return CommandReply::Error("wrong number of arguments for 'MGET' command".to_owned());
         }
@@ -1778,7 +1800,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Array(replies)
     }
 
-    fn execute_mset(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_mset(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error("wrong number of arguments for 'MSET' command".to_owned());
         }
@@ -1798,7 +1820,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::SimpleString("OK".to_owned())
     }
 
-    fn execute_msetnx(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_msetnx(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
             return CommandReply::Error(
                 "wrong number of arguments for 'MSETNX' command".to_owned(),
@@ -1828,7 +1850,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         CommandReply::Integer(1)
     }
 
-    fn execute_rename(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_rename(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if let Some(error_reply) =
             self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
         {
@@ -1837,7 +1859,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         self.core.execute_in_db(db, frame)
     }
 
-    fn execute_copy(&mut self, db: u16, frame: &CommandFrame) -> CommandReply {
+    fn execute_copy(&self, db: u16, frame: &CommandFrame) -> CommandReply {
         if frame.args.len() >= 2
             && let Some(error_reply) = self
                 .ensure_cluster_multi_key_constraints(frame.args.iter().take(2).map(Vec::as_slice))
@@ -1851,7 +1873,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        if self.cluster.mode == ClusterMode::Disabled {
+        if self.cluster_read_guard().mode == ClusterMode::Disabled {
             return None;
         }
 
@@ -1870,15 +1892,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn cluster_moved_reply_for_key(&self, key: &[u8]) -> Option<CommandReply> {
-        self.cluster
+        self.cluster_read_guard()
             .moved_slot_for_key(key)
             .map(|slot| CommandReply::Moved {
                 slot,
-                endpoint: self.cluster.redirect_endpoint.clone(),
+                endpoint: self.cluster_read_guard().redirect_endpoint.clone(),
             })
     }
 
-    fn replay_journal_entries(&mut self, entries: &[JournalEntry]) -> DflyResult<usize> {
+    fn replay_journal_entries(&self, entries: &[JournalEntry]) -> DflyResult<usize> {
         let mut applied = 0_usize;
         for entry in entries {
             if matches!(entry.op, JournalOp::Ping | JournalOp::Lsn) {
@@ -1898,14 +1920,12 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         Ok(applied)
     }
 
-    fn allocate_txid(&mut self) -> TxId {
-        let txid = self.next_txid;
-        self.next_txid = self.next_txid.saturating_add(1);
-        txid
+    fn allocate_txid(&self) -> TxId {
+        self.next_txid.fetch_add(1, Ordering::AcqRel)
     }
 
     fn maybe_append_journal_for_command(
-        &mut self,
+        &self,
         txid: Option<TxId>,
         db: u16,
         frame: &CommandFrame,
@@ -1917,7 +1937,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let txid = txid.unwrap_or_else(|| self.allocate_txid());
         let payload = serialize_command_frame(frame);
-        self.replication.append_journal(JournalEntry {
+        self.replication_guard().append_journal(JournalEntry {
             txid,
             db,
             op,
@@ -2281,8 +2301,8 @@ pub fn run() -> DflyResult<()> {
         let snapshot = server.create_snapshot_bytes()?;
         server.load_snapshot_bytes(&snapshot)?;
         let _ = server.recover_from_replication_journal()?;
-        let _ =
-            server.recover_from_replication_journal_from_lsn(server.replication.journal_lsn())?;
+        let _ = server
+            .recover_from_replication_journal_from_lsn(server.replication_guard().journal_lsn())?;
         Ok(())
     })?;
 

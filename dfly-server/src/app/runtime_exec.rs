@@ -17,7 +17,7 @@ const DIRECT_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_millis(2);
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
-        &mut self,
+        &self,
         db: u16,
         plan: &TransactionPlan,
     ) -> Vec<CommandReply> {
@@ -62,7 +62,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_runtime_scheduled_hop(
-        &mut self,
+        &self,
         db: u16,
         txid: TxId,
         hop: &TransactionHop,
@@ -200,7 +200,7 @@ impl ServerApp {
         // transaction mode. Worker execution for non-single-key commands is enabled
         // only in standalone mode where coordinator-side cluster checks are not
         // required.
-        if self.cluster.mode != ClusterMode::Disabled {
+        if self.cluster_read_guard().mode != ClusterMode::Disabled {
             return false;
         }
 
@@ -237,7 +237,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_command_after_runtime_barrier(
-        &mut self,
+        &self,
         db: u16,
         command: &CommandFrame,
     ) -> CommandReply {
@@ -245,7 +245,7 @@ impl ServerApp {
     }
 
     fn execute_command_after_runtime_barrier_internal(
-        &mut self,
+        &self,
         db: u16,
         command: &CommandFrame,
         pre_dispatched: bool,
@@ -277,7 +277,7 @@ impl ServerApp {
         {
             return reply;
         }
-        if self.cluster.mode == ClusterMode::Disabled
+        if self.cluster_read_guard().mode == ClusterMode::Disabled
             && self.command_requires_shard_worker_execution(command)
         {
             return CommandReply::Error(
@@ -386,7 +386,7 @@ impl ServerApp {
         if connection.context.protocol != ClientProtocol::Resp {
             return Ok(None);
         }
-        if self.cluster.mode != ClusterMode::Disabled {
+        if self.cluster_read_guard().mode != ClusterMode::Disabled {
             return Ok(None);
         }
         if connection.transaction.in_multi() {
@@ -443,7 +443,7 @@ impl ServerApp {
     }
 
     fn execute_runtime_command_on_worker_shard(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         shard: u16,
@@ -474,7 +474,7 @@ impl ServerApp {
     }
 
     fn execute_grouped_worker_commands(
-        &mut self,
+        &self,
         db: u16,
         grouped_commands: Vec<(u16, CommandFrame)>,
         enforce_scheduler_barrier: bool,
@@ -544,7 +544,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_user_command(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         txid: Option<TxId>,
@@ -592,7 +592,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_copy_rename_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -617,7 +617,7 @@ impl ServerApp {
     }
 
     fn execute_copy_rename_on_owner_worker(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         source_shard: u16,
@@ -756,7 +756,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_multikey_string_commands_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
@@ -764,7 +764,7 @@ impl ServerApp {
     }
 
     fn execute_multikey_string_commands_via_runtime_internal(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -786,7 +786,7 @@ impl ServerApp {
     }
 
     fn execute_same_shard_multikey_string_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -815,7 +815,7 @@ impl ServerApp {
     }
 
     fn execute_mget_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -898,7 +898,7 @@ impl ServerApp {
     }
 
     fn execute_mset_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -951,7 +951,7 @@ impl ServerApp {
     }
 
     fn execute_msetnx_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -1046,7 +1046,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_multi_key_counting_command_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
     ) -> Option<CommandReply> {
@@ -1054,7 +1054,7 @@ impl ServerApp {
     }
 
     fn execute_multi_key_counting_command_via_runtime_internal(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -1111,7 +1111,7 @@ impl ServerApp {
     }
 
     fn execute_same_shard_multikey_count_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -1132,7 +1132,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_single_shard_command_via_runtime(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
     ) -> CommandReply {
@@ -1140,7 +1140,7 @@ impl ServerApp {
     }
 
     fn execute_single_shard_command_via_runtime_internal(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
         enforce_scheduler_barrier: bool,
@@ -1162,7 +1162,7 @@ impl ServerApp {
     }
 
     pub(super) fn execute_replay_command_without_journal(
-        &mut self,
+        &self,
         db: u16,
         frame: &CommandFrame,
     ) -> CommandReply {
@@ -1241,7 +1241,7 @@ impl ServerApp {
                 return Err(DflyError::InvalidState("transaction shard queue is busy"));
             }
         }
-        let execute_on_worker = self.cluster.mode == ClusterMode::Disabled
+        let execute_on_worker = self.cluster_read_guard().mode == ClusterMode::Disabled
             && self.command_requires_shard_worker_execution(frame);
 
         // Direct command path mirrors Dragonfly's coordinator ingress:
