@@ -1275,6 +1275,44 @@ mod tests {
     }
 
     #[rstest]
+    fn core_execute_on_shard_in_db_runs_cross_shard_rename_from_owner_worker() {
+        let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
+        let source_key = b"runtime:rename:cross:source".to_vec();
+        let source_shard = core.resolve_shard_for_key(&source_key);
+        let mut destination_key = b"runtime:rename:cross:destination".to_vec();
+        let mut destination_shard = core.resolve_shard_for_key(&destination_key);
+        let mut suffix = 0_u32;
+        while destination_shard == source_shard {
+            suffix = suffix.saturating_add(1);
+            destination_key = format!("runtime:rename:cross:destination:{suffix}").into_bytes();
+            destination_shard = core.resolve_shard_for_key(&destination_key);
+        }
+
+        let set = core.execute_on_shard_in_db(
+            source_shard,
+            0,
+            &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        );
+        assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let rename = core.execute_on_shard_in_db(
+            source_shard,
+            0,
+            &CommandFrame::new("RENAME", vec![source_key.clone(), destination_key.clone()]),
+        );
+        assert_that!(&rename, eq(&CommandReply::SimpleString("OK".to_owned())));
+
+        let source_value = core.execute_in_db(0, &CommandFrame::new("GET", vec![source_key]));
+        let destination_value =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+        assert_that!(&source_value, eq(&CommandReply::Null));
+        assert_that!(
+            &destination_value,
+            eq(&CommandReply::BulkString(b"value".to_vec()))
+        );
+    }
+
+    #[rstest]
     fn core_execute_on_shard_in_db_runs_same_shard_multikey_count_command() {
         let core = CoreModule::new(ShardCount::new(8).expect("valid shard count"));
         let first_key = b"runtime:multi:same:1".to_vec();

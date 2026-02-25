@@ -2067,6 +2067,89 @@ fn exec_plan_global_cross_shard_copy_executes_on_owner_worker_fiber() {
 }
 
 #[rstest]
+fn exec_plan_global_cross_shard_rename_executes_on_owner_worker_fiber() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let source_key = b"plan:rt:global:rename:cross:source".to_vec();
+    let source_shard = app.core.resolve_shard_for_key(&source_key);
+    let mut destination_key = b"plan:rt:global:rename:cross:destination".to_vec();
+    let mut destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    let mut suffix = 0_u32;
+    while destination_shard == source_shard {
+        suffix = suffix.saturating_add(1);
+        destination_key = format!("plan:rt:global:rename:cross:destination:{suffix}").into_bytes();
+        destination_shard = app.core.resolve_shard_for_key(&destination_key);
+    }
+
+    let set = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![source_key.clone(), b"value".to_vec()]),
+        None,
+    );
+    assert_that!(&set, eq(&CommandReply::SimpleString("OK".to_owned())));
+    for shard_id in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard_id)
+            .expect("drain should succeed");
+    }
+
+    let queued = vec![CommandFrame::new(
+        "RENAME",
+        vec![source_key.clone(), destination_key.clone()],
+    )];
+    let plan = app.build_exec_plan(&queued);
+    assert_that!(plan.mode, eq(TransactionMode::Global));
+    assert_that!(plan.touched_shards.contains(&source_shard), eq(true));
+    assert_that!(plan.touched_shards.contains(&destination_shard), eq(true));
+
+    let replies = app.execute_transaction_plan(0, &plan);
+    assert_that!(
+        &replies,
+        eq(&vec![CommandReply::SimpleString("OK".to_owned())])
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(source_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(destination_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let source_runtime = app
+        .runtime
+        .drain_processed_for_shard(source_shard)
+        .expect("drain should succeed");
+    let destination_runtime = app
+        .runtime
+        .drain_processed_for_shard(destination_shard)
+        .expect("drain should succeed");
+    assert_that!(source_runtime.len(), eq(1_usize));
+    assert_that!(destination_runtime.len(), eq(1_usize));
+    assert_that!(&source_runtime[0].command, eq(&queued[0]));
+    assert_that!(&destination_runtime[0].command, eq(&queued[0]));
+    let worker_count = usize::from(source_runtime[0].execute_on_worker)
+        + usize::from(destination_runtime[0].execute_on_worker);
+    assert_that!(worker_count, eq(1_usize));
+
+    let source_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![source_key]));
+    let destination_value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![destination_key]));
+    assert_that!(&source_value, eq(&CommandReply::Null));
+    assert_that!(
+        &destination_value,
+        eq(&CommandReply::BulkString(b"value".to_vec()))
+    );
+}
+
+#[rstest]
 fn exec_plan_global_same_shard_multikey_count_executes_on_worker_fiber() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"plan:rt:global:del:1".to_vec();
