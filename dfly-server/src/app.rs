@@ -16,7 +16,8 @@ use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::ConnectionContext;
-use dfly_facade::proactor::ConnectionAffinity;
+#[cfg(test)]
+use dfly_facade::connection::ConnectionState;
 use dfly_facade::protocol::{ClientProtocol, ParseStatus, ParsedCommand, parse_next_command};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
@@ -61,9 +62,6 @@ pub struct ServerApp {
     pub tiering: TieringModule,
     /// Monotonic transaction id allocator.
     next_txid: TxId,
-    #[cfg(test)]
-    /// Monotonic id used for deterministic proactor-worker connection affinity.
-    next_connection_id: u64,
     /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
     next_implicit_replica_id: u64,
 }
@@ -109,8 +107,6 @@ impl ServerApp {
             search,
             tiering,
             next_txid: 1,
-            #[cfg(test)]
-            next_connection_id: 1,
             next_implicit_replica_id: 1,
         }
     }
@@ -206,14 +202,15 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// an explicit object to make parser/dispatcher flow easy to test.
     #[must_use]
     pub fn new_connection(protocol: ClientProtocol) -> ServerConnection {
+        let context = ConnectionContext {
+            protocol,
+            db_index: 0,
+            privileged: false,
+        };
         ServerConnection {
-            context: ConnectionContext {
-                protocol,
-                db_index: 0,
-                privileged: false,
-            },
-            io_context_synced: None,
-            io_affinity: None,
+            #[cfg(test)]
+            ingress_parser: ConnectionState::new(context.clone()),
+            context,
             transaction: TransactionSession::default(),
             replica_endpoint: None,
             replica_client_id: None,
@@ -221,80 +218,16 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    #[cfg(test)]
-    fn ensure_connection_io_affinity(
-        &mut self,
-        connection: &mut ServerConnection,
-    ) -> ConnectionAffinity {
-        if let Some(affinity) = connection.io_affinity {
-            return affinity;
-        }
-        let connection_id = self.next_connection_id;
-        self.next_connection_id = self.next_connection_id.saturating_add(1);
-        let affinity = self.facade.proactor_pool.bind_connection(connection_id);
-        connection.io_affinity = Some(affinity);
-        affinity
-    }
-
     /// Detaches one connection and releases worker-owned/parser-replication resources.
     ///
     /// Network ingress uses this when a TCP peer disconnects so worker-local parser state and
     /// replica endpoint identity do not leak across reused OS sockets.
     pub fn disconnect_connection(&mut self, connection: &mut ServerConnection) {
-        if let Some(affinity) = connection.io_affinity.take() {
-            let _ = self.facade.proactor_pool.release_connection(affinity);
-        }
-        connection.io_context_synced = None;
         if let Some(endpoint) = connection.replica_endpoint.take() {
             let _ = self
                 .replication
                 .remove_replica_endpoint(&endpoint.address, endpoint.listening_port);
         }
-    }
-
-    /// Feeds network bytes into one connection and executes all newly completed commands.
-    ///
-    /// The return vector contains one protocol-encoded reply per decoded command.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when connection input bytes violate the active
-    /// wire protocol framing rules.
-    #[cfg(test)]
-    pub fn feed_connection_bytes(
-        &mut self,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>> {
-        let affinity = self.ensure_connection_io_affinity(connection);
-        let parsed_batch = if connection.io_context_synced.as_ref() == Some(&connection.context) {
-            self.facade
-                .proactor_pool
-                .parse_on_worker_for_bound_connection(affinity, bytes)?
-        } else {
-            let parsed = self.facade.proactor_pool.parse_on_worker_for_connection(
-                affinity,
-                &connection.context,
-                bytes,
-            )?;
-            connection.io_context_synced = Some(connection.context.clone());
-            parsed
-        };
-        let parsed_commands = parsed_batch.commands;
-        let parse_error = parsed_batch.parse_error;
-
-        let mut responses = Vec::new();
-        for parsed in parsed_commands {
-            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
-                responses.push(encoded);
-            }
-        }
-
-        if let Some(error) = parse_error {
-            return Err(error);
-        }
-
-        Ok(responses)
     }
 
     pub(crate) fn execute_parsed_command(
@@ -1914,10 +1847,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 pub struct ServerConnection {
     /// Stable connection metadata shared with worker-owned parser state.
     pub context: ConnectionContext,
-    /// Last connection metadata synchronized into worker-owned parser state.
-    pub io_context_synced: Option<ConnectionContext>,
-    /// Stable proactor worker affinity allocated by the connection ingress path.
-    pub io_affinity: Option<ConnectionAffinity>,
+    /// Test-only parser state used by unit tests that drive command bytes directly.
+    #[cfg(test)]
+    pub ingress_parser: ConnectionState,
     /// Connection-local transaction queue (`MULTI` mode).
     pub transaction: TransactionSession,
     /// Replica endpoint identity announced on this connection via `REPLCONF`.

@@ -1,7 +1,7 @@
-use super::ServerApp;
+use super::{ServerApp, ServerConnection};
 use dfly_cluster::slot::{SlotRange, key_slot};
 use dfly_common::config::{ClusterMode, RuntimeConfig};
-use dfly_common::error::DflyError;
+use dfly_common::error::{DflyError, DflyResult};
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::protocol::ClientProtocol;
 use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
@@ -11,6 +11,34 @@ use googletest::prelude::*;
 use rstest::rstest;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+trait TestConnectionFeedExt {
+    fn feed_connection_bytes(
+        &mut self,
+        connection: &mut ServerConnection,
+        bytes: &[u8],
+    ) -> DflyResult<Vec<Vec<u8>>>;
+}
+
+impl TestConnectionFeedExt for ServerApp {
+    fn feed_connection_bytes(
+        &mut self,
+        connection: &mut ServerConnection,
+        bytes: &[u8],
+    ) -> DflyResult<Vec<Vec<u8>>> {
+        connection.ingress_parser.feed_bytes(bytes);
+        let mut responses = Vec::new();
+        loop {
+            let Some(parsed) = connection.ingress_parser.try_pop_command()? else {
+                break;
+            };
+            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
+                responses.push(encoded);
+            }
+        }
+        Ok(responses)
+    }
+}
 
 #[rstest]
 fn resp_connection_executes_set_then_get() {
@@ -31,58 +59,6 @@ fn resp_connection_executes_set_then_get() {
         .expect("GET command should execute");
     let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
     assert_that!(&get_responses, eq(&expected_get));
-}
-
-#[rstest]
-fn connection_assigns_stable_io_affinity_on_first_feed() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
-    assert_that!(connection.io_affinity.is_none(), eq(true));
-
-    let first = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PING"]))
-        .expect("first command should execute");
-    assert_that!(&first, eq(&vec![b"+PONG\r\n".to_vec()]));
-    let first_affinity = connection
-        .io_affinity
-        .expect("connection should receive io affinity");
-    assert_that!(
-        first_affinity.io_worker < app.facade.io_thread_count,
-        eq(true)
-    );
-
-    let second = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PING"]))
-        .expect("second command should execute");
-    assert_that!(&second, eq(&vec![b"+PONG\r\n".to_vec()]));
-    assert_that!(&connection.io_affinity, eq(&Some(first_affinity)));
-}
-
-#[rstest]
-fn distinct_connections_use_distinct_io_workers_when_capacity_allows() {
-    let mut app = ServerApp::new(RuntimeConfig::default());
-    assert_that!(app.facade.io_thread_count >= 2, eq(true));
-
-    let mut first = ServerApp::new_connection(ClientProtocol::Resp);
-    let mut second = ServerApp::new_connection(ClientProtocol::Resp);
-
-    let _ = app
-        .feed_connection_bytes(&mut first, &resp_command(&[b"PING"]))
-        .expect("first command should execute");
-    let _ = app
-        .feed_connection_bytes(&mut second, &resp_command(&[b"PING"]))
-        .expect("second command should execute");
-
-    let first_affinity = first.io_affinity.expect("first connection must be bound");
-    let second_affinity = second.io_affinity.expect("second connection must be bound");
-    assert_that!(
-        first_affinity.connection_id < second_affinity.connection_id,
-        eq(true)
-    );
-    assert_that!(
-        first_affinity.io_worker != second_affinity.io_worker,
-        eq(true)
-    );
 }
 
 #[rstest]
