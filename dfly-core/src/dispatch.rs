@@ -190,6 +190,8 @@ pub struct DispatchState {
     pub db_tables: HashMap<DbIndex, DbTable>,
     /// Monotonic per-key versions used by optimistic transaction checks (`WATCH`).
     db_versions: HashMap<DbIndex, HashMap<Vec<u8>, u64>>,
+    /// Round-robin starting point for per-pass active-expire DB scans.
+    active_expire_db_cursor: usize,
 }
 
 /// Stored value with optional expiration metadata.
@@ -558,18 +560,40 @@ impl DispatchState {
         }
 
         let now = Self::now_unix_seconds();
+        let mut dbs = self.db_tables.keys().copied().collect::<Vec<_>>();
+        dbs.sort_unstable();
+        if dbs.is_empty() {
+            return 0;
+        }
+
+        let start = self.active_expire_db_cursor % dbs.len();
         let mut candidates = Vec::with_capacity(limit);
-        for (db, table) in &mut self.db_tables {
-            while candidates.len() < limit {
-                let Some(key) = Self::pop_next_expired_key(table, now) else {
+        let mut cycle_start = start;
+        while candidates.len() < limit {
+            let mut progressed = false;
+            for offset in 0..dbs.len() {
+                if candidates.len() == limit {
                     break;
+                }
+
+                let index = (cycle_start + offset) % dbs.len();
+                let db = dbs[index];
+                let Some(table) = self.db_tables.get_mut(&db) else {
+                    continue;
                 };
-                candidates.push((*db, key));
+                let Some(key) = Self::pop_next_expired_key(table, now) else {
+                    continue;
+                };
+                candidates.push((db, key));
+                progressed = true;
             }
-            if candidates.len() == limit {
+
+            if !progressed {
                 break;
             }
+            cycle_start = (cycle_start + 1) % dbs.len();
         }
+        self.active_expire_db_cursor = (start + 1) % dbs.len();
 
         let mut removed = 0_usize;
         for (db, key) in candidates {

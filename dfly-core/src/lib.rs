@@ -2345,6 +2345,49 @@ mod tests {
     }
 
     #[rstest]
+    fn core_active_expire_pass_rotates_database_start_cursor() {
+        let core = CoreModule::new(ShardCount::new(1).expect("valid shard count"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u64, |duration| duration.as_secs());
+        let db0_key = b"active-expire:db0".to_vec();
+        let db1_key = b"active-expire:db1".to_vec();
+
+        core.import_snapshot(&CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: db0_key.clone(),
+                    value: b"a".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+                SnapshotEntry {
+                    shard: 0,
+                    db: 1,
+                    key: db1_key.clone(),
+                    value: b"b".to_vec(),
+                    expire_at_unix_secs: Some(now.saturating_sub(1)),
+                },
+            ],
+        })
+        .expect("snapshot import should succeed");
+
+        let first_removed = core.active_expire_pass(1);
+        assert_that!(first_removed, eq(1_usize));
+        assert_that!(core.db_size(0), eq(0_usize));
+        assert_that!(core.db_size(1), eq(1_usize));
+        assert_that!(core.key_version(0, &db0_key), eq(2_u64));
+        assert_that!(core.key_version(1, &db1_key), eq(1_u64));
+
+        let second_removed = core.active_expire_pass(1);
+        assert_that!(second_removed, eq(1_usize));
+        assert_that!(core.db_size(0), eq(0_usize));
+        assert_that!(core.db_size(1), eq(0_usize));
+        assert_that!(core.key_version(1, &db1_key), eq(2_u64));
+    }
+
+    #[rstest]
     fn core_active_expire_pass_on_shard_scopes_cleanup() {
         let core = CoreModule::new(ShardCount::new(2).expect("valid shard count"));
         let now = SystemTime::now()
