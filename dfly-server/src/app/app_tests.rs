@@ -2519,6 +2519,92 @@ fn direct_del_multikey_executes_each_key_on_worker_fiber() {
 }
 
 #[rstest]
+fn direct_del_multikey_groups_keys_by_shard_worker_command() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let first_key = b"direct:rt:del:group:1".to_vec();
+    let first_shard = app.core.resolve_shard_for_key(&first_key);
+
+    let mut second_key = b"direct:rt:del:group:2".to_vec();
+    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
+    let mut suffix = 0_u32;
+    while second_shard != first_shard {
+        suffix = suffix.saturating_add(1);
+        second_key = format!("direct:rt:del:group:2:{suffix}").into_bytes();
+        second_shard = app.core.resolve_shard_for_key(&second_key);
+    }
+
+    let mut third_key = b"direct:rt:del:group:3".to_vec();
+    let mut third_shard = app.core.resolve_shard_for_key(&third_key);
+    while third_shard == first_shard {
+        suffix = suffix.saturating_add(1);
+        third_key = format!("direct:rt:del:group:3:{suffix}").into_bytes();
+        third_shard = app.core.resolve_shard_for_key(&third_key);
+    }
+
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![first_key.clone(), b"a".to_vec()]),
+        None,
+    );
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![second_key.clone(), b"b".to_vec()]),
+        None,
+    );
+    let _ = app.execute_user_command(
+        0,
+        &CommandFrame::new("SET", vec![third_key.clone(), b"c".to_vec()]),
+        None,
+    );
+    for shard in 0_u16..app.config.shard_count.get() {
+        let _ = app
+            .runtime
+            .drain_processed_for_shard(shard)
+            .expect("drain should succeed");
+    }
+
+    let frame = CommandFrame::new(
+        "DEL",
+        vec![first_key.clone(), second_key.clone(), third_key.clone()],
+    );
+    let reply = app.execute_user_command(0, &frame, None);
+    assert_that!(&reply, eq(&CommandReply::Integer(3)));
+
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+    assert_that!(
+        app.runtime
+            .wait_for_processed_count(third_shard, 1, Duration::from_millis(200))
+            .expect("wait should succeed"),
+        eq(true)
+    );
+
+    let first_runtime = app
+        .runtime
+        .drain_processed_for_shard(first_shard)
+        .expect("drain should succeed");
+    let third_runtime = app
+        .runtime
+        .drain_processed_for_shard(third_shard)
+        .expect("drain should succeed");
+    assert_that!(first_runtime.len(), eq(1_usize));
+    assert_that!(third_runtime.len(), eq(1_usize));
+    assert_that!(&first_runtime[0].command.name, eq(&"DEL".to_owned()));
+    assert_that!(&third_runtime[0].command.name, eq(&"DEL".to_owned()));
+    assert_that!(
+        &first_runtime[0].command.args,
+        eq(&vec![first_key.clone(), second_key.clone()])
+    );
+    assert_that!(&third_runtime[0].command.args, eq(&vec![third_key.clone()]));
+    assert_that!(first_runtime[0].execute_on_worker, eq(true));
+    assert_that!(third_runtime[0].execute_on_worker, eq(true));
+}
+
+#[rstest]
 fn direct_del_same_shard_executes_single_worker_command() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let first_key = b"direct:rt:del:same:1".to_vec();

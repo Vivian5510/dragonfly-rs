@@ -9,7 +9,7 @@ use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_core::runtime::RuntimeEnvelope;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
@@ -382,6 +382,22 @@ impl ServerApp {
         Some(first_shard)
     }
 
+    fn group_multikey_count_frame_by_shard(
+        &self,
+        frame: &CommandFrame,
+    ) -> Vec<(u16, CommandFrame)> {
+        let mut grouped_keys = BTreeMap::<u16, Vec<Vec<u8>>>::new();
+        for key in &frame.args {
+            let shard = self.core.resolve_shard_for_key(key);
+            grouped_keys.entry(shard).or_default().push(key.clone());
+        }
+
+        grouped_keys
+            .into_iter()
+            .map(|(shard, args)| (shard, CommandFrame::new(frame.name.as_str(), args)))
+            .collect()
+    }
+
     fn same_shard_multikey_string_target_shard(&self, frame: &CommandFrame) -> Option<u16> {
         let keys: Vec<&[u8]> = match frame.name.as_str() {
             "MGET" if frame.args.len() >= 2 => frame.args.iter().map(Vec::as_slice).collect(),
@@ -542,17 +558,76 @@ impl ServerApp {
         if let Some(reply) = self.execute_same_shard_multikey_count_via_runtime(db, frame) {
             return Some(reply);
         }
+        if let Some(error_reply) =
+            self.ensure_cluster_multi_key_constraints(frame.args.iter().map(Vec::as_slice))
+        {
+            return Some(error_reply);
+        }
+
+        let grouped_commands = self.group_multikey_count_frame_by_shard(frame);
+        let touched_shards = grouped_commands
+            .iter()
+            .map(|(shard, _)| *shard)
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .transaction
+            .scheduler
+            .ensure_shards_available(&touched_shards)
+        {
+            return Some(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+
+        let mut barriers = Vec::with_capacity(grouped_commands.len());
+        for (shard, grouped_frame) in grouped_commands {
+            let sequence =
+                match self.submit_runtime_envelope_with_sequence(shard, db, &grouped_frame, true) {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        return Some(CommandReply::Error(format!(
+                            "runtime dispatch failed: {error}"
+                        )));
+                    }
+                };
+            barriers.push((shard, sequence));
+        }
+        for (shard, sequence) in &barriers {
+            if let Err(error) = self
+                .runtime
+                .wait_until_processed_sequence(*shard, *sequence)
+            {
+                return Some(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+            }
+        }
 
         let mut total = 0_i64;
-        for key in &frame.args {
-            let single_key_frame = CommandFrame::new(frame.name.as_str(), vec![key.clone()]);
-            let reply = self.execute_single_shard_command_via_runtime(db, &single_key_frame);
+        for (shard, sequence) in barriers {
+            let reply = match self.runtime.take_processed_reply(shard, sequence) {
+                Ok(Some(reply)) => reply,
+                Ok(None) => {
+                    return Some(CommandReply::Error(
+                        "runtime dispatch failed: missing worker reply".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    return Some(CommandReply::Error(format!(
+                        "runtime dispatch failed: {error}"
+                    )));
+                }
+            };
+
             match reply {
                 CommandReply::Integer(delta) => {
                     total = total.saturating_add(delta.max(0));
                 }
-                CommandReply::Moved { .. } | CommandReply::Error(_) => {
-                    return Some(reply);
+                CommandReply::Moved { slot, endpoint } => {
+                    return Some(CommandReply::Moved { slot, endpoint });
+                }
+                CommandReply::Error(message) => {
+                    return Some(CommandReply::Error(message));
                 }
                 _ => {
                     return Some(CommandReply::Error(format!(
@@ -562,6 +637,7 @@ impl ServerApp {
                 }
             }
         }
+
         Some(CommandReply::Integer(total))
     }
 
