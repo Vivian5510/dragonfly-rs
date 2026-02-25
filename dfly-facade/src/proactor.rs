@@ -51,6 +51,7 @@ pub struct ProactorPool {
     senders: Vec<mpsc::UnboundedSender<ParseRequest>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
+const PROACTOR_WORKER_YIELD_INTERVAL: usize = 64;
 
 impl std::fmt::Debug for ProactorPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,17 +156,41 @@ fn proactor_worker_thread_main(io_worker: u16, receiver: mpsc::UnboundedReceiver
 
     let local_set = LocalSet::new();
     runtime.block_on(local_set.run_until(async move {
-        let parse_fiber = tokio::task::spawn_local(proactor_parse_fiber(io_worker, receiver));
+        // Mirror Dragonfly's explicit ingress and execution fibers inside one proactor thread.
+        let (dispatch_sender, dispatch_receiver) = mpsc::unbounded_channel::<ParseRequest>();
+        let ingress_fiber =
+            tokio::task::spawn_local(proactor_ingress_fiber(receiver, dispatch_sender));
+        let parse_fiber =
+            tokio::task::spawn_local(proactor_parse_fiber(io_worker, dispatch_receiver));
+        let _ = ingress_fiber.await;
         let _ = parse_fiber.await;
     }));
 }
 
+async fn proactor_ingress_fiber(
+    mut receiver: mpsc::UnboundedReceiver<ParseRequest>,
+    dispatch_sender: mpsc::UnboundedSender<ParseRequest>,
+) {
+    while let Some(request) = receiver.recv().await {
+        if dispatch_sender.send(request).is_err() {
+            break;
+        }
+    }
+}
+
 async fn proactor_parse_fiber(io_worker: u16, mut receiver: mpsc::UnboundedReceiver<ParseRequest>) {
+    let mut processed_since_yield = 0_usize;
     while let Some(request) = receiver.recv().await {
         let _ = tokio::task::spawn_local(async move {
             handle_parse_request(io_worker, request);
         })
         .await;
+
+        processed_since_yield = processed_since_yield.saturating_add(1);
+        if processed_since_yield >= PROACTOR_WORKER_YIELD_INTERVAL {
+            processed_since_yield = 0;
+            tokio::task::yield_now().await;
+        }
     }
 }
 
