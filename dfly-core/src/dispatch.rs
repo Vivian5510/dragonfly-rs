@@ -88,6 +88,10 @@ impl SlotStats {
         self.key_counts[usize::from(slot)] = count;
     }
 
+    fn set_memory_bytes(&mut self, slot: u16, bytes: usize) {
+        self.memory_bytes[usize::from(slot)] = bytes;
+    }
+
     fn increment_write(&mut self, slot: u16) {
         let index = usize::from(slot);
         self.total_writes[index] = self.total_writes[index].saturating_add(1);
@@ -391,10 +395,21 @@ impl DispatchState {
         };
         if live.is_empty() {
             table.slot_stats.clear(slot);
+            table.slot_stats.set_memory_bytes(slot, 0);
             let _ = table.slot_keys.remove(&slot);
             return;
         }
+        let memory_bytes = live
+            .iter()
+            .filter_map(|key| {
+                table
+                    .prime
+                    .get(key)
+                    .map(|entry| Self::slot_payload_bytes(key, entry))
+            })
+            .sum::<usize>();
         table.slot_stats.set_count(slot, live.len());
+        table.slot_stats.set_memory_bytes(slot, memory_bytes);
         let _ = table
             .slot_keys
             .insert(slot, live.iter().cloned().collect::<HashSet<_>>());
@@ -2380,6 +2395,7 @@ mod tests {
         if let Some(table) = state.db_tables.get_mut(&0) {
             let _ = table.slot_keys.insert(slot, HashSet::new());
             table.slot_stats.set_count(slot, 0_usize);
+            table.slot_stats.set_memory_bytes(slot, 0_usize);
         }
 
         assert_that!(state.count_live_keys_in_slot(0, slot), eq(1_usize));
@@ -2390,6 +2406,10 @@ mod tests {
         assert_that!(
             table.slot_keys.get(&slot).map(HashSet::len),
             eq(Some(1_usize))
+        );
+        assert_that!(
+            table.slot_stats.memory_bytes(slot),
+            eq(key.len().saturating_add(b"value".len()))
         );
         assert_that!(&state.slot_keys(0, slot), eq(&vec![key.clone()]));
     }
