@@ -57,7 +57,7 @@ pub trait TransactionScheduler: Send + Sync {
 pub struct InMemoryTransactionScheduler {
     shard_queues: ShardQueueSegments,
     key_locks: KeyLockSegments,
-    active: Mutex<HashMap<TxId, ActiveLease>>,
+    active: ActiveLeaseSegments,
 }
 
 const SCHEDULER_SEGMENT_COUNT: usize = 64;
@@ -67,8 +67,10 @@ type KeyAccessList = Vec<(KeyId, SingleKeyAccess)>;
 
 type ShardQueueMap = HashMap<ShardId, VecDeque<TxId>>;
 type KeyLockMap = HashMap<KeyId, KeyLockState>;
+type ActiveLeaseMap = HashMap<TxId, ActiveLease>;
 type ShardQueueSegments = [Mutex<ShardQueueMap>; SCHEDULER_SEGMENT_COUNT];
 type KeyLockSegments = [Mutex<KeyLockMap>; SCHEDULER_SEGMENT_COUNT];
+type ActiveLeaseSegments = [Mutex<ActiveLeaseMap>; SCHEDULER_SEGMENT_COUNT];
 
 #[derive(Debug, Default)]
 struct KeyLockState {
@@ -97,7 +99,7 @@ impl Default for InMemoryTransactionScheduler {
         Self {
             shard_queues: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             key_locks: std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            active: Mutex::new(HashMap::new()),
+            active: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }
     }
 }
@@ -152,8 +154,8 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             key_leases.push(KeyLease { key_id, access });
         }
 
-        let mut active = self
-            .active
+        let active_segment = active_lease_segment_index(plan.txid);
+        let mut active = self.active[active_segment]
             .lock()
             .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
         if active.contains_key(&plan.txid) {
@@ -174,8 +176,8 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
     }
 
     fn conclude(&self, txid: TxId) -> DflyResult<()> {
-        let mut active = self
-            .active
+        let active_segment = active_lease_segment_index(txid);
+        let mut active = self.active[active_segment]
             .lock()
             .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
 
@@ -211,8 +213,8 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
 
 impl InMemoryTransactionScheduler {
     fn is_active_txid(&self, txid: TxId) -> DflyResult<bool> {
-        let active = self
-            .active
+        let active_segment = active_lease_segment_index(txid);
+        let active = self.active[active_segment]
             .lock()
             .map_err(|_| DflyError::InvalidState("transaction scheduler mutex is poisoned"))?;
         Ok(active.contains_key(&txid))
@@ -422,6 +424,13 @@ fn key_lock_segment_index(key_id: &KeyId) -> usize {
     let segment_count_u64 =
         u64::try_from(SCHEDULER_SEGMENT_COUNT).expect("segment count must fit into u64");
     let segment = hasher.finish() % segment_count_u64;
+    usize::try_from(segment).expect("segment index must fit into usize")
+}
+
+fn active_lease_segment_index(txid: TxId) -> usize {
+    let segment_count_u64 =
+        u64::try_from(SCHEDULER_SEGMENT_COUNT).expect("segment count must fit into u64");
+    let segment = txid % segment_count_u64;
     usize::try_from(segment).expect("segment index must fit into usize")
 }
 
@@ -709,5 +718,35 @@ mod tests {
                 .is_ok(),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn scheduler_rejects_duplicate_active_txid_even_on_other_shards() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let first = TransactionPlan {
+            txid: 77,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k:one".to_vec(), b"v1".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![0],
+        };
+        let duplicate_txid = TransactionPlan {
+            txid: 77,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    1,
+                    CommandFrame::new("SET", vec![b"k:two".to_vec(), b"v2".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![1],
+        };
+
+        assert_that!(scheduler.schedule(&first).is_ok(), eq(true));
+        assert_that!(scheduler.schedule(&duplicate_txid).is_err(), eq(true));
     }
 }
