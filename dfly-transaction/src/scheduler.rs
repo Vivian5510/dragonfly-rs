@@ -1,7 +1,7 @@
 //! Scheduler interfaces for transaction execution.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{ShardId, TxId};
@@ -54,7 +54,7 @@ pub trait TransactionScheduler: Send + Sync {
 /// so we allow only one active transaction per shard queue head at a time.
 #[derive(Debug)]
 pub struct InMemoryTransactionScheduler {
-    shard_queues: Mutex<HashMap<ShardId, Arc<Mutex<VecDeque<TxId>>>>>,
+    shard_queues: Mutex<HashMap<ShardId, Arc<ShardAdmission>>>,
     key_locks: Mutex<HashMap<ShardId, Arc<Mutex<KeyLockMap>>>>,
     active: Mutex<ActiveLeaseMap>,
 }
@@ -64,6 +64,12 @@ type KeyAccessList = Vec<(KeyId, SingleKeyAccess)>;
 
 type KeyLockMap = HashMap<Vec<u8>, KeyLockState>;
 type ActiveLeaseMap = HashMap<TxId, ActiveLease>;
+
+#[derive(Debug, Default)]
+struct ShardAdmission {
+    queue: Mutex<VecDeque<TxId>>,
+    waiters: Condvar,
+}
 
 #[derive(Debug, Default)]
 struct KeyLockState {
@@ -182,7 +188,7 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
 
         for shard in unique_shards {
             if let Some(queue_handle) = self.shard_queue_handle_if_exists(shard)? {
-                let queue = queue_handle.lock().map_err(|_| {
+                let queue = queue_handle.queue.lock().map_err(|_| {
                     DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
                 })?;
                 if !queue.is_empty() {
@@ -207,20 +213,19 @@ impl InMemoryTransactionScheduler {
         let mut reserved_shards = Vec::with_capacity(shards.len());
         for shard in shards {
             let queue_handle = self.shard_queue_handle(*shard)?;
-            let mut queue = queue_handle.lock().map_err(|_| {
+            let mut queue = queue_handle.queue.lock().map_err(|_| {
                 DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
             })?;
-
-            // Unit-level model: a queued transaction is considered "active". If queue is non-empty,
-            // next transaction must retry later instead of running immediately.
-            if !queue.is_empty() {
-                drop(queue);
-                self.release_shard_reservations(txid, &reserved_shards)?;
-                return Err(DflyError::InvalidState("shard queue is busy"));
-            }
-
             queue.push_back(txid);
             reserved_shards.push(*shard);
+
+            // Queue admission mirrors Dragonfly's shard-serial execution idea:
+            // each transaction waits until it reaches the shard queue head.
+            while queue.front().copied() != Some(txid) {
+                queue = queue_handle.waiters.wait(queue).map_err(|_| {
+                    DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
+                })?;
+            }
         }
         Ok(reserved_shards)
     }
@@ -337,30 +342,36 @@ impl InMemoryTransactionScheduler {
             let Some(queue_handle) = self.shard_queue_handle_if_exists(*shard)? else {
                 continue;
             };
-            let mut queue = queue_handle.lock().map_err(|_| {
+            let mut queue = queue_handle.queue.lock().map_err(|_| {
                 DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
             })?;
+            let mut removed = false;
             if let Some(position) = queue.iter().position(|queued_txid| *queued_txid == txid) {
                 let _ = queue.remove(position);
+                removed = true;
+            }
+            drop(queue);
+            if removed {
+                queue_handle.waiters.notify_all();
             }
         }
         Ok(())
     }
 
-    fn shard_queue_handle(&self, shard: ShardId) -> DflyResult<Arc<Mutex<VecDeque<TxId>>>> {
+    fn shard_queue_handle(&self, shard: ShardId) -> DflyResult<Arc<ShardAdmission>> {
         let mut shard_queues = self.shard_queues.lock().map_err(|_| {
             DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
         })?;
         Ok(shard_queues
             .entry(shard)
-            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+            .or_insert_with(|| Arc::new(ShardAdmission::default()))
             .clone())
     }
 
     fn shard_queue_handle_if_exists(
         &self,
         shard: ShardId,
-    ) -> DflyResult<Option<Arc<Mutex<VecDeque<TxId>>>>> {
+    ) -> DflyResult<Option<Arc<ShardAdmission>>> {
         let shard_queues = self.shard_queues.lock().map_err(|_| {
             DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
         })?;
@@ -554,6 +565,9 @@ mod tests {
     use dfly_core::command::CommandFrame;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[rstest]
     fn scheduler_rejects_empty_hops() {
@@ -757,7 +771,7 @@ mod tests {
 
     #[rstest]
     fn scheduler_blocks_busy_shard_until_transaction_concludes() {
-        let scheduler = InMemoryTransactionScheduler::default();
+        let scheduler = Arc::new(InMemoryTransactionScheduler::default());
         let first = TransactionPlan {
             txid: 10,
             mode: TransactionMode::LockAhead,
@@ -782,10 +796,47 @@ mod tests {
         };
 
         assert_that!(scheduler.schedule(&first).is_ok(), eq(true));
-        assert_that!(scheduler.schedule(&second).is_err(), eq(true));
 
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_plan = second.clone();
+        let worker = thread::spawn(move || {
+            let _ = done_tx.send(worker_scheduler.schedule(&worker_plan));
+        });
+
+        // Wait until second transaction is actually queued behind the first one.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let Some(queue_handle) = scheduler
+                .shard_queue_handle_if_exists(0)
+                .expect("scheduler queue lookup should not fail")
+            else {
+                panic!("expected scheduler shard queue to exist");
+            };
+            let queue = queue_handle
+                .queue
+                .lock()
+                .expect("scheduler shard queue lock should not fail");
+            let waiting = queue.front() == Some(&first.txid)
+                && queue.iter().any(|queued_txid| *queued_txid == second.txid);
+            drop(queue);
+            if waiting {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second transaction was not queued in time"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_that!(done_rx.try_recv().is_err(), eq(true));
         assert_that!(scheduler.conclude(first.txid).is_ok(), eq(true));
-        assert_that!(scheduler.schedule(&second).is_ok(), eq(true));
+        let second_result = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("blocked scheduler call should finish after conclude");
+        assert_that!(second_result.is_ok(), eq(true));
+        worker.join().expect("worker thread should join");
     }
 
     #[rstest]
@@ -796,7 +847,7 @@ mod tests {
 
     #[rstest]
     fn scheduler_global_mode_reserves_full_runtime_shard_footprint() {
-        let scheduler = InMemoryTransactionScheduler::default();
+        let scheduler = Arc::new(InMemoryTransactionScheduler::default());
         let global = TransactionPlan {
             txid: 20,
             mode: TransactionMode::Global,
@@ -829,9 +880,48 @@ mod tests {
         };
 
         assert_that!(scheduler.schedule(&global).is_ok(), eq(true));
-        assert_that!(scheduler.schedule(&shard_one_writer).is_err(), eq(true));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_plan = shard_one_writer.clone();
+        let worker = thread::spawn(move || {
+            let _ = done_tx.send(worker_scheduler.schedule(&worker_plan));
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let Some(queue_handle) = scheduler
+                .shard_queue_handle_if_exists(1)
+                .expect("scheduler queue lookup should not fail")
+            else {
+                panic!("expected scheduler shard queue to exist");
+            };
+            let queue = queue_handle
+                .queue
+                .lock()
+                .expect("scheduler shard queue lock should not fail");
+            let waiting = queue.front() == Some(&global.txid)
+                && queue
+                    .iter()
+                    .any(|queued_txid| *queued_txid == shard_one_writer.txid);
+            drop(queue);
+            if waiting {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second transaction was not queued in time"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_that!(done_rx.try_recv().is_err(), eq(true));
         assert_that!(scheduler.conclude(global.txid).is_ok(), eq(true));
-        assert_that!(scheduler.schedule(&shard_one_writer).is_ok(), eq(true));
+        let second_result = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("blocked scheduler call should finish after conclude");
+        assert_that!(second_result.is_ok(), eq(true));
+        worker.join().expect("worker thread should join");
     }
 
     #[rstest]
