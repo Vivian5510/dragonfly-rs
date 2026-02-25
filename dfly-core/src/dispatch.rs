@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dfly_cluster::slot::key_slot;
 use dfly_common::ids::{DbIndex, MAX_SLOT_ID};
-use hashbrown::{HashMap, HashSet};
 
 use crate::command::{CommandFrame, CommandReply};
+use crate::containers::{HotMap as HashMap, HotSet as HashSet};
 
 /// Handler function signature used by command registry entries.
 pub type CommandHandler = fn(DbIndex, &CommandFrame, &mut DispatchState) -> CommandReply;

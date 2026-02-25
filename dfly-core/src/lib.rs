@@ -1,6 +1,7 @@
 //! Core runtime abstractions shared by transaction, storage, and facade layers.
 
 pub mod command;
+pub mod containers;
 pub mod dispatch;
 pub mod runtime;
 pub mod sharding;

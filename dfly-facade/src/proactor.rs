@@ -21,13 +21,13 @@ enum ParseRequest {
     Detached {
         sequence: u64,
         parser: ConnectionState,
-        bytes: Vec<u8>,
+        bytes: PooledBytes,
     },
     Bound {
         sequence: u64,
         connection_id: u64,
         context: Option<ConnectionContext>,
-        bytes: Vec<u8>,
+        bytes: PooledBytes,
     },
     Release {
         sequence: u64,
@@ -48,6 +48,86 @@ struct IoWorkerQueueMetrics {
 struct IoWorkerQueueState {
     gate: Mutex<()>,
     changed: Condvar,
+}
+
+#[derive(Debug)]
+struct IoWorkerBufferPool {
+    recycled: Mutex<Vec<Vec<u8>>>,
+    max_cached_buffers: usize,
+}
+
+impl Default for IoWorkerBufferPool {
+    fn default() -> Self {
+        Self {
+            recycled: Mutex::new(Vec::new()),
+            max_cached_buffers: 64,
+        }
+    }
+}
+
+impl IoWorkerBufferPool {
+    fn acquire(&self, min_capacity: usize) -> Vec<u8> {
+        let mut recycled = self
+            .recycled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(mut buffer) = recycled.pop() {
+            if buffer.capacity() >= min_capacity {
+                buffer.clear();
+                return buffer;
+            }
+        }
+        Vec::with_capacity(min_capacity)
+    }
+
+    fn recycle(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let mut recycled = self
+            .recycled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recycled.len() >= self.max_cached_buffers {
+            return;
+        }
+        recycled.push(buffer);
+    }
+
+    #[cfg(test)]
+    fn cached_count(&self) -> usize {
+        self.recycled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[derive(Debug)]
+struct PooledBytes {
+    bytes: Vec<u8>,
+    pool: Arc<IoWorkerBufferPool>,
+}
+
+impl PooledBytes {
+    fn from_slice(pool: Arc<IoWorkerBufferPool>, input: &[u8]) -> Self {
+        let mut bytes = pool.acquire(input.len());
+        bytes.extend_from_slice(input);
+        Self { bytes, pool }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for PooledBytes {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.pool.recycle(bytes);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +191,7 @@ pub struct ProactorPool {
     senders: Vec<mpsc::UnboundedSender<ParseRequest>>,
     queue_metrics_per_worker: Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: Arc<Vec<IoWorkerQueueState>>,
+    buffer_pool_per_worker: Arc<Vec<Arc<IoWorkerBufferPool>>>,
     completion_per_worker: Arc<Vec<IoWorkerCompletionState>>,
     submitted_sequence_per_worker: Vec<Mutex<u64>>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -139,6 +220,7 @@ impl std::fmt::Debug for ProactorPool {
                 &self.queue_metrics_per_worker.len(),
             )
             .field("queue_state_per_worker", &self.queue_state_per_worker.len())
+            .field("buffer_pool_per_worker", &self.buffer_pool_per_worker.len())
             .field("completion_per_worker", &self.completion_per_worker.len())
             .field(
                 "submitted_sequence_per_worker",
@@ -174,6 +256,11 @@ impl ProactorPool {
         let queue_state_per_worker = Arc::new(
             (0..worker_len)
                 .map(|_| IoWorkerQueueState::default())
+                .collect::<Vec<_>>(),
+        );
+        let buffer_pool_per_worker = Arc::new(
+            (0..worker_len)
+                .map(|_| Arc::new(IoWorkerBufferPool::default()))
                 .collect::<Vec<_>>(),
         );
         let completion_per_worker = Arc::new(
@@ -212,6 +299,7 @@ impl ProactorPool {
             senders,
             queue_metrics_per_worker,
             queue_state_per_worker,
+            buffer_pool_per_worker,
             completion_per_worker,
             submitted_sequence_per_worker,
             workers,
@@ -312,12 +400,14 @@ impl ProactorPool {
         parser: ConnectionState,
         bytes: &[u8],
     ) -> DflyResult<ProactorParseBatch> {
+        let bytes = self.allocate_request_bytes(io_worker, bytes)?;
+        let request_bytes = bytes.len();
         let request = ParseRequest::Detached {
             sequence: 0,
             parser,
-            bytes: bytes.to_vec(),
+            bytes,
         };
-        let sequence = self.submit_parse_request(io_worker, request, bytes.len())?;
+        let sequence = self.submit_parse_request(io_worker, request, request_bytes)?;
         match self.wait_for_parse_completion(io_worker, sequence)? {
             ProactorParseCompletion::Detached(reply) => Ok(reply),
             ProactorParseCompletion::Bound(_) | ProactorParseCompletion::Released => Err(
@@ -341,13 +431,15 @@ impl ProactorPool {
         context: &ConnectionContext,
         bytes: &[u8],
     ) -> DflyResult<ProactorBoundParseBatch> {
+        let bytes = self.allocate_request_bytes(affinity.io_worker, bytes)?;
+        let request_bytes = bytes.len();
         let request = ParseRequest::Bound {
             sequence: 0,
             connection_id: affinity.connection_id,
             context: Some(context.clone()),
-            bytes: bytes.to_vec(),
+            bytes,
         };
-        let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
+        let sequence = self.submit_parse_request(affinity.io_worker, request, request_bytes)?;
         match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
             ProactorParseCompletion::Bound(reply) => Ok(reply),
             ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Released => Err(
@@ -370,13 +462,15 @@ impl ProactorPool {
         affinity: ConnectionAffinity,
         bytes: &[u8],
     ) -> DflyResult<ProactorBoundParseBatch> {
+        let bytes = self.allocate_request_bytes(affinity.io_worker, bytes)?;
+        let request_bytes = bytes.len();
         let request = ParseRequest::Bound {
             sequence: 0,
             connection_id: affinity.connection_id,
             context: None,
-            bytes: bytes.to_vec(),
+            bytes,
         };
-        let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
+        let sequence = self.submit_parse_request(affinity.io_worker, request, request_bytes)?;
         match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
             ProactorParseCompletion::Bound(reply) => Ok(reply),
             ProactorParseCompletion::Detached(_) | ProactorParseCompletion::Released => Err(
@@ -403,6 +497,13 @@ impl ProactorPool {
                 DflyError::InvalidState("io worker completion type mismatch"),
             ),
         }
+    }
+
+    fn allocate_request_bytes(&self, io_worker: u16, bytes: &[u8]) -> DflyResult<PooledBytes> {
+        let Some(pool) = self.buffer_pool_per_worker.get(usize::from(io_worker)) else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
+        Ok(PooledBytes::from_slice(Arc::clone(pool), bytes))
     }
 
     fn submit_parse_request(
@@ -534,6 +635,13 @@ impl ProactorPool {
                 "io worker completion for sequence is missing",
             ))
     }
+
+    #[cfg(test)]
+    fn pooled_request_buffer_count(&self, io_worker: u16) -> usize {
+        self.buffer_pool_per_worker
+            .get(usize::from(io_worker))
+            .map_or(0, |pool| pool.cached_count())
+    }
 }
 
 impl Drop for ProactorPool {
@@ -627,7 +735,7 @@ fn handle_parse_request(
             bytes,
         } => {
             let request_bytes = bytes.len();
-            parser.feed_bytes(&bytes);
+            parser.feed_bytes(bytes.as_slice());
             let (commands, parse_error) = drain_commands(&mut parser);
             finalize_parse_request(
                 io_worker,
@@ -681,7 +789,7 @@ fn handle_parse_request(
                     entry.insert(ConnectionState::new(context))
                 }
             };
-            parser.feed_bytes(&bytes);
+            parser.feed_bytes(bytes.as_slice());
             let (commands, parse_error) = drain_commands(parser);
             finalize_parse_request(
                 io_worker,
@@ -999,5 +1107,24 @@ mod tests {
                 .expect("blocked submitters should be available"),
             eq(0_usize)
         );
+    }
+
+    #[rstest]
+    fn proactor_pool_recycles_request_buffers_per_worker() {
+        let pool = ProactorPool::new(1);
+        let before = pool.pooled_request_buffer_count(0);
+        assert_that!(before, eq(0_usize));
+
+        let _ = pool
+            .parse_on_worker(0, resp_parser(), b"*1\r\n$4\r\nPING\r\n")
+            .expect("first parse should succeed");
+        let after_first = pool.pooled_request_buffer_count(0);
+        assert_that!(after_first >= 1, eq(true));
+
+        let _ = pool
+            .parse_on_worker(0, resp_parser(), b"*1\r\n$4\r\nPING\r\n")
+            .expect("second parse should succeed");
+        let after_second = pool.pooled_request_buffer_count(0);
+        assert_that!(after_second >= 1, eq(true));
     }
 }
