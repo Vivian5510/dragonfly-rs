@@ -569,7 +569,7 @@ impl CoreModule {
                         shard,
                         db: *db,
                         key: key.clone(),
-                        value: value_entry.value.clone(),
+                        value: value_entry.clone_string_bytes(),
                         expire_at_unix_secs: value_entry.expire_at_unix_secs,
                     });
                 }

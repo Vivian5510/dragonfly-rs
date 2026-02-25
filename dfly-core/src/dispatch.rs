@@ -195,12 +195,81 @@ pub struct DispatchState {
 }
 
 /// Stored value with optional expiration metadata.
+///
+/// The storage layer intentionally models value payload as an enum even when only
+/// string is implemented. This keeps dispatch/container shape extensible for future
+/// Dragonfly data types without changing `prime` table entry ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredValue {
+    /// Redis string payload stored in compact exact-sized buffer.
+    String(Box<[u8]>),
+}
+
+impl StoredValue {
+    #[must_use]
+    fn string_len(&self) -> usize {
+        match self {
+            Self::String(payload) => payload.len(),
+        }
+    }
+
+    #[must_use]
+    fn string_bytes(&self) -> &[u8] {
+        match self {
+            Self::String(payload) => payload.as_ref(),
+        }
+    }
+
+    #[must_use]
+    fn clone_string_bytes(&self) -> Vec<u8> {
+        self.string_bytes().to_vec()
+    }
+
+    #[must_use]
+    fn into_string_bytes(self) -> Vec<u8> {
+        match self {
+            Self::String(payload) => payload.into_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One prime-table value record with typed payload and optional expiry.
 pub struct ValueEntry {
     /// User payload.
-    pub value: Vec<u8>,
+    pub value: StoredValue,
     /// Unix timestamp in seconds when the key expires.
     pub expire_at_unix_secs: Option<u64>,
+}
+
+impl ValueEntry {
+    #[must_use]
+    fn new_string(value: Vec<u8>, expire_at_unix_secs: Option<u64>) -> Self {
+        Self {
+            value: StoredValue::String(value.into_boxed_slice()),
+            expire_at_unix_secs,
+        }
+    }
+
+    #[must_use]
+    fn string_len(&self) -> usize {
+        self.value.string_len()
+    }
+
+    #[must_use]
+    fn string_bytes(&self) -> &[u8] {
+        self.value.string_bytes()
+    }
+
+    #[must_use]
+    pub(crate) fn clone_string_bytes(&self) -> Vec<u8> {
+        self.value.clone_string_bytes()
+    }
+
+    #[must_use]
+    fn into_string_bytes(self) -> Vec<u8> {
+        self.value.into_string_bytes()
+    }
 }
 
 impl DispatchState {
@@ -289,7 +358,7 @@ impl DispatchState {
     }
 
     fn slot_payload_bytes(key: &[u8], entry: &ValueEntry) -> usize {
-        key.len().saturating_add(entry.value.len())
+        key.len().saturating_add(entry.string_len())
     }
 
     fn account_upsert_slot_memory(
@@ -338,7 +407,7 @@ impl DispatchState {
     fn upsert_key(&mut self, db: DbIndex, key: &[u8], value: ValueEntry) -> Option<ValueEntry> {
         let key_bytes = key.to_vec();
         let expire_at = value.expire_at_unix_secs;
-        let next_value_len = value.value.len();
+        let next_value_len = value.string_len();
         let table = self.db_table_mut(db);
         let previous = table.prime.insert(key_bytes.clone(), value);
         Self::update_expire_index(table, key, expire_at);
@@ -535,10 +604,7 @@ impl DispatchState {
         let table = self.db_table_mut(db);
         let previous = table.prime.insert(
             key.to_vec(),
-            ValueEntry {
-                value,
-                expire_at_unix_secs,
-            },
+            ValueEntry::new_string(value, expire_at_unix_secs),
         );
         Self::update_expire_index(table, key, expire_at_unix_secs);
         Self::increment_slot_stat(table, key);
@@ -1023,7 +1089,7 @@ fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
 
     let existing = state.db_map(db).and_then(|map| map.get(&key)).cloned();
     let key_exists = existing.is_some();
-    let previous_value = existing.as_ref().map(|entry| entry.value.clone());
+    let previous_value = existing.as_ref().map(ValueEntry::clone_string_bytes);
     let previous_expire_at = existing.and_then(|entry| entry.expire_at_unix_secs);
 
     if !set_condition_satisfied(options.condition, key_exists) {
@@ -1041,14 +1107,7 @@ fn handle_set(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
         None
     };
 
-    let _ = state.upsert_key(
-        db,
-        &key,
-        ValueEntry {
-            value,
-            expire_at_unix_secs,
-        },
-    );
+    let _ = state.upsert_key(db, &key, ValueEntry::new_string(value, expire_at_unix_secs));
     state.bump_key_version(db, &key);
 
     if options.return_previous {
@@ -1067,14 +1126,7 @@ fn handle_setnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
         return CommandReply::Integer(0);
     }
 
-    let _ = state.upsert_key(
-        db,
-        &key,
-        ValueEntry {
-            value,
-            expire_at_unix_secs: None,
-        },
-    );
+    let _ = state.upsert_key(db, &key, ValueEntry::new_string(value, None));
     state.bump_key_version(db, &key);
     CommandReply::Integer(1)
 }
@@ -1086,7 +1138,7 @@ fn handle_mget(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
         let value = if let Some(value) = state
             .db_map(db)
             .and_then(|map| map.get(key))
-            .map(|entry| entry.value.clone())
+            .map(ValueEntry::clone_string_bytes)
         {
             if let Some(table) = state.db_tables.get_mut(&db) {
                 DispatchState::increment_slot_read_stat(table, key);
@@ -1109,14 +1161,7 @@ fn handle_mset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
         let key = pair[0].clone();
         let value = pair[1].clone();
         state.purge_expired_key(db, &key);
-        let _ = state.upsert_key(
-            db,
-            &key,
-            ValueEntry {
-                value,
-                expire_at_unix_secs: None,
-            },
-        );
+        let _ = state.upsert_key(db, &key, ValueEntry::new_string(value, None));
         state.bump_key_version(db, &key);
     }
     CommandReply::SimpleString("OK".to_owned())
@@ -1138,14 +1183,7 @@ fn handle_msetnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     for pair in frame.args.chunks_exact(2) {
         let key = pair[0].clone();
         let value = pair[1].clone();
-        let _ = state.upsert_key(
-            db,
-            &key,
-            ValueEntry {
-                value,
-                expire_at_unix_secs: None,
-            },
-        );
+        let _ = state.upsert_key(db, &key, ValueEntry::new_string(value, None));
         state.bump_key_version(db, &key);
     }
     CommandReply::Integer(1)
@@ -1157,7 +1195,7 @@ fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> C
     match state
         .db_map(db)
         .and_then(|map| map.get(key))
-        .map(|entry| entry.value.clone())
+        .map(ValueEntry::clone_string_bytes)
     {
         Some(value) => {
             if let Some(table) = state.db_tables.get_mut(&db) {
@@ -1189,16 +1227,9 @@ fn handle_getset(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let previous = state
         .db_map(db)
         .and_then(|map| map.get(&key))
-        .map(|entry| entry.value.clone());
+        .map(ValueEntry::clone_string_bytes);
 
-    let _ = state.upsert_key(
-        db,
-        &key,
-        ValueEntry {
-            value: next_value,
-            expire_at_unix_secs: None,
-        },
-    );
+    let _ = state.upsert_key(db, &key, ValueEntry::new_string(next_value, None));
     state.bump_key_version(db, &key);
 
     previous.map_or(CommandReply::Null, CommandReply::BulkString)
@@ -1211,7 +1242,7 @@ fn handle_getdel(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let removed = state.remove_key(db, key);
     if let Some(entry) = removed {
         state.bump_key_version(db, key);
-        return CommandReply::BulkString(entry.value);
+        return CommandReply::BulkString(entry.into_string_bytes());
     }
     CommandReply::Null
 }
@@ -1223,7 +1254,7 @@ fn handle_append(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
 
     let (mut value, expire_at_unix_secs) =
         if let Some(existing) = state.db_map(db).and_then(|map| map.get(&key)) {
-            (existing.value.clone(), existing.expire_at_unix_secs)
+            (existing.clone_string_bytes(), existing.expire_at_unix_secs)
         } else {
             (Vec::new(), None)
         };
@@ -1232,10 +1263,7 @@ fn handle_append(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let _ = state.upsert_key(
         db,
         &key,
-        ValueEntry {
-            value: value.clone(),
-            expire_at_unix_secs,
-        },
+        ValueEntry::new_string(value.clone(), expire_at_unix_secs),
     );
     state.bump_key_version(db, &key);
     CommandReply::Integer(i64::try_from(value.len()).unwrap_or(i64::MAX))
@@ -1247,7 +1275,7 @@ fn handle_strlen(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let length = if let Some(length) = state
         .db_map(db)
         .and_then(|map| map.get(key))
-        .map(|entry| entry.value.len())
+        .map(ValueEntry::string_len)
     {
         if let Some(table) = state.db_tables.get_mut(&db) {
             DispatchState::increment_slot_read_stat(table, key);
@@ -1273,7 +1301,7 @@ fn handle_getrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
     let Some(value) = state
         .db_map(db)
         .and_then(|map| map.get(key))
-        .map(|entry| entry.value.clone())
+        .map(ValueEntry::clone_string_bytes)
     else {
         return CommandReply::BulkString(Vec::new());
     };
@@ -1300,7 +1328,7 @@ fn handle_setrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
 
     let (mut value, expire_at_unix_secs) =
         if let Some(existing) = state.db_map(db).and_then(|map| map.get(&key)) {
-            (existing.value.clone(), existing.expire_at_unix_secs)
+            (existing.clone_string_bytes(), existing.expire_at_unix_secs)
         } else {
             (Vec::new(), None)
         };
@@ -1321,10 +1349,7 @@ fn handle_setrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
     let _ = state.upsert_key(
         db,
         &key,
-        ValueEntry {
-            value: value.clone(),
-            expire_at_unix_secs,
-        },
+        ValueEntry::new_string(value.clone(), expire_at_unix_secs),
     );
     state.bump_key_version(db, &key);
     CommandReply::Integer(i64::try_from(value.len()).unwrap_or(i64::MAX))
@@ -1628,10 +1653,7 @@ fn handle_setex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) ->
     let _ = state.upsert_key(
         db,
         &key,
-        ValueEntry {
-            value: frame.args[2].clone(),
-            expire_at_unix_secs: Some(expire_at),
-        },
+        ValueEntry::new_string(frame.args[2].clone(), Some(expire_at)),
     );
     state.bump_key_version(db, &key);
     CommandReply::SimpleString("OK".to_owned())
@@ -1655,10 +1677,7 @@ fn handle_psetex(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     let _ = state.upsert_key(
         db,
         &key,
-        ValueEntry {
-            value: frame.args[2].clone(),
-            expire_at_unix_secs: Some(expire_at_secs),
-        },
+        ValueEntry::new_string(frame.args[2].clone(), Some(expire_at_secs)),
     );
     state.bump_key_version(db, &key);
     CommandReply::SimpleString("OK".to_owned())
@@ -2011,7 +2030,7 @@ fn mutate_counter_by(
 
     let (current, expire_at_unix_secs) =
         if let Some(existing) = state.db_map(db).and_then(|map| map.get(key)) {
-            let Ok(current) = parse_redis_i64(&existing.value) else {
+            let Ok(current) = parse_redis_i64(existing.string_bytes()) else {
                 return CommandReply::Error("value is not an integer or out of range".to_owned());
             };
             (current, existing.expire_at_unix_secs)
@@ -2026,10 +2045,7 @@ fn mutate_counter_by(
     let _ = state.upsert_key(
         db,
         key,
-        ValueEntry {
-            value: next.to_string().into_bytes(),
-            expire_at_unix_secs,
-        },
+        ValueEntry::new_string(next.to_string().into_bytes(), expire_at_unix_secs),
     );
     state.bump_key_version(db, key);
     CommandReply::Integer(next)
