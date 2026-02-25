@@ -29,6 +29,7 @@ use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use dfly_transaction::session::TransactionSession;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const ACTIVE_EXPIRE_KEYS_PER_TICK: usize = 64;
@@ -63,6 +64,75 @@ pub struct ServerApp {
     next_txid: TxId,
     /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
     next_implicit_replica_id: u64,
+}
+
+/// Thread-safe execution handle used by I/O workers.
+#[derive(Clone, Debug)]
+pub struct AppExecutor {
+    app: Arc<Mutex<ServerApp>>,
+}
+
+impl AppExecutor {
+    /// Wraps one server app instance with shared synchronization for worker threads.
+    #[must_use]
+    pub fn new(app: ServerApp) -> Self {
+        Self {
+            app: Arc::new(Mutex::new(app)),
+        }
+    }
+
+    fn lock_app(&self) -> std::sync::MutexGuard<'_, ServerApp> {
+        self.app
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Executes one parsed command while holding the shared app mutex.
+    pub fn execute_parsed_command_deferred(
+        &self,
+        connection: &mut ServerConnection,
+        parsed: ParsedCommand,
+    ) -> ParsedCommandExecution {
+        let mut app = self.lock_app();
+        app.execute_parsed_command_deferred(connection, parsed)
+    }
+
+    /// Checks whether one deferred runtime reply is ready.
+    pub fn runtime_reply_ticket_ready(&self, ticket: &RuntimeReplyTicket) -> DflyResult<bool> {
+        let app = self.lock_app();
+        app.runtime_reply_ticket_ready(ticket)
+    }
+
+    /// Takes one deferred runtime reply and encodes it for client protocol.
+    pub fn take_runtime_reply_ticket(&self, ticket: &RuntimeReplyTicket) -> DflyResult<Vec<u8>> {
+        let app = self.lock_app();
+        app.take_runtime_reply_ticket(ticket)
+    }
+
+    /// Runs disconnect cleanup for one connection-owned replica endpoint.
+    pub fn disconnect_connection(&self, connection: &mut ServerConnection) {
+        let mut app = self.lock_app();
+        app.disconnect_connection(connection);
+    }
+
+    /// Returns server startup summary from the shared app instance.
+    #[must_use]
+    pub fn startup_summary(&self) -> String {
+        let app = self.lock_app();
+        app.startup_summary()
+    }
+
+    /// Runs one mutable closure against the underlying app under synchronization.
+    pub fn with_app_mut<R>(&self, f: impl FnOnce(&mut ServerApp) -> R) -> R {
+        let mut app = self.lock_app();
+        f(&mut app)
+    }
+
+    /// Runs one read-only closure against the underlying app under synchronization.
+    pub fn with_app<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
+        let app = self.lock_app();
+        f(&app)
+    }
 }
 
 impl ServerApp {
@@ -2204,16 +2274,20 @@ pub fn run() -> DflyResult<()> {
     let memcache_bind_addr = config
         .memcached_port
         .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
-    let mut app = ServerApp::new(config);
+    let app = AppExecutor::new(ServerApp::new(config));
 
     // Keep subsystem initialization paths exercised in regular server startup.
-    let snapshot = app.create_snapshot_bytes()?;
-    app.load_snapshot_bytes(&snapshot)?;
-    let _ = app.recover_from_replication_journal()?;
-    let _ = app.recover_from_replication_journal_from_lsn(app.replication.journal_lsn())?;
+    app.with_app_mut(|server| -> DflyResult<()> {
+        let snapshot = server.create_snapshot_bytes()?;
+        server.load_snapshot_bytes(&snapshot)?;
+        let _ = server.recover_from_replication_journal()?;
+        let _ =
+            server.recover_from_replication_journal_from_lsn(server.replication.journal_lsn())?;
+        Ok(())
+    })?;
 
     let reactor_config = ServerReactorConfig {
-        io_worker_count: usize::from(app.facade.io_thread_count),
+        io_worker_count: app.with_app(|server| usize::from(server.facade.io_thread_count)),
         ..ServerReactorConfig::default()
     };
     let mut reactor = if let Some(memcache_bind_addr) = memcache_bind_addr {
@@ -2221,13 +2295,14 @@ pub fn run() -> DflyResult<()> {
             redis_bind_addr,
             Some(memcache_bind_addr),
             reactor_config,
+            &app,
         )?
     } else {
-        ThreadedServerReactor::bind(redis_bind_addr, reactor_config)?
+        ThreadedServerReactor::bind(redis_bind_addr, reactor_config, &app)?
     };
     println!("{}", app.startup_summary());
     loop {
-        let _ = reactor.poll_once(&mut app, Some(Duration::from_millis(10)))?;
+        let _ = reactor.poll_once(Some(Duration::from_millis(10)))?;
     }
 }
 
