@@ -37,18 +37,23 @@ impl ServerReactorConfig {
         self.max_events.max(64)
     }
 
-    #[must_use]
-    pub fn normalized_backpressure_watermarks(self) -> (usize, usize) {
-        let high = self
-            .write_high_watermark_bytes
-            .max(DEFAULT_WRITE_HIGH_WATERMARK_BYTES);
-        let mut low = self
-            .write_low_watermark_bytes
-            .max(DEFAULT_WRITE_LOW_WATERMARK_BYTES);
+    pub fn normalized_backpressure_watermarks(self) -> DflyResult<(usize, usize)> {
+        let high = if self.write_high_watermark_bytes == 0 {
+            DEFAULT_WRITE_HIGH_WATERMARK_BYTES
+        } else {
+            self.write_high_watermark_bytes
+        };
+        let low = if self.write_low_watermark_bytes == 0 {
+            DEFAULT_WRITE_LOW_WATERMARK_BYTES
+        } else {
+            self.write_low_watermark_bytes
+        };
         if low >= high {
-            low = high.saturating_sub(1);
+            return Err(DflyError::InvalidConfig(
+                "backpressure low watermark must be smaller than high watermark",
+            ));
         }
-        (high, low)
+        Ok((high, low))
     }
 }
 
@@ -216,7 +221,7 @@ impl ServerReactor {
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
         let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
         let (write_high_watermark, write_low_watermark) =
-            config.normalized_backpressure_watermarks();
+            config.normalized_backpressure_watermarks()?;
 
         let mut resp_listener = TcpListener::bind(resp_addr)
             .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
@@ -711,5 +716,36 @@ mod tests {
         assert_that!(connection.read_paused_by_backpressure, eq(true));
         assert_that!(connection.lifecycle, eq(ConnectionLifecycle::Active));
         assert_that!(connection.write_buffer.is_empty(), eq(false));
+    }
+
+    #[rstest]
+    fn reactor_config_accepts_small_custom_backpressure_values() {
+        let config = ServerReactorConfig {
+            max_events: 64,
+            write_high_watermark_bytes: 512,
+            write_low_watermark_bytes: 128,
+        };
+        let watermarks = config
+            .normalized_backpressure_watermarks()
+            .expect("custom backpressure values should be accepted");
+
+        assert_that!(&watermarks, eq(&(512_usize, 128_usize)));
+    }
+
+    #[rstest]
+    fn reactor_config_rejects_non_increasing_backpressure_values() {
+        let config = ServerReactorConfig {
+            max_events: 64,
+            write_high_watermark_bytes: 256,
+            write_low_watermark_bytes: 256,
+        };
+        let error = config
+            .normalized_backpressure_watermarks()
+            .expect_err("low >= high should be rejected");
+
+        assert_that!(
+            format!("{error}").contains("low watermark must be smaller than high watermark"),
+            eq(true)
+        );
     }
 }
