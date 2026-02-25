@@ -17,7 +17,7 @@ use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::ConnectionContext;
 use dfly_facade::proactor::ConnectionAffinity;
-use dfly_facade::protocol::{ClientProtocol, ParseStatus, parse_next_command};
+use dfly_facade::protocol::{ClientProtocol, ParseStatus, ParsedCommand, parse_next_command};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
 use dfly_replication::state::{FlowSyncType, SyncSessionError};
@@ -281,75 +281,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
         let mut responses = Vec::new();
         for parsed in parsed_commands {
-            // Protocol parser has already normalized command shape, so dispatcher can operate
-            // on a stable frame independent from socket/wire details.
-            let frame = CommandFrame::new(parsed.name, parsed.args);
-
-            // Redis `MULTI/EXEC/DISCARD` is connection-scoped control flow and is handled
-            // before core command execution, matching Dragonfly's high-level transaction entry.
-            if connection.context.protocol == ClientProtocol::Resp {
-                if let Some(select_reply) = Self::handle_resp_select(connection, &frame) {
-                    responses.push(select_reply);
-                    continue;
-                }
-
-                if let Some(transaction_reply) =
-                    self.handle_resp_transaction_control(connection, &frame)
-                {
-                    responses.push(transaction_reply);
-                    continue;
-                }
-
-                if connection.transaction.in_multi() {
-                    match self.validate_queued_command(&frame) {
-                        Ok(()) => {
-                            let queued = connection.transaction.queue_command(frame);
-                            if queued {
-                                responses.push(
-                                    CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes(),
-                                );
-                            } else {
-                                responses.push(
-                                    CommandReply::Error(
-                                        "transaction queue is unavailable".to_owned(),
-                                    )
-                                    .to_resp_bytes(),
-                                );
-                            }
-                        }
-                        Err(message) => {
-                            connection.transaction.mark_queued_error();
-                            responses.push(CommandReply::Error(message).to_resp_bytes());
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            if frame.name == "REPLCONF" {
-                let reply = self.execute_replconf(connection, &frame);
-                if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
-                    // Dragonfly does not interleave ACK replies with journal stream writes.
-                    // We model the same behavior by consuming successful ACK silently.
-                    continue;
-                }
-                let encoded = encode_reply_for_protocol(connection.context.protocol, &frame, reply);
+            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
                 responses.push(encoded);
-                continue;
             }
-
-            let db = connection.context.db_index;
-            let reply = self.execute_user_command(db, &frame, None);
-            if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
-                // Dragonfly does not interleave ACK replies with journal stream writes.
-                // We model the same behavior by consuming successful ACK silently.
-                continue;
-            }
-
-            // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
-            // where execution result is translated back to client protocol right before writeback.
-            let encoded = encode_reply_for_protocol(connection.context.protocol, &frame, reply);
-            responses.push(encoded);
         }
 
         if let Some(error) = parse_error {
@@ -357,6 +291,78 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
 
         Ok(responses)
+    }
+
+    pub(crate) fn execute_parsed_command(
+        &mut self,
+        connection: &mut ServerConnection,
+        parsed: ParsedCommand,
+    ) -> Option<Vec<u8>> {
+        // Protocol parser has already normalized command shape, so dispatcher can operate
+        // on a stable frame independent from socket/wire details.
+        let frame = CommandFrame::new(parsed.name, parsed.args);
+
+        // Redis `MULTI/EXEC/DISCARD` is connection-scoped control flow and is handled
+        // before core command execution, matching Dragonfly's high-level transaction entry.
+        if connection.context.protocol == ClientProtocol::Resp {
+            if let Some(select_reply) = Self::handle_resp_select(connection, &frame) {
+                return Some(select_reply);
+            }
+
+            if let Some(transaction_reply) =
+                self.handle_resp_transaction_control(connection, &frame)
+            {
+                return Some(transaction_reply);
+            }
+
+            if connection.transaction.in_multi() {
+                return Some(match self.validate_queued_command(&frame) {
+                    Ok(()) => {
+                        let queued = connection.transaction.queue_command(frame);
+                        if queued {
+                            CommandReply::SimpleString("QUEUED".to_owned()).to_resp_bytes()
+                        } else {
+                            CommandReply::Error("transaction queue is unavailable".to_owned())
+                                .to_resp_bytes()
+                        }
+                    }
+                    Err(message) => {
+                        connection.transaction.mark_queued_error();
+                        CommandReply::Error(message).to_resp_bytes()
+                    }
+                });
+            }
+        }
+
+        if frame.name == "REPLCONF" {
+            let reply = self.execute_replconf(connection, &frame);
+            if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
+                // Dragonfly does not interleave ACK replies with journal stream writes.
+                // We model the same behavior by consuming successful ACK silently.
+                return None;
+            }
+            return Some(encode_reply_for_protocol(
+                connection.context.protocol,
+                &frame,
+                reply,
+            ));
+        }
+
+        let db = connection.context.db_index;
+        let reply = self.execute_user_command(db, &frame, None);
+        if is_replconf_ack_command(&frame) && !matches!(&reply, CommandReply::Error(_)) {
+            // Dragonfly does not interleave ACK replies with journal stream writes.
+            // We model the same behavior by consuming successful ACK silently.
+            return None;
+        }
+
+        // Unit 1 keeps protocol-specific encoding at the facade edge. This mirrors Dragonfly
+        // where execution result is translated back to client protocol right before writeback.
+        Some(encode_reply_for_protocol(
+            connection.context.protocol,
+            &frame,
+            reply,
+        ))
     }
 
     fn handle_resp_select(
@@ -2228,6 +2234,11 @@ pub fn run() -> DflyResult<()> {
         .memcached_port
         .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
     let mut app = ServerApp::new(config);
+    let mut bootstrap_connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    // Keep parser/proactor ingress path exercised by regular startup as a fallback path.
+    let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
+
     // Keep subsystem initialization paths exercised in regular server startup.
     let snapshot = app.create_snapshot_bytes()?;
     app.load_snapshot_bytes(&snapshot)?;
