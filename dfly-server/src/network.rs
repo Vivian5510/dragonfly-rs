@@ -440,6 +440,11 @@ impl ServerReactor {
                                     write_low_watermark,
                                 );
                             }
+                            if connection.read_paused_by_backpressure {
+                                // Once backpressure is armed we must stop draining socket bytes in
+                                // this readiness turn and leave remaining input in kernel buffers.
+                                return;
+                            }
                         }
                         Err(error) => {
                             connection
@@ -542,13 +547,14 @@ impl ServerReactor {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerReactor, ServerReactorConfig};
+    use super::{ConnectionLifecycle, ReactorConnection, ServerReactor, ServerReactorConfig};
     use crate::app::ServerApp;
     use dfly_common::config::RuntimeConfig;
+    use dfly_facade::protocol::ClientProtocol;
     use googletest::prelude::*;
     use rstest::rstest;
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
     #[rstest]
@@ -667,5 +673,43 @@ mod tests {
         }
 
         assert_that!(reactor.connection_count(), eq(0_usize));
+    }
+
+    #[rstest]
+    fn reactor_read_stops_same_cycle_after_backpressure_arms() {
+        let mut app = ServerApp::new(RuntimeConfig::default());
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("listener bind should succeed");
+        let listen_addr = listener
+            .local_addr()
+            .expect("listener must expose local addr");
+
+        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
+        let (server_stream, _) = listener.accept().expect("accept should succeed");
+        server_stream
+            .set_nonblocking(true)
+            .expect("accepted socket should be nonblocking");
+
+        let mut connection = ReactorConnection::new(
+            mio::net::TcpStream::from_std(server_stream),
+            ClientProtocol::Resp,
+        );
+        let one_ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut payload = Vec::with_capacity(one_ping.len() * 1024);
+        for _ in 0..1024 {
+            payload.extend_from_slice(one_ping);
+        }
+        client
+            .write_all(&payload)
+            .expect("client payload write should succeed");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("client write-half shutdown should succeed");
+
+        ServerReactor::read_connection_bytes(&mut app, &mut connection, 64, 32);
+
+        assert_that!(connection.read_paused_by_backpressure, eq(true));
+        assert_that!(connection.lifecycle, eq(ConnectionLifecycle::Active));
+        assert_that!(connection.write_buffer.is_empty(), eq(false));
     }
 }
