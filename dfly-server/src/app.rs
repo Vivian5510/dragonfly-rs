@@ -228,32 +228,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    /// Feeds network bytes into one connection and executes all newly completed commands.
-    ///
-    /// The return vector contains one protocol-encoded reply per decoded command.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when connection input bytes violate the active
-    /// wire protocol framing rules.
-    pub fn feed_connection_bytes(
-        &mut self,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>> {
-        connection.parser.feed_bytes(bytes);
-        let mut responses = Vec::new();
-        loop {
-            let Some(parsed) = connection.parser.try_pop_command()? else {
-                break;
-            };
-            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
-                responses.push(encoded);
-            }
-        }
-        Ok(responses)
-    }
-
     pub(crate) fn execute_parsed_command(
         &mut self,
         connection: &mut ServerConnection,
