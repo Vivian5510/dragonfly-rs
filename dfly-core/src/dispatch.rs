@@ -46,13 +46,15 @@ const CLUSTER_SLOT_COUNT: usize = (MAX_SLOT_ID as usize) + 1;
 /// structure instead of a sparse hashmap to avoid allocator and hash overhead on hot paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStats {
-    counts: Box<[usize]>,
+    key_counts: Box<[usize]>,
+    total_writes: Box<[u64]>,
 }
 
 impl Default for SlotStats {
     fn default() -> Self {
         Self {
-            counts: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
+            key_counts: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
+            total_writes: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
         }
     }
 }
@@ -60,22 +62,36 @@ impl Default for SlotStats {
 impl SlotStats {
     fn increment(&mut self, slot: u16) {
         let index = usize::from(slot);
-        self.counts[index] = self.counts[index].saturating_add(1);
+        self.key_counts[index] = self.key_counts[index].saturating_add(1);
     }
 
     fn decrement(&mut self, slot: u16) -> usize {
         let index = usize::from(slot);
-        self.counts[index] = self.counts[index].saturating_sub(1);
-        self.counts[index]
+        self.key_counts[index] = self.key_counts[index].saturating_sub(1);
+        self.key_counts[index]
     }
 
     #[must_use]
     fn get(&self, slot: u16) -> usize {
-        self.counts[usize::from(slot)]
+        self.key_counts[usize::from(slot)]
     }
 
     fn clear(&mut self, slot: u16) {
-        self.counts[usize::from(slot)] = 0;
+        self.key_counts[usize::from(slot)] = 0;
+    }
+
+    fn increment_write(&mut self, slot: u16) {
+        let index = usize::from(slot);
+        self.total_writes[index] = self.total_writes[index].saturating_add(1);
+    }
+
+    /// Returns cumulative successful write count for one slot.
+    ///
+    /// Dragonfly keeps per-slot write counters in `slots_stats`; this mirrors
+    /// the same shape so slot-local mutation pressure is observable.
+    #[must_use]
+    pub fn total_writes(&self, slot: u16) -> u64 {
+        self.total_writes[usize::from(slot)]
     }
 }
 
@@ -198,6 +214,10 @@ impl DispatchState {
         }
     }
 
+    fn increment_slot_write_stat(table: &mut DbTable, key: &[u8]) {
+        table.slot_stats.increment_write(key_slot(key));
+    }
+
     fn decrement_slot_stat(table: &mut DbTable, key: &[u8]) {
         let slot = key_slot(key);
         let mut should_remove_slot = false;
@@ -222,6 +242,7 @@ impl DispatchState {
         let previous = table.prime.insert(key_bytes.clone(), value);
         Self::update_expire_index(table, key, expire_at);
         Self::increment_slot_stat(table, key);
+        Self::increment_slot_write_stat(table, key);
         previous
     }
 
@@ -232,6 +253,7 @@ impl DispatchState {
             Self::remove_expire_deadline(table, key, previous_expire);
         }
         Self::decrement_slot_stat(table, key);
+        Self::increment_slot_write_stat(table, key);
         Some(removed)
     }
 
@@ -244,6 +266,7 @@ impl DispatchState {
         };
         entry.expire_at_unix_secs = expire_at;
         Self::update_expire_index(table, key, expire_at);
+        Self::increment_slot_write_stat(table, key);
         true
     }
 
@@ -2142,6 +2165,7 @@ mod tests {
             panic!("db table must exist after SET");
         };
         assert_that!(table.slot_stats.get(slot), eq(1_usize));
+        assert_that!(table.slot_stats.total_writes(slot), eq(1_u64));
         assert_that!(
             table.slot_keys.get(&slot).map(HashSet::len),
             eq(Some(1_usize))
@@ -2153,6 +2177,7 @@ mod tests {
             panic!("db table should be kept after key deletion");
         };
         assert_that!(table.slot_stats.get(slot), eq(0_usize));
+        assert_that!(table.slot_stats.total_writes(slot), eq(2_u64));
         assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
         assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
     }
