@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::{ShardId, TxId};
@@ -41,6 +42,19 @@ pub trait TransactionScheduler: Send + Sync {
     /// currently busy and cannot accept direct command execution.
     fn ensure_shards_available(&self, _shards: &[ShardId]) -> DflyResult<()> {
         Ok(())
+    }
+
+    /// Waits until provided shards have no queued transactions, up to timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scheduler synchronization state cannot be accessed.
+    fn wait_for_shards_available(
+        &self,
+        _shards: &[ShardId],
+        _timeout: Duration,
+    ) -> DflyResult<bool> {
+        Ok(true)
     }
 }
 
@@ -197,6 +211,48 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             }
         }
         Ok(())
+    }
+
+    fn wait_for_shards_available(&self, shards: &[ShardId], timeout: Duration) -> DflyResult<bool> {
+        if shards.is_empty() {
+            return Ok(true);
+        }
+
+        let mut unique_shards = shards.to_vec();
+        unique_shards.sort_unstable();
+        unique_shards.dedup();
+
+        let wait_start = Instant::now();
+        for shard in unique_shards {
+            let Some(queue_handle) = self.shard_queue_handle_if_exists(shard)? else {
+                continue;
+            };
+            let mut queue = queue_handle.queue.lock().map_err(|_| {
+                DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
+            })?;
+            while !queue.is_empty() {
+                let elapsed = wait_start.elapsed();
+                let Some(remaining) = timeout.checked_sub(elapsed) else {
+                    return Ok(false);
+                };
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                let (next_queue, wait_result) = queue_handle
+                    .waiters
+                    .wait_timeout(queue, remaining)
+                    .map_err(|_| {
+                        DflyError::InvalidState(
+                            "transaction scheduler shard queue mutex is poisoned",
+                        )
+                    })?;
+                queue = next_queue;
+                if wait_result.timed_out() && !queue.is_empty() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -962,6 +1018,58 @@ mod tests {
         let scheduler = InMemoryTransactionScheduler::default();
         let shards = vec![2_u16, 2_u16, 1_u16, 1_u16];
         assert_that!(scheduler.ensure_shards_available(&shards).is_ok(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_waits_for_shards_available_until_conclude_releases_queue() {
+        let scheduler = Arc::new(InMemoryTransactionScheduler::default());
+        let plan = TransactionPlan {
+            txid: 57,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![0],
+        };
+        assert_that!(scheduler.schedule(&plan).is_ok(), eq(true));
+
+        let scheduler_for_release = Arc::clone(&scheduler);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = scheduler_for_release.conclude(plan.txid);
+        });
+
+        let ready = scheduler
+            .wait_for_shards_available(&[0], Duration::from_millis(200))
+            .expect("wait should not fail");
+        assert_that!(ready, eq(true));
+        releaser.join().expect("releaser thread should join");
+    }
+
+    #[rstest]
+    fn scheduler_wait_for_shards_available_times_out_when_queue_remains_busy() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 58,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    0,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![0],
+        };
+        assert_that!(scheduler.schedule(&plan).is_ok(), eq(true));
+
+        let ready = scheduler
+            .wait_for_shards_available(&[0], Duration::from_millis(5))
+            .expect("wait should not fail");
+        assert_that!(ready, eq(false));
+        assert_that!(scheduler.conclude(plan.txid).is_ok(), eq(true));
     }
 
     #[rstest]

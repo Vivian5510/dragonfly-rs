@@ -10,6 +10,9 @@ use dfly_core::runtime::RuntimeEnvelope;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Duration;
+
+const DIRECT_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_millis(2);
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
@@ -1162,9 +1165,13 @@ impl ServerApp {
         }
 
         if enforce_scheduler_barrier {
-            self.transaction
+            let ready = self
+                .transaction
                 .scheduler
-                .ensure_shards_available(&target_shards)?;
+                .wait_for_shards_available(&target_shards, DIRECT_BARRIER_WAIT_TIMEOUT)?;
+            if !ready {
+                return Err(DflyError::InvalidState("transaction shard queue is busy"));
+            }
         }
         let execute_on_worker = self.cluster.mode == ClusterMode::Disabled
             && self.command_requires_shard_worker_execution(frame);
