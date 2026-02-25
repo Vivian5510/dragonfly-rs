@@ -84,6 +84,10 @@ impl SlotStats {
         self.key_counts[usize::from(slot)] = 0;
     }
 
+    fn set_count(&mut self, slot: u16, count: usize) {
+        self.key_counts[usize::from(slot)] = count;
+    }
+
     fn increment_write(&mut self, slot: u16) {
         let index = usize::from(slot);
         self.total_writes[index] = self.total_writes[index].saturating_add(1);
@@ -349,25 +353,49 @@ impl DispatchState {
     pub fn slot_keys(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
         let mut keys = self
             .db_table(db)
-            .and_then(|table| table.slot_keys.get(&slot))
-            .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
+            .map(|table| {
+                table
+                    .prime
+                    .keys()
+                    .filter(|key| key_slot(key) == slot)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         keys.sort();
         keys
     }
 
+    fn reconcile_slot_membership(&mut self, db: DbIndex, slot: u16, live: &[Vec<u8>]) {
+        let Some(table) = self.db_tables.get_mut(&db) else {
+            return;
+        };
+        if live.is_empty() {
+            table.slot_stats.clear(slot);
+            let _ = table.slot_keys.remove(&slot);
+            return;
+        }
+        table.slot_stats.set_count(slot, live.len());
+        let _ = table
+            .slot_keys
+            .insert(slot, live.iter().cloned().collect::<HashSet<_>>());
+    }
+
     fn collect_live_slot_keys(&mut self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
-        let Some(slot_keys) = self
-            .db_table(db)
-            .and_then(|table| table.slot_keys.get(&slot))
-            .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
-        else {
+        let Some(candidate_keys) = self.db_table(db).map(|table| {
+            table
+                .prime
+                .keys()
+                .filter(|key| key_slot(key) == slot)
+                .cloned()
+                .collect::<Vec<_>>()
+        }) else {
             return Vec::new();
         };
 
         let now = Self::now_unix_seconds();
         let mut live = Vec::new();
-        for key in slot_keys {
+        for key in candidate_keys {
             let expire_at = self
                 .db_table(db)
                 .and_then(|table| table.prime.get(&key))
@@ -385,12 +413,11 @@ impl DispatchState {
                         .is_some()
                     {
                         live.push(key);
-                    } else if let Some(table) = self.db_tables.get_mut(&db) {
-                        Self::decrement_slot_stat(table, &key);
                     }
                 }
             }
         }
+        self.reconcile_slot_membership(db, slot, &live);
         live
     }
 
@@ -2291,6 +2318,35 @@ mod tests {
         assert_that!(table.slot_stats.memory_bytes(slot), eq(0_usize));
         assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
         assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
+    }
+
+    #[rstest]
+    fn dispatch_slot_live_queries_reconcile_drifted_slot_index() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:slot:drift".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+            &mut state,
+        );
+        if let Some(table) = state.db_tables.get_mut(&0) {
+            let _ = table.slot_keys.insert(slot, HashSet::new());
+            table.slot_stats.set_count(slot, 0_usize);
+        }
+
+        assert_that!(state.count_live_keys_in_slot(0, slot), eq(1_usize));
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table should remain after slot reconciliation");
+        };
+        assert_that!(table.slot_stats.get(slot), eq(1_usize));
+        assert_that!(
+            table.slot_keys.get(&slot).map(HashSet::len),
+            eq(Some(1_usize))
+        );
+        assert_that!(&state.slot_keys(0, slot), eq(&vec![key.clone()]));
     }
 
     #[rstest]
