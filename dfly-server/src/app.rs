@@ -263,7 +263,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 .proactor_pool
                 .parse_on_worker(affinity.io_worker, parser_for_io, bytes)?;
         connection.restore_parser_from_io_worker(parsed_batch.parser);
-        let parsed_commands = parsed_batch.commands?;
+        let parsed_commands = parsed_batch.commands;
+        let parse_error = parsed_batch.parse_error;
 
         let mut responses = Vec::new();
         for parsed in parsed_commands {
@@ -338,6 +339,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             let encoded =
                 encode_reply_for_protocol(connection.parser.context.protocol, &frame, reply);
             responses.push(encoded);
+        }
+
+        if let Some(error) = parse_error {
+            return Err(error);
         }
 
         Ok(responses)

@@ -36,8 +36,10 @@ pub struct ConnectionAffinity {
 pub struct ProactorParseBatch {
     /// Parser state after consuming the provided input chunk.
     pub parser: ConnectionState,
-    /// Parsed commands completed by this chunk (or protocol error).
-    pub commands: DflyResult<Vec<ParsedCommand>>,
+    /// Parsed commands completed by this chunk before parser returned `Incomplete` or an error.
+    pub commands: Vec<ParsedCommand>,
+    /// Optional protocol error observed after parsing a command prefix.
+    pub parse_error: Option<DflyError>,
     /// Worker index that executed this parse step.
     pub io_worker: u16,
 }
@@ -201,24 +203,24 @@ fn handle_parse_request(io_worker: u16, request: ParseRequest) {
         response,
     } = request;
     parser.feed_bytes(&bytes);
-    let commands = drain_commands(&mut parser);
+    let (commands, parse_error) = drain_commands(&mut parser);
     let _ = response.send(ProactorParseBatch {
         parser,
         commands,
+        parse_error,
         io_worker,
     });
 }
 
-fn drain_commands(parser: &mut ConnectionState) -> DflyResult<Vec<ParsedCommand>> {
+fn drain_commands(parser: &mut ConnectionState) -> (Vec<ParsedCommand>, Option<DflyError>) {
     let mut commands = Vec::new();
     loop {
-        let parsed = parser.try_pop_command()?;
-        let Some(command) = parsed else {
-            break;
-        };
-        commands.push(command);
+        match parser.try_pop_command() {
+            Ok(Some(command)) => commands.push(command),
+            Ok(None) => return (commands, None),
+            Err(error) => return (commands, Some(error)),
+        }
     }
-    Ok(commands)
 }
 
 #[cfg(test)]
@@ -261,20 +263,18 @@ mod tests {
             )
             .expect("first parse step should reach worker");
         assert_that!(first.io_worker, eq(affinity.io_worker));
-        let first_commands = first
-            .commands
-            .expect("first parse step should not fail protocol validation");
+        let first_commands = first.commands;
         assert_that!(first_commands.is_empty(), eq(true));
+        assert_that!(first.parse_error.is_none(), eq(true));
         assert_that!(first.parser.pending_bytes() > 0, eq(true));
 
         let second = pool
             .parse_on_worker(affinity.io_worker, first.parser, b"llo\r\n")
             .expect("second parse step should reach worker");
         assert_that!(second.io_worker, eq(affinity.io_worker));
-        let parsed_commands = second
-            .commands
-            .expect("second parse step should decode one command");
+        let parsed_commands = second.commands;
         assert_that!(parsed_commands.len(), eq(1_usize));
+        assert_that!(second.parse_error.is_none(), eq(true));
         assert_that!(parsed_commands[0].name.as_str(), eq("ECHO"));
         assert_that!(&parsed_commands[0].args, eq(&vec![b"hello".to_vec()]));
     }
@@ -285,9 +285,8 @@ mod tests {
         let parsed = pool
             .parse_on_worker(0, resp_parser(), b"*1\r\n$A\r\nPING\r\n")
             .expect("request should be delivered to worker");
-        let command_error = parsed
-            .commands
-            .expect_err("malformed bulk length must fail");
+        let command_error = parsed.parse_error.expect("malformed bulk length must fail");
+        assert_that!(parsed.commands.is_empty(), eq(true));
         assert_that!(
             format!("{command_error}").contains("protocol error"),
             eq(true)
