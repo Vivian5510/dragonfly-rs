@@ -255,14 +255,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         bytes: &[u8],
     ) -> DflyResult<Vec<Vec<u8>>> {
         let affinity = self.ensure_connection_io_affinity(connection);
-        // Move parser ownership into the proactor request so we do not clone buffered bytes
-        // on every feed call. The parser state is returned after worker-side advancement.
-        let parser_for_io = connection.take_parser_for_io_worker();
-        let parsed_batch =
-            self.facade
-                .proactor_pool
-                .parse_on_worker(affinity.io_worker, parser_for_io, bytes)?;
-        connection.restore_parser_from_io_worker(parsed_batch.parser);
+        let parsed_batch = self.facade.proactor_pool.parse_on_worker_for_connection(
+            affinity,
+            &connection.parser.context,
+            bytes,
+        )?;
         let parsed_commands = parsed_batch.commands;
         let parse_error = parsed_batch.parse_error;
 
@@ -1903,18 +1900,6 @@ pub struct ServerConnection {
     pub replica_client_id: Option<String>,
     /// Optional Dragonfly replica version announced via `REPLCONF CLIENT-VERSION`.
     pub replica_client_version: Option<u64>,
-}
-
-impl ServerConnection {
-    fn take_parser_for_io_worker(&mut self) -> ConnectionState {
-        // Keep protocol/db metadata intact while avoiding a full parser clone of pending bytes.
-        let placeholder = ConnectionState::new(self.parser.context.clone());
-        std::mem::replace(&mut self.parser, placeholder)
-    }
-
-    fn restore_parser_from_io_worker(&mut self, parser: ConnectionState) {
-        self.parser = parser;
-    }
 }
 
 /// One replica endpoint attached to a client connection.

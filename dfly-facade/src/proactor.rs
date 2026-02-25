@@ -13,14 +13,22 @@ use tokio::runtime::Builder as TokioBuilder;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use crate::connection::ConnectionState;
+use crate::connection::{ConnectionContext, ConnectionState};
 use crate::protocol::ParsedCommand;
 
 #[derive(Debug)]
-struct ParseRequest {
-    sequence: u64,
-    parser: ConnectionState,
-    bytes: Vec<u8>,
+enum ParseRequest {
+    Detached {
+        sequence: u64,
+        parser: ConnectionState,
+        bytes: Vec<u8>,
+    },
+    Bound {
+        sequence: u64,
+        connection_id: u64,
+        context: ConnectionContext,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -40,7 +48,7 @@ struct IoWorkerQueueState {
 
 #[derive(Debug, Default)]
 struct IoWorkerCompletionInner {
-    replies_by_sequence: std::collections::HashMap<u64, ProactorParseBatch>,
+    replies_by_sequence: std::collections::HashMap<u64, ProactorParseCompletion>,
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +77,23 @@ pub struct ProactorParseBatch {
     pub parse_error: Option<DflyError>,
     /// Worker index that executed this parse step.
     pub io_worker: u16,
+}
+
+/// Result of one parser advancement for an already bound connection.
+#[derive(Debug)]
+pub struct ProactorBoundParseBatch {
+    /// Parsed commands completed by this chunk before parser returned `Incomplete` or an error.
+    pub commands: Vec<ParsedCommand>,
+    /// Optional protocol error observed after parsing a command prefix.
+    pub parse_error: Option<DflyError>,
+    /// Worker index that executed this parse step.
+    pub io_worker: u16,
+}
+
+#[derive(Debug)]
+enum ProactorParseCompletion {
+    Detached(ProactorParseBatch),
+    Bound(ProactorBoundParseBatch),
 }
 
 /// In-memory proactor pool using one worker thread per I/O queue.
@@ -282,6 +307,56 @@ impl ProactorPool {
         parser: ConnectionState,
         bytes: &[u8],
     ) -> DflyResult<ProactorParseBatch> {
+        let request = ParseRequest::Detached {
+            sequence: 0,
+            parser,
+            bytes: bytes.to_vec(),
+        };
+        let sequence = self.submit_parse_request(io_worker, request, bytes.len())?;
+        match self.wait_for_parse_completion(io_worker, sequence)? {
+            ProactorParseCompletion::Detached(reply) => Ok(reply),
+            ProactorParseCompletion::Bound(_) => Err(DflyError::InvalidState(
+                "io worker completion type mismatch",
+            )),
+        }
+    }
+
+    /// Advances parser state for one connection pinned to its I/O worker.
+    ///
+    /// The parser buffer is retained inside the worker by `connection_id`, so callers
+    /// only provide incremental bytes and connection context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when the worker id is invalid or queue/completion
+    /// state is unavailable.
+    pub fn parse_on_worker_for_connection(
+        &self,
+        affinity: ConnectionAffinity,
+        context: &ConnectionContext,
+        bytes: &[u8],
+    ) -> DflyResult<ProactorBoundParseBatch> {
+        let request = ParseRequest::Bound {
+            sequence: 0,
+            connection_id: affinity.connection_id,
+            context: context.clone(),
+            bytes: bytes.to_vec(),
+        };
+        let sequence = self.submit_parse_request(affinity.io_worker, request, bytes.len())?;
+        match self.wait_for_parse_completion(affinity.io_worker, sequence)? {
+            ProactorParseCompletion::Bound(reply) => Ok(reply),
+            ProactorParseCompletion::Detached(_) => Err(DflyError::InvalidState(
+                "io worker completion type mismatch",
+            )),
+        }
+    }
+
+    fn submit_parse_request(
+        &self,
+        io_worker: u16,
+        request: ParseRequest,
+        request_bytes: usize,
+    ) -> DflyResult<u64> {
         let Some(sender) = self.senders.get(usize::from(io_worker)) else {
             return Err(DflyError::InvalidState("io worker is out of range"));
         };
@@ -291,18 +366,14 @@ impl ProactorPool {
         let Some(queue_state) = self.queue_state_per_worker.get(usize::from(io_worker)) else {
             return Err(DflyError::InvalidState("io worker is out of range"));
         };
-        let Some(completion_state) = self.completion_per_worker.get(usize::from(io_worker)) else {
-            return Err(DflyError::InvalidState("io worker is out of range"));
-        };
         let Some(sequence_counter) = self
             .submitted_sequence_per_worker
             .get(usize::from(io_worker))
         else {
             return Err(DflyError::InvalidState("io worker is out of range"));
         };
-        let queue_soft_limit = self.queue_soft_limit;
-        let request_bytes = bytes.len();
 
+        let queue_soft_limit = self.queue_soft_limit;
         let mut blocked_submitter_marked = false;
         while queue_soft_limit != usize::MAX
             && queue_metrics.pending.load(Ordering::Acquire) >= queue_soft_limit
@@ -340,34 +411,54 @@ impl ProactorPool {
             + request_bytes;
         update_peak_pending(&queue_metrics.peak_pending_bytes, pending_bytes);
 
-        // Keep per-worker submission ordering explicit so completion wait can target one sequence.
         let mut sequence_guard = sequence_counter
             .lock()
             .map_err(|_| DflyError::InvalidState("io worker sequence mutex is poisoned"))?;
         let sequence = (*sequence_guard).saturating_add(1);
-        sender
-            .send(ParseRequest {
+        let request = match request {
+            ParseRequest::Detached { parser, bytes, .. } => ParseRequest::Detached {
                 sequence,
                 parser,
-                bytes: bytes.to_vec(),
-            })
-            .map_err(|_| {
-                let _ = queue_metrics.pending.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |pending| Some(pending.saturating_sub(1)),
-                );
-                let _ = queue_metrics.pending_bytes.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |pending| Some(pending.saturating_sub(request_bytes)),
-                );
-                queue_state.changed.notify_all();
-                DflyError::InvalidState("io worker queue is closed")
-            })?;
+                bytes,
+            },
+            ParseRequest::Bound {
+                connection_id,
+                context,
+                bytes,
+                ..
+            } => ParseRequest::Bound {
+                sequence,
+                connection_id,
+                context,
+                bytes,
+            },
+        };
+        sender.send(request).map_err(|_| {
+            let _ = queue_metrics.pending.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(1)),
+            );
+            let _ = queue_metrics.pending_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(request_bytes)),
+            );
+            queue_state.changed.notify_all();
+            DflyError::InvalidState("io worker queue is closed")
+        })?;
         *sequence_guard = sequence;
-        drop(sequence_guard);
+        Ok(sequence)
+    }
 
+    fn wait_for_parse_completion(
+        &self,
+        io_worker: u16,
+        sequence: u64,
+    ) -> DflyResult<ProactorParseCompletion> {
+        let Some(completion_state) = self.completion_per_worker.get(usize::from(io_worker)) else {
+            return Err(DflyError::InvalidState("io worker is out of range"));
+        };
         let completion = completion_state
             .inner
             .lock()
@@ -378,14 +469,12 @@ impl ProactorPool {
                 !inner.replies_by_sequence.contains_key(&sequence)
             })
             .map_err(|_| DflyError::InvalidState("io worker completion mutex is poisoned"))?;
-        let reply =
-            completion
-                .replies_by_sequence
-                .remove(&sequence)
-                .ok_or(DflyError::InvalidState(
-                    "io worker completion for sequence is missing",
-                ))?;
-        Ok(reply)
+        completion
+            .replies_by_sequence
+            .remove(&sequence)
+            .ok_or(DflyError::InvalidState(
+                "io worker completion for sequence is missing",
+            ))
     }
 }
 
@@ -445,21 +534,17 @@ async fn proactor_parse_fiber(
     queue_state_per_worker: Arc<Vec<IoWorkerQueueState>>,
     completion_per_worker: Arc<Vec<IoWorkerCompletionState>>,
 ) {
+    let mut parsers_by_connection = std::collections::HashMap::<u64, ConnectionState>::new();
     let mut processed_since_yield = 0_usize;
     while let Some(request) = receiver.recv().await {
-        let queue_metrics = Arc::clone(&queue_metrics_per_worker);
-        let queue_state = Arc::clone(&queue_state_per_worker);
-        let completion = Arc::clone(&completion_per_worker);
-        let _ = tokio::task::spawn_local(async move {
-            handle_parse_request(
-                io_worker,
-                request,
-                &queue_metrics,
-                &queue_state,
-                &completion,
-            );
-        })
-        .await;
+        handle_parse_request(
+            io_worker,
+            request,
+            &queue_metrics_per_worker,
+            &queue_state_per_worker,
+            &completion_per_worker,
+            &mut parsers_by_connection,
+        );
 
         processed_since_yield = processed_since_yield.saturating_add(1);
         if processed_since_yield >= PROACTOR_WORKER_YIELD_INTERVAL {
@@ -475,15 +560,71 @@ fn handle_parse_request(
     queue_metrics_per_worker: &Arc<Vec<IoWorkerQueueMetrics>>,
     queue_state_per_worker: &Arc<Vec<IoWorkerQueueState>>,
     completion_per_worker: &Arc<Vec<IoWorkerCompletionState>>,
+    parsers_by_connection: &mut std::collections::HashMap<u64, ConnectionState>,
 ) {
-    let ParseRequest {
-        sequence,
-        mut parser,
-        bytes,
-    } = request;
-    let request_bytes = bytes.len();
-    parser.feed_bytes(&bytes);
-    let (commands, parse_error) = drain_commands(&mut parser);
+    match request {
+        ParseRequest::Detached {
+            sequence,
+            mut parser,
+            bytes,
+        } => {
+            let request_bytes = bytes.len();
+            parser.feed_bytes(&bytes);
+            let (commands, parse_error) = drain_commands(&mut parser);
+            finalize_parse_request(
+                io_worker,
+                sequence,
+                request_bytes,
+                ProactorParseCompletion::Detached(ProactorParseBatch {
+                    parser,
+                    commands,
+                    parse_error,
+                    io_worker,
+                }),
+                queue_metrics_per_worker,
+                queue_state_per_worker,
+                completion_per_worker,
+            );
+        }
+        ParseRequest::Bound {
+            sequence,
+            connection_id,
+            context,
+            bytes,
+        } => {
+            let request_bytes = bytes.len();
+            let parser = parsers_by_connection
+                .entry(connection_id)
+                .or_insert_with(|| ConnectionState::new(context.clone()));
+            parser.context = context;
+            parser.feed_bytes(&bytes);
+            let (commands, parse_error) = drain_commands(parser);
+            finalize_parse_request(
+                io_worker,
+                sequence,
+                request_bytes,
+                ProactorParseCompletion::Bound(ProactorBoundParseBatch {
+                    commands,
+                    parse_error,
+                    io_worker,
+                }),
+                queue_metrics_per_worker,
+                queue_state_per_worker,
+                completion_per_worker,
+            );
+        }
+    }
+}
+
+fn finalize_parse_request(
+    io_worker: u16,
+    sequence: u64,
+    request_bytes: usize,
+    completion_reply: ProactorParseCompletion,
+    queue_metrics_per_worker: &Arc<Vec<IoWorkerQueueMetrics>>,
+    queue_state_per_worker: &Arc<Vec<IoWorkerQueueState>>,
+    completion_per_worker: &Arc<Vec<IoWorkerCompletionState>>,
+) {
     if let Some(queue_metrics) = queue_metrics_per_worker.get(usize::from(io_worker)) {
         let _ =
             queue_metrics
@@ -505,15 +646,9 @@ fn handle_parse_request(
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = completion.replies_by_sequence.insert(
-            sequence,
-            ProactorParseBatch {
-                parser,
-                commands,
-                parse_error,
-                io_worker,
-            },
-        );
+        let _ = completion
+            .replies_by_sequence
+            .insert(sequence, completion_reply);
         completion_state.changed.notify_all();
     }
 }
@@ -583,6 +718,70 @@ mod tests {
         assert_that!(second.parse_error.is_none(), eq(true));
         assert_that!(parsed_commands[0].name.as_str(), eq("ECHO"));
         assert_that!(&parsed_commands[0].args, eq(&vec![b"hello".to_vec()]));
+    }
+
+    #[rstest]
+    fn proactor_pool_keeps_bound_connection_parser_state_on_worker() {
+        let pool = ProactorPool::new(2);
+        let affinity = pool.bind_connection(11);
+        let context = ConnectionContext {
+            protocol: ClientProtocol::Resp,
+            db_index: 0,
+            privileged: false,
+        };
+
+        let first = pool
+            .parse_on_worker_for_connection(affinity, &context, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
+            .expect("first parse step should reach worker");
+        assert_that!(first.io_worker, eq(affinity.io_worker));
+        assert_that!(first.commands.is_empty(), eq(true));
+        assert_that!(first.parse_error.is_none(), eq(true));
+
+        let second = pool
+            .parse_on_worker_for_connection(affinity, &context, b"llo\r\n")
+            .expect("second parse step should reach worker");
+        assert_that!(second.io_worker, eq(affinity.io_worker));
+        assert_that!(second.commands.len(), eq(1_usize));
+        assert_that!(second.parse_error.is_none(), eq(true));
+        assert_that!(second.commands[0].name.as_str(), eq("ECHO"));
+        assert_that!(&second.commands[0].args, eq(&vec![b"hello".to_vec()]));
+    }
+
+    #[rstest]
+    fn proactor_pool_isolates_bound_parsers_by_connection_id() {
+        let pool = ProactorPool::new(1);
+        let first_affinity = pool.bind_connection(1);
+        let second_affinity = pool.bind_connection(2);
+        let context = ConnectionContext {
+            protocol: ClientProtocol::Resp,
+            db_index: 0,
+            privileged: false,
+        };
+
+        let first_partial = pool
+            .parse_on_worker_for_connection(
+                first_affinity,
+                &context,
+                b"*2\r\n$4\r\nECHO\r\n$5\r\nhe",
+            )
+            .expect("partial parse should reach worker");
+        assert_that!(first_partial.commands.is_empty(), eq(true));
+
+        let second_complete = pool
+            .parse_on_worker_for_connection(second_affinity, &context, b"*1\r\n$4\r\nPING\r\n")
+            .expect("second connection parse should reach worker");
+        assert_that!(second_complete.commands.len(), eq(1_usize));
+        assert_that!(second_complete.commands[0].name.as_str(), eq("PING"));
+
+        let first_complete = pool
+            .parse_on_worker_for_connection(first_affinity, &context, b"llo\r\n")
+            .expect("first connection completion should parse");
+        assert_that!(first_complete.commands.len(), eq(1_usize));
+        assert_that!(first_complete.commands[0].name.as_str(), eq("ECHO"));
+        assert_that!(
+            &first_complete.commands[0].args,
+            eq(&vec![b"hello".to_vec()])
+        );
     }
 
     #[rstest]
