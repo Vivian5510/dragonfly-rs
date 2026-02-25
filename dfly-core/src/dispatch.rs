@@ -47,6 +47,7 @@ const CLUSTER_SLOT_COUNT: usize = (MAX_SLOT_ID as usize) + 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStats {
     key_counts: Box<[usize]>,
+    total_reads: Box<[u64]>,
     total_writes: Box<[u64]>,
 }
 
@@ -54,6 +55,7 @@ impl Default for SlotStats {
     fn default() -> Self {
         Self {
             key_counts: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
+            total_reads: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
             total_writes: vec![0; CLUSTER_SLOT_COUNT].into_boxed_slice(),
         }
     }
@@ -85,6 +87,20 @@ impl SlotStats {
         self.total_writes[index] = self.total_writes[index].saturating_add(1);
     }
 
+    fn increment_read(&mut self, slot: u16) {
+        let index = usize::from(slot);
+        self.total_reads[index] = self.total_reads[index].saturating_add(1);
+    }
+
+    /// Returns cumulative successful read count for one slot.
+    ///
+    /// Counter shape mirrors Dragonfly's slot stats bookkeeping that tracks
+    /// slot-local read pressure independently from key cardinality.
+    #[must_use]
+    pub fn total_reads(&self, slot: u16) -> u64 {
+        self.total_reads[usize::from(slot)]
+    }
+
     /// Returns cumulative successful write count for one slot.
     ///
     /// Dragonfly keeps per-slot write counters in `slots_stats`; this mirrors
@@ -100,7 +116,7 @@ impl SlotStats {
 /// This shape mirrors Dragonfly's `DbTable` layering:
 /// - `prime`: main key/value dictionary (`PrimeTable` concept),
 /// - `expire`: expiration index (`ExpireTable` concept),
-/// - `slot_stats`: per-slot key cardinality used by slot-aware operations,
+/// - `slot_stats`: per-slot counters (cardinality + read/write totals),
 /// - `slot_keys`: per-slot key membership index used by slot-local scans/migrations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbTable {
@@ -216,6 +232,10 @@ impl DispatchState {
 
     fn increment_slot_write_stat(table: &mut DbTable, key: &[u8]) {
         table.slot_stats.increment_write(key_slot(key));
+    }
+
+    fn increment_slot_read_stat(table: &mut DbTable, key: &[u8]) {
+        table.slot_stats.increment_read(key_slot(key));
     }
 
     fn decrement_slot_stat(table: &mut DbTable, key: &[u8]) {
@@ -886,12 +906,18 @@ fn handle_mget(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
     let mut values = Vec::with_capacity(frame.args.len());
     for key in &frame.args {
         state.purge_expired_key(db, key);
-        let value = state
+        let value = if let Some(value) = state
             .db_map(db)
             .and_then(|map| map.get(key))
-            .map_or(CommandReply::Null, |entry| {
-                CommandReply::BulkString(entry.value.clone())
-            });
+            .map(|entry| entry.value.clone())
+        {
+            if let Some(table) = state.db_tables.get_mut(&db) {
+                DispatchState::increment_slot_read_stat(table, key);
+            }
+            CommandReply::BulkString(value)
+        } else {
+            CommandReply::Null
+        };
         values.push(value);
     }
     CommandReply::Array(values)
@@ -951,8 +977,17 @@ fn handle_msetnx(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
 fn handle_get(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
-    match state.db_map(db).and_then(|map| map.get(key)) {
-        Some(value) => CommandReply::BulkString(value.value.clone()),
+    match state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.value.clone())
+    {
+        Some(value) => {
+            if let Some(table) = state.db_tables.get_mut(&db) {
+                DispatchState::increment_slot_read_stat(table, key);
+            }
+            CommandReply::BulkString(value)
+        }
         None => CommandReply::Null,
     }
 }
@@ -961,6 +996,9 @@ fn handle_type(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> 
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
     if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+        if let Some(table) = state.db_tables.get_mut(&db) {
+            DispatchState::increment_slot_read_stat(table, key);
+        }
         return CommandReply::SimpleString("string".to_owned());
     }
     CommandReply::SimpleString("none".to_owned())
@@ -1029,24 +1067,24 @@ fn handle_append(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
 fn handle_strlen(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
-    let length = state
+    let length = if let Some(length) = state
         .db_map(db)
         .and_then(|map| map.get(key))
-        .map_or(0_usize, |entry| entry.value.len());
+        .map(|entry| entry.value.len())
+    {
+        if let Some(table) = state.db_tables.get_mut(&db) {
+            DispatchState::increment_slot_read_stat(table, key);
+        }
+        length
+    } else {
+        0_usize
+    };
     CommandReply::Integer(i64::try_from(length).unwrap_or(i64::MAX))
 }
 
 fn handle_getrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -> CommandReply {
     let key = &frame.args[0];
     state.purge_expired_key(db, key);
-
-    let Some(value) = state
-        .db_map(db)
-        .and_then(|map| map.get(key))
-        .map(|entry| entry.value.as_slice())
-    else {
-        return CommandReply::BulkString(Vec::new());
-    };
 
     let Ok(start) = parse_redis_i64(&frame.args[1]) else {
         return CommandReply::Error("value is not an integer or out of range".to_owned());
@@ -1055,9 +1093,20 @@ fn handle_getrange(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState)
         return CommandReply::Error("value is not an integer or out of range".to_owned());
     };
 
+    let Some(value) = state
+        .db_map(db)
+        .and_then(|map| map.get(key))
+        .map(|entry| entry.value.clone())
+    else {
+        return CommandReply::BulkString(Vec::new());
+    };
+
     let Some((start_index, end_index)) = normalize_redis_range(start, end, value.len()) else {
         return CommandReply::BulkString(Vec::new());
     };
+    if let Some(table) = state.db_tables.get_mut(&db) {
+        DispatchState::increment_slot_read_stat(table, key);
+    }
     CommandReply::BulkString(value[start_index..=end_index].to_vec())
 }
 
@@ -1124,6 +1173,9 @@ fn handle_exists(db: DbIndex, frame: &CommandFrame, state: &mut DispatchState) -
     for key in &frame.args {
         state.purge_expired_key(db, key);
         if state.db_map(db).is_some_and(|map| map.contains_key(key)) {
+            if let Some(table) = state.db_tables.get_mut(&db) {
+                DispatchState::increment_slot_read_stat(table, key);
+            }
             existing = existing.saturating_add(1);
         }
     }
@@ -2180,6 +2232,49 @@ mod tests {
         assert_that!(table.slot_stats.total_writes(slot), eq(2_u64));
         assert_that!(table.slot_keys.get(&slot).map(HashSet::len), eq(None));
         assert_that!(&state.slot_keys(0, slot), eq(&Vec::<Vec<u8>>::new()));
+    }
+
+    #[rstest]
+    fn dispatch_tracks_slot_read_and_write_counters() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:slot:reads".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(0, &CommandFrame::new("GET", vec![key.clone()]), &mut state);
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("MGET", vec![key.clone(), b"missing".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("EXISTS", vec![key.clone(), b"missing".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("STRLEN", vec![key.clone()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("GETRANGE", vec![key.clone(), b"0".to_vec(), b"0".to_vec()]),
+            &mut state,
+        );
+        let _ = registry.dispatch(0, &CommandFrame::new("TYPE", vec![key.clone()]), &mut state);
+
+        let Some(table) = state.db_tables.get(&0) else {
+            panic!("db table must exist after read/write sequence");
+        };
+        assert_that!(table.slot_stats.get(slot), eq(1_usize));
+        assert_that!(table.slot_stats.total_writes(slot), eq(1_u64));
+        assert_that!(table.slot_stats.total_reads(slot), eq(6_u64));
     }
 
     #[rstest]
