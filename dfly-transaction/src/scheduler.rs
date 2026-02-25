@@ -115,6 +115,8 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
             return Ok(());
         }
 
+        let shards = validate_touched_shard_footprint(plan)?;
+
         let key_accesses = match plan.mode {
             TransactionMode::LockAhead => collect_lock_ahead_accesses(plan)?,
             // Global mode models a coarse barrier and does not need per-key locks.
@@ -123,19 +125,6 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
                 unreachable!("non-atomic mode returns before queue/lock scheduling")
             }
         };
-
-        let mut touched_shards = plan.touched_shards.iter().copied().collect::<HashSet<_>>();
-        if touched_shards.is_empty() {
-            // Keep a fallback for planner callsites that do not provide explicit footprint yet.
-            for hop in &plan.hops {
-                for (shard, _) in &hop.per_shard {
-                    let _ = touched_shards.insert(*shard);
-                }
-            }
-        }
-
-        let mut shards = touched_shards.into_iter().collect::<Vec<_>>();
-        shards.sort_unstable();
 
         if self.is_active_txid(plan.txid)? {
             return Err(DflyError::InvalidState(
@@ -354,6 +343,37 @@ fn validate_plan_shape(plan: &TransactionPlan) -> DflyResult<()> {
     Ok(())
 }
 
+fn validate_touched_shard_footprint(plan: &TransactionPlan) -> DflyResult<Vec<ShardId>> {
+    if plan.touched_shards.is_empty() {
+        return Err(DflyError::InvalidState(
+            "transaction plan must declare touched shard footprint",
+        ));
+    }
+
+    let mut touched = plan.touched_shards.clone();
+    touched.sort_unstable();
+
+    for duplicate_pair in touched.windows(2) {
+        if duplicate_pair[0] == duplicate_pair[1] {
+            return Err(DflyError::InvalidState(
+                "transaction plan touched_shards contains duplicates",
+            ));
+        }
+    }
+
+    for hop in &plan.hops {
+        for (shard, _) in &hop.per_shard {
+            if touched.binary_search(shard).is_err() {
+                return Err(DflyError::InvalidState(
+                    "transaction plan shard is missing from touched_shards",
+                ));
+            }
+        }
+    }
+
+    Ok(touched)
+}
+
 fn validate_non_atomic_mode(plan: &TransactionPlan) -> DflyResult<()> {
     for hop in &plan.hops {
         for (_, command) in &hop.per_shard {
@@ -465,6 +485,41 @@ mod tests {
             mode: TransactionMode::Global,
             hops: vec![TransactionHop {
                 per_shard: Vec::new(),
+            }],
+            touched_shards: vec![0],
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_empty_touched_shard_footprint() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 2,
+            mode: TransactionMode::Global,
+            hops: vec![TransactionHop {
+                per_shard: vec![(0, CommandFrame::new("PING", Vec::new()))],
+            }],
+            touched_shards: Vec::new(),
+        };
+
+        let result = scheduler.schedule(&plan);
+        assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_hop_shard_missing_from_touched_footprint() {
+        let scheduler = InMemoryTransactionScheduler::default();
+        let plan = TransactionPlan {
+            txid: 3,
+            mode: TransactionMode::LockAhead,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    1,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
             }],
             touched_shards: vec![0],
         };
