@@ -21,16 +21,34 @@ const RESP_LISTENER_TOKEN: Token = Token(0);
 const MEMCACHE_LISTENER_TOKEN: Token = Token(1);
 const CONNECTION_TOKEN_START: usize = 2;
 const READ_CHUNK_BYTES: usize = 8192;
+const DEFAULT_WRITE_HIGH_WATERMARK_BYTES: usize = 256 * 1024;
+const DEFAULT_WRITE_LOW_WATERMARK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerReactorConfig {
     pub max_events: usize,
+    pub write_high_watermark_bytes: usize,
+    pub write_low_watermark_bytes: usize,
 }
 
 impl ServerReactorConfig {
     #[must_use]
     pub fn normalized_max_events(self) -> usize {
         self.max_events.max(64)
+    }
+
+    #[must_use]
+    pub fn normalized_backpressure_watermarks(self) -> (usize, usize) {
+        let high = self
+            .write_high_watermark_bytes
+            .max(DEFAULT_WRITE_HIGH_WATERMARK_BYTES);
+        let mut low = self
+            .write_low_watermark_bytes
+            .max(DEFAULT_WRITE_LOW_WATERMARK_BYTES);
+        if low >= high {
+            low = high.saturating_sub(1);
+        }
+        (high, low)
     }
 }
 
@@ -83,13 +101,21 @@ impl EventSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionLifecycle {
+    Active,
+    Draining,
+    Closing,
+}
+
 #[derive(Debug)]
 struct ReactorConnection {
     socket: TcpStream,
     logical: ServerConnection,
     parser: ConnectionState,
     write_buffer: Vec<u8>,
-    closing: bool,
+    lifecycle: ConnectionLifecycle,
+    read_paused_by_backpressure: bool,
     interest: Interest,
 }
 
@@ -102,8 +128,50 @@ impl ReactorConnection {
             logical,
             parser,
             write_buffer: Vec::new(),
-            closing: false,
+            lifecycle: ConnectionLifecycle::Active,
+            read_paused_by_backpressure: false,
             interest: Interest::READABLE,
+        }
+    }
+
+    fn on_peer_closed_or_error(&mut self) {
+        if self.lifecycle == ConnectionLifecycle::Active {
+            self.lifecycle = ConnectionLifecycle::Draining;
+        }
+    }
+
+    fn mark_draining(&mut self) {
+        if self.lifecycle == ConnectionLifecycle::Active {
+            self.lifecycle = ConnectionLifecycle::Draining;
+        }
+    }
+
+    fn mark_closing(&mut self) {
+        self.lifecycle = ConnectionLifecycle::Closing;
+    }
+
+    fn can_read(&self) -> bool {
+        self.lifecycle == ConnectionLifecycle::Active && !self.read_paused_by_backpressure
+    }
+
+    fn should_try_flush(&self) -> bool {
+        !self.write_buffer.is_empty()
+    }
+
+    fn should_close_now(&self) -> bool {
+        self.lifecycle == ConnectionLifecycle::Closing
+            || (self.lifecycle == ConnectionLifecycle::Draining && self.write_buffer.is_empty())
+    }
+
+    fn update_backpressure_state(&mut self, high_watermark: usize, low_watermark: usize) {
+        if self.read_paused_by_backpressure {
+            if self.write_buffer.len() <= low_watermark {
+                self.read_paused_by_backpressure = false;
+            }
+            return;
+        }
+        if self.write_buffer.len() >= high_watermark {
+            self.read_paused_by_backpressure = true;
         }
     }
 }
@@ -122,6 +190,8 @@ pub struct ServerReactor {
     events: Events,
     listeners: Vec<ReactorListener>,
     next_token: usize,
+    write_high_watermark: usize,
+    write_low_watermark: usize,
     connections: HashMap<Token, ReactorConnection>,
 }
 
@@ -148,6 +218,8 @@ impl ServerReactor {
         let poll =
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
         let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
+        let (write_high_watermark, write_low_watermark) =
+            config.normalized_backpressure_watermarks();
 
         let mut resp_listener = TcpListener::bind(resp_addr)
             .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
@@ -189,6 +261,8 @@ impl ServerReactor {
             events: Events::with_capacity(config.normalized_max_events()),
             listeners,
             next_token: CONNECTION_TOKEN_START,
+            write_high_watermark,
+            write_low_watermark,
             connections: HashMap::new(),
         })
     }
@@ -316,17 +390,26 @@ impl ServerReactor {
         };
 
         if snapshot.closed_or_error() {
-            connection.closing = true;
+            connection.on_peer_closed_or_error();
         }
 
-        if snapshot.readable() && !connection.closing {
-            Self::read_connection_bytes(app, &mut connection);
+        if snapshot.readable() && connection.can_read() {
+            Self::read_connection_bytes(
+                app,
+                &mut connection,
+                self.write_high_watermark,
+                self.write_low_watermark,
+            );
         }
-        if snapshot.writable() && !connection.write_buffer.is_empty() {
-            Self::flush_connection_writes(&mut connection);
+        if snapshot.writable() && connection.should_try_flush() {
+            Self::flush_connection_writes(
+                &mut connection,
+                self.write_high_watermark,
+                self.write_low_watermark,
+            );
         }
 
-        if connection.closing && connection.write_buffer.is_empty() {
+        if connection.should_close_now() {
             self.close_connection(app, snapshot.token, connection)?;
             return Ok(());
         }
@@ -336,12 +419,17 @@ impl ServerReactor {
         Ok(())
     }
 
-    fn read_connection_bytes(app: &mut ServerApp, connection: &mut ReactorConnection) {
+    fn read_connection_bytes(
+        app: &mut ServerApp,
+        connection: &mut ReactorConnection,
+        write_high_watermark: usize,
+        write_low_watermark: usize,
+    ) {
         let mut chunk = [0_u8; READ_CHUNK_BYTES];
         loop {
             match connection.socket.read(&mut chunk) {
                 Ok(0) => {
-                    connection.closing = true;
+                    connection.mark_draining();
                     return;
                 }
                 Ok(read_len) => {
@@ -353,6 +441,10 @@ impl ServerReactor {
                                     app.execute_parsed_command(&mut connection.logical, parsed)
                                 {
                                     connection.write_buffer.extend_from_slice(&reply);
+                                    connection.update_backpressure_state(
+                                        write_high_watermark,
+                                        write_low_watermark,
+                                    );
                                 }
                             }
                             Ok(None) => break,
@@ -360,7 +452,11 @@ impl ServerReactor {
                                 connection
                                     .write_buffer
                                     .extend_from_slice(format!("-ERR {error}\r\n").as_bytes());
-                                connection.closing = true;
+                                connection.mark_draining();
+                                connection.update_backpressure_state(
+                                    write_high_watermark,
+                                    write_low_watermark,
+                                );
                                 return;
                             }
                         }
@@ -368,26 +464,31 @@ impl ServerReactor {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(_error) => {
-                    connection.closing = true;
+                    connection.mark_closing();
                     return;
                 }
             }
         }
     }
 
-    fn flush_connection_writes(connection: &mut ReactorConnection) {
+    fn flush_connection_writes(
+        connection: &mut ReactorConnection,
+        write_high_watermark: usize,
+        write_low_watermark: usize,
+    ) {
         while !connection.write_buffer.is_empty() {
             match connection.socket.write(connection.write_buffer.as_slice()) {
                 Ok(0) => {
-                    connection.closing = true;
+                    connection.mark_closing();
                     return;
                 }
                 Ok(written) => {
                     let _ = connection.write_buffer.drain(..written);
+                    connection.update_backpressure_state(write_high_watermark, write_low_watermark);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(_error) => {
-                    connection.closing = true;
+                    connection.mark_closing();
                     return;
                 }
             }
@@ -399,11 +500,14 @@ impl ServerReactor {
         token: Token,
         connection: &mut ReactorConnection,
     ) -> DflyResult<()> {
-        let next_interest = if connection.write_buffer.is_empty() {
+        let mut next_interest = if connection.can_read() {
             Interest::READABLE
         } else {
-            Interest::READABLE | Interest::WRITABLE
+            Interest::WRITABLE
         };
+        if !connection.write_buffer.is_empty() {
+            next_interest |= Interest::WRITABLE;
+        }
         if next_interest == connection.interest {
             return Ok(());
         }
