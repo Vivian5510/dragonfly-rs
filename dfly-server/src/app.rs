@@ -228,26 +228,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn execute_parsed_command(
-        &mut self,
-        connection: &mut ServerConnection,
-        parsed: ParsedCommand,
-    ) -> Option<Vec<u8>> {
-        match self.execute_parsed_command_deferred(connection, parsed) {
-            ParsedCommandExecution::Immediate(reply) => reply,
-            ParsedCommandExecution::Deferred(ticket) => {
-                match self.wait_and_take_runtime_reply_ticket(&ticket) {
-                    Ok(reply) => Some(reply),
-                    Err(error) => Some(
-                        CommandReply::Error(format!("runtime dispatch failed: {error}"))
-                            .to_resp_bytes(),
-                    ),
-                }
-            }
-        }
-    }
-
     pub(crate) fn execute_parsed_command_deferred(
         &mut self,
         connection: &mut ServerConnection,

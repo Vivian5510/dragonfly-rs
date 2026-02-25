@@ -442,16 +442,6 @@ impl ServerApp {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_and_take_runtime_reply_ticket(
-        &self,
-        ticket: &RuntimeReplyTicket,
-    ) -> DflyResult<Vec<u8>> {
-        self.runtime
-            .wait_until_processed_sequence(ticket.shard, ticket.sequence)?;
-        self.take_runtime_reply_ticket(ticket)
-    }
-
     fn execute_runtime_command_on_worker_shard(
         &mut self,
         db: u16,
