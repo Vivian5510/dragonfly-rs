@@ -1,6 +1,9 @@
 //! Runtime dispatch/execution path for transactions and direct command ingress.
 
-use super::{RuntimeReplyTicket, ServerApp, ServerConnection, is_runtime_dispatch_error};
+use super::{
+    RuntimeMgetReplyGroup, RuntimeMsetNxStage, RuntimeReplyAggregation, RuntimeReplyTicket,
+    RuntimeSequenceBarrier, ServerApp, ServerConnection, is_runtime_dispatch_error,
+};
 use dfly_common::config::ClusterMode;
 use dfly_common::error::{DflyError, DflyResult};
 use dfly_common::ids::TxId;
@@ -12,8 +15,6 @@ use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
-
-const DIRECT_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_millis(2);
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
@@ -380,61 +381,597 @@ impl ServerApp {
         connection: &ServerConnection,
         frame: &CommandFrame,
     ) -> DflyResult<Option<RuntimeReplyTicket>> {
-        // Start with one narrowly-scoped async fast path so coordinator writeback can
-        // run without blocking on shard barriers. This keeps behavior predictable while
-        // we expand deferred execution to more command families.
-        if connection.context.protocol != ClientProtocol::Resp {
-            return Ok(None);
-        }
         if self.cluster_read_guard().mode != ClusterMode::Disabled {
             return Ok(None);
         }
         if connection.transaction.in_multi() {
             return Ok(None);
         }
-        if frame.name != "GET" || frame.args.len() != 1 {
-            return Ok(None);
-        }
 
-        let shard = self.core.resolve_target_shard(frame);
-        let ready = self
-            .transaction
-            .scheduler
-            .wait_for_shards_available(&[shard], DIRECT_BARRIER_WAIT_TIMEOUT)?;
-        if !ready {
-            return Err(DflyError::InvalidState("transaction shard queue is busy"));
-        }
-
-        let sequence = self.submit_runtime_envelope_with_sequence(
-            shard,
+        self.build_direct_runtime_ticket(
             connection.context.db_index,
+            connection.context.protocol,
             frame,
-            true,
-        )?;
+        )
+    }
+
+    fn build_direct_runtime_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        if matches!(
+            self.core.command_routing(frame),
+            CommandRouting::SingleKey { .. }
+        ) {
+            let shard = self.core.resolve_target_shard(frame);
+            return self.build_single_shard_runtime_ticket(db, protocol, frame, shard);
+        }
+
+        if let Some(ticket) = self.build_copy_rename_runtime_ticket(db, protocol, frame)? {
+            return Ok(Some(ticket));
+        }
+
+        if let Some(ticket) = self.build_multikey_string_runtime_ticket(db, protocol, frame)? {
+            return Ok(Some(ticket));
+        }
+
+        if let Some(ticket) = self.build_multikey_count_runtime_ticket(db, protocol, frame)? {
+            return Ok(Some(ticket));
+        }
+
+        self.dispatch_runtime_for_command_deferred(db, protocol, frame, true)
+    }
+
+    fn build_copy_rename_runtime_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        let Some((source_shard, destination_shard)) = self.copy_rename_shards(frame) else {
+            return Ok(None);
+        };
+        let mut touched_shards = vec![source_shard];
+        if destination_shard != source_shard {
+            touched_shards.push(destination_shard);
+        }
+        self.transaction
+            .scheduler
+            .ensure_shards_available(&touched_shards)?;
+        let source_sequence =
+            self.submit_runtime_envelope_with_sequence(source_shard, db, frame, true)?;
+        let mut barriers = vec![RuntimeSequenceBarrier {
+            shard: source_shard,
+            sequence: source_sequence,
+        }];
+        if destination_shard != source_shard {
+            let destination_sequence =
+                self.submit_runtime_envelope_with_sequence(destination_shard, db, frame, false)?;
+            barriers.push(RuntimeSequenceBarrier {
+                shard: destination_shard,
+                sequence: destination_sequence,
+            });
+        }
         Ok(Some(RuntimeReplyTicket {
-            shard,
-            sequence,
-            protocol: connection.context.protocol,
+            db,
+            txid: None,
+            protocol,
             frame: frame.clone(),
+            barriers,
+            aggregation: RuntimeReplyAggregation::Worker {
+                shard: source_shard,
+                sequence: source_sequence,
+            },
         }))
+    }
+
+    fn build_multikey_string_runtime_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        if let Some(shard) = self.same_shard_multikey_string_target_shard(frame) {
+            return self.build_single_shard_runtime_ticket(db, protocol, frame, shard);
+        }
+        match frame.name.as_str() {
+            "MGET" if frame.args.len() > 1 => self.build_deferred_mget_ticket(db, protocol, frame),
+            "MSET" if !frame.args.is_empty() && frame.args.len().is_multiple_of(2) => {
+                self.build_deferred_mset_ticket(db, protocol, frame)
+            }
+            "MSETNX" if !frame.args.is_empty() && frame.args.len().is_multiple_of(2) => {
+                self.build_deferred_msetnx_ticket(db, protocol, frame)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn build_deferred_mget_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        let mut grouped_keys = BTreeMap::<u16, Vec<(usize, Vec<u8>)>>::new();
+        for (position, key) in frame.args.iter().enumerate() {
+            let shard = self.core.resolve_shard_for_key(key);
+            grouped_keys
+                .entry(shard)
+                .or_default()
+                .push((position, key.clone()));
+        }
+
+        let grouped_entries = grouped_keys.into_iter().collect::<Vec<_>>();
+        let grouped_commands = grouped_entries
+            .iter()
+            .map(|(shard, keys)| {
+                let args = keys.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+                (*shard, CommandFrame::new("MGET", args))
+            })
+            .collect::<Vec<_>>();
+        let replies = self.submit_grouped_worker_commands_deferred(db, grouped_commands, true)?;
+        let groups = grouped_entries
+            .into_iter()
+            .zip(replies.iter())
+            .map(|((_, keys), reply_sequence)| RuntimeMgetReplyGroup {
+                shard: reply_sequence.shard,
+                sequence: reply_sequence.sequence,
+                positions: keys.into_iter().map(|(position, _)| position).collect(),
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(RuntimeReplyTicket {
+            db,
+            txid: None,
+            protocol,
+            frame: frame.clone(),
+            barriers: replies,
+            aggregation: RuntimeReplyAggregation::GroupedMget { groups },
+        }))
+    }
+
+    fn build_deferred_mset_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        let mut grouped_pairs = BTreeMap::<u16, Vec<Vec<u8>>>::new();
+        for pair in frame.args.chunks_exact(2) {
+            let shard = self.core.resolve_shard_for_key(&pair[0]);
+            let grouped = grouped_pairs.entry(shard).or_default();
+            grouped.push(pair[0].clone());
+            grouped.push(pair[1].clone());
+        }
+        let grouped_commands = grouped_pairs
+            .into_iter()
+            .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
+            .collect::<Vec<_>>();
+        let replies = self.submit_grouped_worker_commands_deferred(db, grouped_commands, true)?;
+        Ok(Some(RuntimeReplyTicket {
+            db,
+            txid: None,
+            protocol,
+            frame: frame.clone(),
+            barriers: replies.clone(),
+            aggregation: RuntimeReplyAggregation::GroupedAllOk {
+                replies,
+                command: frame.name.clone(),
+            },
+        }))
+    }
+
+    fn build_deferred_msetnx_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        let mut grouped_exists_keys = BTreeMap::<u16, Vec<Vec<u8>>>::new();
+        let mut grouped_set_pairs = BTreeMap::<u16, Vec<Vec<u8>>>::new();
+        for pair in frame.args.chunks_exact(2) {
+            let shard = self.core.resolve_shard_for_key(&pair[0]);
+            grouped_exists_keys
+                .entry(shard)
+                .or_default()
+                .push(pair[0].clone());
+            let grouped = grouped_set_pairs.entry(shard).or_default();
+            grouped.push(pair[0].clone());
+            grouped.push(pair[1].clone());
+        }
+        let grouped_exists_commands = grouped_exists_keys
+            .into_iter()
+            .map(|(shard, keys)| (shard, CommandFrame::new("EXISTS", keys)))
+            .collect::<Vec<_>>();
+        let exists_replies =
+            self.submit_grouped_worker_commands_deferred(db, grouped_exists_commands, true)?;
+        let grouped_set_commands = grouped_set_pairs
+            .into_iter()
+            .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
+            .collect::<Vec<_>>();
+        Ok(Some(RuntimeReplyTicket {
+            db,
+            txid: None,
+            protocol,
+            frame: frame.clone(),
+            barriers: exists_replies.clone(),
+            aggregation: RuntimeReplyAggregation::MsetNx {
+                grouped_set_commands,
+                exists_replies,
+                set_replies: Vec::new(),
+                stage: RuntimeMsetNxStage::WaitingExists,
+            },
+        }))
+    }
+
+    fn build_multikey_count_runtime_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        if let Some(shard) = self.same_shard_multikey_count_target_shard(frame) {
+            return self.build_single_shard_runtime_ticket(db, protocol, frame, shard);
+        }
+
+        if matches!(frame.name.as_str(), "DEL" | "UNLINK" | "EXISTS" | "TOUCH")
+            && frame.args.len() > 1
+        {
+            let grouped_commands = self.group_multikey_count_frame_by_shard(frame);
+            let replies =
+                self.submit_grouped_worker_commands_deferred(db, grouped_commands, true)?;
+            return Ok(Some(RuntimeReplyTicket {
+                db,
+                txid: None,
+                protocol,
+                frame: frame.clone(),
+                barriers: replies.clone(),
+                aggregation: RuntimeReplyAggregation::GroupedIntegerSum {
+                    replies,
+                    command: frame.name.clone(),
+                },
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn build_single_shard_runtime_ticket(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+        shard: u16,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        self.transaction
+            .scheduler
+            .ensure_shards_available(&[shard])?;
+        let sequence = self.submit_runtime_envelope_with_sequence(shard, db, frame, true)?;
+        Ok(Some(RuntimeReplyTicket {
+            db,
+            txid: None,
+            protocol,
+            frame: frame.clone(),
+            barriers: vec![RuntimeSequenceBarrier { shard, sequence }],
+            aggregation: RuntimeReplyAggregation::Worker { shard, sequence },
+        }))
+    }
+
+    fn submit_grouped_worker_commands_deferred(
+        &self,
+        db: u16,
+        grouped_commands: Vec<(u16, CommandFrame)>,
+        enforce_scheduler_barrier: bool,
+    ) -> DflyResult<Vec<RuntimeSequenceBarrier>> {
+        if grouped_commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if enforce_scheduler_barrier {
+            let mut touched_shards = grouped_commands
+                .iter()
+                .map(|(shard, _)| *shard)
+                .collect::<Vec<_>>();
+            touched_shards.sort_unstable();
+            touched_shards.dedup();
+            self.transaction
+                .scheduler
+                .ensure_shards_available(&touched_shards)?;
+        }
+
+        let mut replies = Vec::with_capacity(grouped_commands.len());
+        for (shard, grouped_frame) in grouped_commands {
+            let sequence =
+                self.submit_runtime_envelope_with_sequence(shard, db, &grouped_frame, true)?;
+            replies.push(RuntimeSequenceBarrier { shard, sequence });
+        }
+        Ok(replies)
+    }
+
+    fn runtime_sequences_ready(&self, barriers: &[RuntimeSequenceBarrier]) -> DflyResult<bool> {
+        for barrier in barriers {
+            let ready = self.runtime.wait_for_processed_sequence(
+                barrier.shard,
+                barrier.sequence,
+                Duration::ZERO,
+            )?;
+            if !ready {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn take_runtime_reply_from_sequence(
+        &self,
+        barrier: RuntimeSequenceBarrier,
+    ) -> DflyResult<CommandReply> {
+        let reply = self
+            .runtime
+            .take_processed_reply(barrier.shard, barrier.sequence)?;
+        reply.ok_or(DflyError::InvalidState("missing worker reply"))
+    }
+
+    fn take_grouped_worker_replies(
+        &self,
+        replies: &[RuntimeSequenceBarrier],
+    ) -> DflyResult<Vec<CommandReply>> {
+        let mut grouped = Vec::with_capacity(replies.len());
+        for barrier in replies {
+            grouped.push(self.take_runtime_reply_from_sequence(*barrier)?);
+        }
+        Ok(grouped)
+    }
+
+    fn reduce_grouped_integer_sum(
+        &self,
+        replies: &[RuntimeSequenceBarrier],
+        command: &str,
+    ) -> DflyResult<CommandReply> {
+        let grouped = self.take_grouped_worker_replies(replies)?;
+        let mut total = 0_i64;
+        for reply in grouped {
+            match reply {
+                CommandReply::Integer(delta) => total = total.saturating_add(delta.max(0)),
+                CommandReply::Moved { slot, endpoint } => {
+                    return Ok(CommandReply::Moved { slot, endpoint });
+                }
+                CommandReply::Error(message) => return Ok(CommandReply::Error(message)),
+                _ => {
+                    return Ok(CommandReply::Error(format!(
+                        "internal error: {command} did not return integer reply"
+                    )));
+                }
+            }
+        }
+        Ok(CommandReply::Integer(total))
+    }
+
+    fn reduce_grouped_all_ok(
+        &self,
+        replies: &[RuntimeSequenceBarrier],
+        command: &str,
+    ) -> DflyResult<CommandReply> {
+        let grouped = self.take_grouped_worker_replies(replies)?;
+        for reply in grouped {
+            match reply {
+                CommandReply::SimpleString(ok) if ok == "OK" => {}
+                CommandReply::Moved { slot, endpoint } => {
+                    return Ok(CommandReply::Moved { slot, endpoint });
+                }
+                CommandReply::Error(message) => return Ok(CommandReply::Error(message)),
+                _ => {
+                    return Ok(CommandReply::Error(format!(
+                        "internal error: {command} did not return simple-string reply"
+                    )));
+                }
+            }
+        }
+        Ok(CommandReply::SimpleString("OK".to_owned()))
+    }
+
+    fn reduce_grouped_mget(
+        &self,
+        frame: &CommandFrame,
+        groups: &[RuntimeMgetReplyGroup],
+    ) -> DflyResult<CommandReply> {
+        let mut replies = vec![CommandReply::Null; frame.args.len()];
+        for group in groups {
+            let reply = self.take_runtime_reply_from_sequence(RuntimeSequenceBarrier {
+                shard: group.shard,
+                sequence: group.sequence,
+            })?;
+            let values = match reply {
+                CommandReply::Array(values) => values,
+                CommandReply::Moved { slot, endpoint } => {
+                    return Ok(CommandReply::Moved { slot, endpoint });
+                }
+                CommandReply::Error(message) => return Ok(CommandReply::Error(message)),
+                _ => {
+                    return Ok(CommandReply::Error(
+                        "internal error: MGET did not return array reply".to_owned(),
+                    ));
+                }
+            };
+            if values.len() != group.positions.len() {
+                return Ok(CommandReply::Error(
+                    "internal error: MGET worker reply cardinality mismatch".to_owned(),
+                ));
+            }
+            for (position, value) in group.positions.iter().copied().zip(values) {
+                match value {
+                    CommandReply::BulkString(_) | CommandReply::Null => replies[position] = value,
+                    CommandReply::Moved { slot, endpoint } => {
+                        return Ok(CommandReply::Moved { slot, endpoint });
+                    }
+                    CommandReply::Error(message) => return Ok(CommandReply::Error(message)),
+                    _ => {
+                        return Ok(CommandReply::Error(
+                            "internal error: MGET value reply was not bulk-string or null"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(CommandReply::Array(replies))
+    }
+
+    fn try_advance_msetnx_ticket(&self, ticket: &mut RuntimeReplyTicket) -> DflyResult<bool> {
+        let RuntimeReplyAggregation::MsetNx {
+            grouped_set_commands,
+            exists_replies,
+            set_replies,
+            stage,
+        } = &mut ticket.aggregation
+        else {
+            return self.runtime_sequences_ready(&ticket.barriers);
+        };
+
+        loop {
+            match stage {
+                RuntimeMsetNxStage::WaitingExists => {
+                    if !self.runtime_sequences_ready(exists_replies)? {
+                        return Ok(false);
+                    }
+                    let exists_grouped = self.take_grouped_worker_replies(exists_replies)?;
+                    let mut existing = 0_i64;
+                    for reply in exists_grouped {
+                        match reply {
+                            CommandReply::Integer(count) => {
+                                existing = existing.saturating_add(count.max(0));
+                            }
+                            CommandReply::Moved { slot, endpoint } => {
+                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved {
+                                    slot,
+                                    endpoint,
+                                });
+                                return Ok(true);
+                            }
+                            CommandReply::Error(message) => {
+                                *stage =
+                                    RuntimeMsetNxStage::Completed(CommandReply::Error(message));
+                                return Ok(true);
+                            }
+                            _ => {
+                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
+                                    "internal error: EXISTS did not return integer reply"
+                                        .to_owned(),
+                                ));
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    if existing > 0 {
+                        *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(0));
+                        return Ok(true);
+                    }
+
+                    let submitted = match self.submit_grouped_worker_commands_deferred(
+                        ticket.db,
+                        grouped_set_commands.clone(),
+                        true,
+                    ) {
+                        Ok(submitted) => submitted,
+                        Err(error) => {
+                            *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(format!(
+                                "runtime dispatch failed: {error}"
+                            )));
+                            return Ok(true);
+                        }
+                    };
+                    set_replies.clone_from(&submitted);
+                    ticket.barriers = submitted;
+                    *stage = RuntimeMsetNxStage::WaitingSet;
+                }
+                RuntimeMsetNxStage::WaitingSet => {
+                    if !self.runtime_sequences_ready(set_replies)? {
+                        return Ok(false);
+                    }
+                    let grouped_set = self.take_grouped_worker_replies(set_replies)?;
+                    for reply in grouped_set {
+                        match reply {
+                            CommandReply::SimpleString(ok) if ok == "OK" => {}
+                            CommandReply::Moved { slot, endpoint } => {
+                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved {
+                                    slot,
+                                    endpoint,
+                                });
+                                return Ok(true);
+                            }
+                            CommandReply::Error(message) => {
+                                *stage =
+                                    RuntimeMsetNxStage::Completed(CommandReply::Error(message));
+                                return Ok(true);
+                            }
+                            _ => {
+                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
+                                    "MSETNX failed while setting key".to_owned(),
+                                ));
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(1));
+                    return Ok(true);
+                }
+                RuntimeMsetNxStage::Completed(_) => return Ok(true),
+            }
+        }
     }
 
     pub(crate) fn runtime_reply_ticket_ready(
         &self,
-        ticket: &RuntimeReplyTicket,
+        ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<bool> {
-        self.runtime
-            .wait_for_processed_sequence(ticket.shard, ticket.sequence, Duration::ZERO)
+        if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. }) {
+            return self.try_advance_msetnx_ticket(ticket);
+        }
+        self.runtime_sequences_ready(&ticket.barriers)
     }
 
     pub(crate) fn take_runtime_reply_ticket(
         &self,
-        ticket: &RuntimeReplyTicket,
+        ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<Vec<u8>> {
-        let reply = self
-            .runtime
-            .take_processed_reply(ticket.shard, ticket.sequence)?;
-        let reply = reply.ok_or(DflyError::InvalidState("missing worker reply"))?;
+        if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. })
+            && !self.try_advance_msetnx_ticket(ticket)?
+        {
+            return Err(DflyError::InvalidState(
+                "runtime deferred reply is not ready",
+            ));
+        }
+
+        let reply = match &ticket.aggregation {
+            RuntimeReplyAggregation::Worker { shard, sequence } => self
+                .take_runtime_reply_from_sequence(RuntimeSequenceBarrier {
+                    shard: *shard,
+                    sequence: *sequence,
+                })?,
+            RuntimeReplyAggregation::CoordinatorAfterBarrier => {
+                self.execute_command_without_side_effects(ticket.db, &ticket.frame)
+            }
+            RuntimeReplyAggregation::GroupedIntegerSum { replies, command } => {
+                self.reduce_grouped_integer_sum(replies, command)?
+            }
+            RuntimeReplyAggregation::GroupedAllOk { replies, command } => {
+                self.reduce_grouped_all_ok(replies, command)?
+            }
+            RuntimeReplyAggregation::GroupedMget { groups } => {
+                self.reduce_grouped_mget(&ticket.frame, groups)?
+            }
+            RuntimeReplyAggregation::MsetNx { stage, .. } => match stage {
+                RuntimeMsetNxStage::Completed(reply) => reply.clone(),
+                RuntimeMsetNxStage::WaitingExists | RuntimeMsetNxStage::WaitingSet => {
+                    return Err(DflyError::InvalidState(
+                        "runtime deferred MSETNX reply is not ready",
+                    ));
+                }
+            },
+        };
+
+        self.maybe_append_journal_for_command(ticket.txid, ticket.db, &ticket.frame, &reply);
         Ok(super::encode_reply_for_protocol(
             ticket.protocol,
             &ticket.frame,
@@ -1221,6 +1758,57 @@ impl ServerApp {
         self.dispatch_runtime_for_command(db, frame, false)
     }
 
+    fn dispatch_runtime_for_command_deferred(
+        &self,
+        db: u16,
+        protocol: ClientProtocol,
+        frame: &CommandFrame,
+        enforce_scheduler_barrier: bool,
+    ) -> DflyResult<Option<RuntimeReplyTicket>> {
+        let target_shards = self.runtime_target_shards_for_command(frame);
+        if target_shards.is_empty() {
+            return Ok(None);
+        }
+
+        if enforce_scheduler_barrier {
+            self.transaction
+                .scheduler
+                .ensure_shards_available(&target_shards)?;
+        }
+
+        let execute_on_worker = self.cluster_read_guard().mode == ClusterMode::Disabled
+            && self.command_requires_shard_worker_execution(frame);
+
+        let mut barriers = Vec::with_capacity(target_shards.len());
+        let mut worker_sequence = None;
+        for shard in target_shards {
+            let should_execute_on_worker = execute_on_worker && worker_sequence.is_none();
+            let sequence = self.submit_runtime_envelope_with_sequence(
+                shard,
+                db,
+                frame,
+                should_execute_on_worker,
+            )?;
+            if should_execute_on_worker {
+                worker_sequence = Some((shard, sequence));
+            }
+            barriers.push(RuntimeSequenceBarrier { shard, sequence });
+        }
+
+        let aggregation = match worker_sequence {
+            Some((shard, sequence)) => RuntimeReplyAggregation::Worker { shard, sequence },
+            None => RuntimeReplyAggregation::CoordinatorAfterBarrier,
+        };
+        Ok(Some(RuntimeReplyTicket {
+            db,
+            txid: None,
+            protocol,
+            frame: frame.clone(),
+            barriers,
+            aggregation,
+        }))
+    }
+
     pub(super) fn dispatch_runtime_for_command(
         &self,
         db: u16,
@@ -1233,13 +1821,9 @@ impl ServerApp {
         }
 
         if enforce_scheduler_barrier {
-            let ready = self
-                .transaction
+            self.transaction
                 .scheduler
-                .wait_for_shards_available(&target_shards, DIRECT_BARRIER_WAIT_TIMEOUT)?;
-            if !ready {
-                return Err(DflyError::InvalidState("transaction shard queue is busy"));
-            }
+                .ensure_shards_available(&target_shards)?;
         }
         let execute_on_worker = self.cluster_read_guard().mode == ClusterMode::Disabled
             && self.command_requires_shard_worker_execution(frame);

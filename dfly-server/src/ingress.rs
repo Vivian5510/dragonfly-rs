@@ -48,21 +48,26 @@ pub(crate) fn ingress_connection_bytes(
 }
 
 fn resolve_deferred_ingress_reply(app: &ServerApp, ticket: &RuntimeReplyTicket) -> Vec<u8> {
-    match app
-        .runtime
-        .wait_until_processed_sequence(ticket.shard, ticket.sequence)
-    {
-        Ok(()) => match app.take_runtime_reply_ticket(ticket) {
-            Ok(encoded) => encoded,
-            Err(error) => encode_runtime_dispatch_error(
-                ticket.protocol,
-                format!("runtime dispatch failed: {error}"),
-            ),
-        },
-        Err(error) => encode_runtime_dispatch_error(
-            ticket.protocol,
-            format!("runtime dispatch failed: {error}"),
-        ),
+    let mut ticket = ticket.clone();
+    loop {
+        match app.runtime_reply_ticket_ready(&mut ticket) {
+            Ok(true) => {
+                return match app.take_runtime_reply_ticket(&mut ticket) {
+                    Ok(encoded) => encoded,
+                    Err(error) => encode_runtime_dispatch_error(
+                        ticket.protocol,
+                        format!("runtime dispatch failed: {error}"),
+                    ),
+                };
+            }
+            Ok(false) => std::thread::yield_now(),
+            Err(error) => {
+                return encode_runtime_dispatch_error(
+                    ticket.protocol,
+                    format!("runtime dispatch failed: {error}"),
+                );
+            }
+        }
     }
 }
 

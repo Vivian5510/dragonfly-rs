@@ -1325,9 +1325,11 @@ fn drain_connection_pending_runtime_replies(
 ) {
     let mut index = 0_usize;
     while index < connection.pending_runtime_requests.len() {
-        let ready = match app_executor
-            .runtime_reply_ticket_ready(&connection.pending_runtime_requests[index].ticket)
-        {
+        let ready_result = {
+            let pending = &mut connection.pending_runtime_requests[index];
+            app_executor.runtime_reply_ticket_ready(&mut pending.ticket)
+        };
+        let ready = match ready_result {
             Ok(ready) => ready,
             Err(error) => {
                 let pending = connection.pending_runtime_requests.swap_remove(index);
@@ -1347,8 +1349,8 @@ fn drain_connection_pending_runtime_replies(
             continue;
         }
 
-        let pending = connection.pending_runtime_requests.swap_remove(index);
-        let reply = match app_executor.take_runtime_reply_ticket(&pending.ticket) {
+        let mut pending = connection.pending_runtime_requests.swap_remove(index);
+        let reply = match app_executor.take_runtime_reply_ticket(&mut pending.ticket) {
             Ok(reply) => Some(reply),
             Err(error) => Some(runtime_dispatch_error_reply(
                 pending.ticket.protocol,
@@ -1467,15 +1469,18 @@ fn runtime_dispatch_error_reply(protocol: ClientProtocol, error: &DflyError) -> 
 fn reap_detached_runtime_replies(app_executor: &AppExecutor, io_state: &mut WorkerIoState) {
     let mut index = 0_usize;
     while index < io_state.detached_runtime_tickets.len() {
-        let ready = app_executor
-            .runtime_reply_ticket_ready(&io_state.detached_runtime_tickets[index])
-            .unwrap_or(true);
+        let ready = {
+            let ticket = &mut io_state.detached_runtime_tickets[index];
+            app_executor
+                .runtime_reply_ticket_ready(ticket)
+                .unwrap_or(true)
+        };
         if !ready {
             index = index.saturating_add(1);
             continue;
         }
-        let ticket = io_state.detached_runtime_tickets.swap_remove(index);
-        let _ = app_executor.take_runtime_reply_ticket(&ticket);
+        let mut ticket = io_state.detached_runtime_tickets.swap_remove(index);
+        let _ = app_executor.take_runtime_reply_ticket(&mut ticket);
     }
 }
 
@@ -2018,6 +2023,234 @@ mod tests {
     }
 
     #[rstest]
+    fn threaded_reactor_deferred_pipeline_does_not_block_other_connection_progress() {
+        const PIPELINE_GETS: usize = 256;
+        const PING_COUNT: usize = 12;
+
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            ..ServerReactorConfig::default()
+        };
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
+            .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local addr should be available");
+
+        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
+        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
+        client_a
+            .set_nonblocking(true)
+            .expect("first client should be nonblocking");
+        client_b
+            .set_nonblocking(true)
+            .expect("second client should be nonblocking");
+
+        let distribution_deadline = Instant::now() + Duration::from_millis(800);
+        let mut counts = Vec::new();
+        while Instant::now() < distribution_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            counts = reactor.worker_connection_counts();
+            if counts.iter().filter(|count| **count > 0).count() == 2 {
+                break;
+            }
+        }
+        assert_that!(
+            counts.iter().filter(|count| **count > 0).count(),
+            eq(2_usize)
+        );
+
+        client_a
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nka\r\n$1\r\n1\r\n")
+            .expect("seed set should write");
+        let mut set_reply = Vec::new();
+        let set_deadline = Instant::now() + Duration::from_millis(900);
+        while Instant::now() < set_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            let mut chunk = [0_u8; 64];
+            match client_a.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => set_reply.extend_from_slice(&chunk[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("seed set read failed: {error}"),
+            }
+            if set_reply.ends_with(b"+OK\r\n") {
+                break;
+            }
+        }
+        assert_that!(&set_reply, eq(&b"+OK\r\n".to_vec()));
+
+        let mut deferred_pipeline = Vec::new();
+        for _ in 0..PIPELINE_GETS {
+            deferred_pipeline.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$2\r\nka\r\n");
+        }
+        client_a
+            .write_all(&deferred_pipeline)
+            .expect("deferred pipeline write should succeed");
+
+        let mut ping_pipeline = Vec::new();
+        for _ in 0..PING_COUNT {
+            ping_pipeline.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        }
+        client_b
+            .write_all(&ping_pipeline)
+            .expect("ping pipeline write should succeed");
+
+        let expected_ping = b"+PONG\r\n".repeat(PING_COUNT);
+        let mut ping_reply = Vec::new();
+        let ping_deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < ping_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+
+            let mut chunk_b = [0_u8; 512];
+            match client_b.read(&mut chunk_b) {
+                Ok(0) => {}
+                Ok(read_len) => ping_reply.extend_from_slice(&chunk_b[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("ping reply read failed: {error}"),
+            }
+            if ping_reply.len() >= expected_ping.len() {
+                break;
+            }
+        }
+
+        assert_that!(&ping_reply, eq(&expected_ping));
+    }
+
+    #[rstest]
+    fn threaded_reactor_mixed_read_write_pipelines_progress_without_hol_blocking() {
+        const PAIRS: usize = 16;
+
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            ..ServerReactorConfig::default()
+        };
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
+            .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local addr should be available");
+
+        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
+        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
+        client_a
+            .set_nonblocking(true)
+            .expect("first client should be nonblocking");
+        client_b
+            .set_nonblocking(true)
+            .expect("second client should be nonblocking");
+
+        let distribution_deadline = Instant::now() + Duration::from_millis(800);
+        let mut counts = Vec::new();
+        while Instant::now() < distribution_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            counts = reactor.worker_connection_counts();
+            if counts.iter().filter(|count| **count > 0).count() == 2 {
+                break;
+            }
+        }
+        assert_that!(
+            counts.iter().filter(|count| **count > 0).count(),
+            eq(2_usize)
+        );
+
+        let mut pipeline_a = Vec::new();
+        let mut pipeline_b = Vec::new();
+        let mut expected_a = Vec::new();
+        let mut expected_b = Vec::new();
+        for index in 0..PAIRS {
+            let key_a = format!("ka{index}");
+            let value_a = format!("va{index}");
+            pipeline_a.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_a.len(),
+                    key_a,
+                    value_a.len(),
+                    value_a
+                )
+                .as_bytes(),
+            );
+            pipeline_a.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key_a.len(), key_a).as_bytes(),
+            );
+            expected_a.extend_from_slice(b"+OK\r\n");
+            expected_a
+                .extend_from_slice(format!("${}\r\n{}\r\n", value_a.len(), value_a).as_bytes());
+
+            let key_b = format!("kb{index}");
+            let value_b = format!("vb{index}");
+            pipeline_b.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key_b.len(),
+                    key_b,
+                    value_b.len(),
+                    value_b
+                )
+                .as_bytes(),
+            );
+            pipeline_b.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key_b.len(), key_b).as_bytes(),
+            );
+            expected_b.extend_from_slice(b"+OK\r\n");
+            expected_b
+                .extend_from_slice(format!("${}\r\n{}\r\n", value_b.len(), value_b).as_bytes());
+        }
+
+        client_a
+            .write_all(&pipeline_a)
+            .expect("first pipeline write should succeed");
+        client_b
+            .write_all(&pipeline_b)
+            .expect("second pipeline write should succeed");
+
+        let mut reply_a = Vec::new();
+        let mut reply_b = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+
+            let mut chunk_a = [0_u8; 4096];
+            match client_a.read(&mut chunk_a) {
+                Ok(0) => {}
+                Ok(read_len) => reply_a.extend_from_slice(&chunk_a[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("first mixed pipeline read failed: {error}"),
+            }
+
+            let mut chunk_b = [0_u8; 4096];
+            match client_b.read(&mut chunk_b) {
+                Ok(0) => {}
+                Ok(read_len) => reply_b.extend_from_slice(&chunk_b[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("second mixed pipeline read failed: {error}"),
+            }
+
+            if reply_a.len() >= expected_a.len() && reply_b.len() >= expected_b.len() {
+                break;
+            }
+        }
+
+        assert_that!(&reply_a, eq(&expected_a));
+        assert_that!(&reply_b, eq(&expected_b));
+    }
+
+    #[rstest]
     fn threaded_reactor_executes_resp_and_memcache_roundtrip() {
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let config = ServerReactorConfig {
@@ -2328,10 +2561,12 @@ mod tests {
             .push(super::PendingRuntimeRequest {
                 request_id: 1,
                 ticket: crate::app::RuntimeReplyTicket {
-                    shard,
-                    sequence,
+                    db: 0,
+                    txid: None,
                     protocol: ClientProtocol::Resp,
-                    frame,
+                    frame: frame.clone(),
+                    barriers: vec![crate::app::RuntimeSequenceBarrier { shard, sequence }],
+                    aggregation: crate::app::RuntimeReplyAggregation::Worker { shard, sequence },
                 },
             });
 

@@ -90,12 +90,15 @@ impl AppExecutor {
     }
 
     /// Checks whether one deferred runtime reply is ready.
-    pub fn runtime_reply_ticket_ready(&self, ticket: &RuntimeReplyTicket) -> DflyResult<bool> {
+    pub fn runtime_reply_ticket_ready(&self, ticket: &mut RuntimeReplyTicket) -> DflyResult<bool> {
         self.app.runtime_reply_ticket_ready(ticket)
     }
 
     /// Takes one deferred runtime reply and encodes it for client protocol.
-    pub fn take_runtime_reply_ticket(&self, ticket: &RuntimeReplyTicket) -> DflyResult<Vec<u8>> {
+    pub fn take_runtime_reply_ticket(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+    ) -> DflyResult<Vec<u8>> {
         self.app.take_runtime_reply_ticket(ticket)
     }
 
@@ -1936,14 +1939,93 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 /// Deferred reply handle for one command already submitted to a shard runtime queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeReplyTicket {
-    /// Target shard that owns the command execution.
-    pub(crate) shard: u16,
-    /// Monotonic sequence assigned at submit time on that shard queue.
-    pub(crate) sequence: u64,
+    /// Logical DB selected by the originating connection.
+    pub(crate) db: u16,
+    /// Optional transaction id to preserve journaling grouping semantics.
+    pub(crate) txid: Option<TxId>,
     /// Client protocol used to encode the command reply.
     pub(crate) protocol: ClientProtocol,
     /// Canonical command frame needed for protocol-aware reply encoding.
     pub(crate) frame: CommandFrame,
+    /// Barrier sequences that must be observed before final reply reduction can run.
+    pub(crate) barriers: Vec<RuntimeSequenceBarrier>,
+    /// Strategy used to reduce one or more runtime replies into one command reply.
+    pub(crate) aggregation: RuntimeReplyAggregation,
+}
+
+/// One processed-sequence barrier for deferred runtime completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeSequenceBarrier {
+    /// Target shard owning this sequence.
+    pub(crate) shard: u16,
+    /// Monotonic sequence id within shard runtime queue.
+    pub(crate) sequence: u64,
+}
+
+/// Position map for one deferred MGET grouped shard reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeMgetReplyGroup {
+    /// Shard that executed grouped MGET keys.
+    pub(crate) shard: u16,
+    /// Sequence carrying grouped MGET reply.
+    pub(crate) sequence: u64,
+    /// Original command positions covered by this shard reply.
+    pub(crate) positions: Vec<usize>,
+}
+
+/// Deferred reduction state for one command reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeReplyAggregation {
+    /// Reply is produced by one worker callback envelope.
+    Worker {
+        /// Worker shard owning callback execution.
+        shard: u16,
+        /// Sequence carrying worker reply.
+        sequence: u64,
+    },
+    /// Reply is coordinator-local after runtime barriers complete.
+    CoordinatorAfterBarrier,
+    /// Reply is one integer sum across grouped worker replies.
+    GroupedIntegerSum {
+        /// Grouped per-shard reply sequences.
+        replies: Vec<RuntimeSequenceBarrier>,
+        /// Command label used in error reporting.
+        command: String,
+    },
+    /// Reply is one all-OK reduction across grouped worker replies.
+    GroupedAllOk {
+        /// Grouped per-shard reply sequences.
+        replies: Vec<RuntimeSequenceBarrier>,
+        /// Command label used in error reporting.
+        command: String,
+    },
+    /// Reply is one grouped MGET reconstruction.
+    GroupedMget {
+        /// Per-shard grouped reply layout.
+        groups: Vec<RuntimeMgetReplyGroup>,
+    },
+    /// Reply is one two-stage MSETNX flow (EXISTS then conditional MSET fanout).
+    MsetNx {
+        /// Stage-local grouped MSET commands to submit if EXISTS reports zero.
+        grouped_set_commands: Vec<(u16, CommandFrame)>,
+        /// EXISTS phase grouped reply sequences.
+        exists_replies: Vec<RuntimeSequenceBarrier>,
+        /// MSET phase grouped reply sequences.
+        set_replies: Vec<RuntimeSequenceBarrier>,
+        /// Mutable stage state advanced by non-blocking ready checks.
+        stage: RuntimeMsetNxStage,
+    },
+}
+
+/// Stage machine for deferred MSETNX reduction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeMsetNxStage {
+    /// Awaiting EXISTS replies.
+    WaitingExists,
+    /// Awaiting conditional MSET replies.
+    WaitingSet,
+    /// Final command reply ready for encoding/journaling.
+    Completed(CommandReply),
 }
 
 /// Result shape for parsed-command execution in threaded network mode.
