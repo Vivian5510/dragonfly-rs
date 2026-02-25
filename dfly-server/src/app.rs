@@ -1308,17 +1308,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         let Ok(master_id) = std::str::from_utf8(&frame.args[1]) else {
             return CommandReply::Error("DFLY FLOW master id must be valid UTF-8".to_owned());
         };
-        let mut replication = self.replication_guard();
-        if master_id != replication.master_replid() {
-            return CommandReply::Error("bad master id".to_owned());
-        }
 
         let Ok(sync_id) = std::str::from_utf8(&frame.args[2]) else {
             return CommandReply::Error("DFLY FLOW sync id must be valid UTF-8".to_owned());
         };
-        if !replication.is_known_sync_session(sync_id) {
-            return CommandReply::Error("syncid not found".to_owned());
-        }
 
         let Ok(flow_id_text) = std::str::from_utf8(&frame.args[3]) else {
             return CommandReply::Error("DFLY FLOW flow id must be valid UTF-8".to_owned());
@@ -1363,6 +1356,14 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         } else {
             None
         };
+
+        let mut replication = self.replication_guard();
+        if master_id != replication.master_replid() {
+            return CommandReply::Error("bad master id".to_owned());
+        }
+        if !replication.is_known_sync_session(sync_id) {
+            return CommandReply::Error("syncid not found".to_owned());
+        }
 
         let (sync_type, flow_start_offset) = requested_offset
             .filter(|offset| replication.can_partial_sync_from_offset(*offset))
