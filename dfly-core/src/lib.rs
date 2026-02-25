@@ -584,13 +584,12 @@ impl CoreModule {
     ///
     /// Returns `DflyError::Protocol` when snapshot carries an out-of-range shard id.
     pub fn import_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
-        for state in &self.shard_states {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *state = DispatchState::default();
-        }
-
+        // Keep snapshot import atomic at module granularity:
+        // 1) validate and normalize all entries first,
+        // 2) clear existing state only after validation passes,
+        // 3) then apply normalized entries.
+        let shard_len = self.shard_states.len();
+        let mut entries_by_owner = vec![Vec::<SnapshotEntry>::new(); shard_len];
         for entry in &snapshot.entries {
             if self.shard_states.get(usize::from(entry.shard)).is_none() {
                 return Err(DflyError::Protocol(format!(
@@ -602,7 +601,27 @@ impl CoreModule {
             // Keep loader deterministic with active routing policy: even if snapshot metadata
             // advertises a different shard id, actual placement follows hash-slot ownership.
             let owner_shard = self.resolve_shard_for_key(&entry.key);
-            let Some(state) = self.shard_states.get(usize::from(owner_shard)) else {
+            let owner_index = usize::from(owner_shard);
+            let Some(owner_bucket) = entries_by_owner.get_mut(owner_index) else {
+                return Err(DflyError::InvalidState(
+                    "snapshot key resolved to unknown owner shard",
+                ));
+            };
+            owner_bucket.push(entry.clone());
+        }
+
+        for state in &self.shard_states {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state = DispatchState::default();
+        }
+
+        for (owner_index, entries) in entries_by_owner.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let Some(state) = self.shard_states.get(owner_index) else {
                 return Err(DflyError::InvalidState(
                     "snapshot key resolved to unknown owner shard",
                 ));
@@ -610,14 +629,16 @@ impl CoreModule {
             let mut state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.db_tables.entry(entry.db).or_default().prime.insert(
-                entry.key.clone(),
-                ValueEntry {
-                    value: entry.value.clone(),
-                    expire_at_unix_secs: entry.expire_at_unix_secs,
-                },
-            );
-            state.mark_key_loaded(entry.db, &entry.key);
+            for entry in entries {
+                state.db_tables.entry(entry.db).or_default().prime.insert(
+                    entry.key.clone(),
+                    ValueEntry {
+                        value: entry.value,
+                        expire_at_unix_secs: entry.expire_at_unix_secs,
+                    },
+                );
+                state.mark_key_loaded(entry.db, &entry.key);
+            }
         }
         Ok(())
     }
@@ -1609,6 +1630,49 @@ mod tests {
             panic!("expected protocol error");
         };
         assert_that!(message.contains("unknown shard"), eq(true));
+    }
+
+    #[rstest]
+    fn core_snapshot_import_failure_keeps_existing_state_unchanged() {
+        let core = CoreModule::new(ShardCount::new(4).expect("valid shard count"));
+        let preserved_key = b"snapshot:preserve".to_vec();
+        let _ = core.execute_in_db(
+            0,
+            &CommandFrame::new("SET", vec![preserved_key.clone(), b"keep".to_vec()]),
+        );
+
+        let snapshot = CoreSnapshot {
+            entries: vec![
+                SnapshotEntry {
+                    shard: 0,
+                    db: 0,
+                    key: b"snapshot:new".to_vec(),
+                    value: b"value".to_vec(),
+                    expire_at_unix_secs: None,
+                },
+                SnapshotEntry {
+                    shard: u16::MAX,
+                    db: 0,
+                    key: b"snapshot:invalid".to_vec(),
+                    value: b"broken".to_vec(),
+                    expire_at_unix_secs: None,
+                },
+            ],
+        };
+
+        let error = core
+            .import_snapshot(&snapshot)
+            .expect_err("out-of-range shard metadata must fail");
+        let DflyError::Protocol(message) = error else {
+            panic!("expected protocol error");
+        };
+        assert_that!(message.contains("unknown shard"), eq(true));
+
+        let preserved = core.execute_in_db(0, &CommandFrame::new("GET", vec![preserved_key]));
+        assert_that!(&preserved, eq(&CommandReply::BulkString(b"keep".to_vec())));
+        let new_key =
+            core.execute_in_db(0, &CommandFrame::new("GET", vec![b"snapshot:new".to_vec()]));
+        assert_that!(&new_key, eq(&CommandReply::Null));
     }
 
     #[rstest]
