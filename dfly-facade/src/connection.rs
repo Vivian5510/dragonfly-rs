@@ -61,6 +61,61 @@ impl ConnectionState {
         }
     }
 
+    /// Advances parser buffer after a protocol error so memcache ingress can keep ordering.
+    ///
+    /// Returns `true` when at least one byte was discarded.
+    pub fn recover_after_protocol_error(&mut self) -> bool {
+        if self.read_buffer.is_empty() {
+            return false;
+        }
+        if self.context.protocol != ClientProtocol::Memcache {
+            return false;
+        }
+
+        let Some(line_end) = self
+            .read_buffer
+            .windows(2)
+            .position(|window| window == [b'\r', b'\n'])
+        else {
+            return false;
+        };
+        let line_consumed = line_end.saturating_add(2);
+        let line = &self.read_buffer[..line_end];
+        let mut consumed = line_consumed;
+
+        // For malformed memcache SET payloads, skip the declared data block too when available.
+        let parts = line
+            .split(|byte| *byte == b' ')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if let Some(name) = parts.first()
+            && name.eq_ignore_ascii_case(b"set")
+            && let Some(bytes_field) = parts.get(4)
+            && let Ok(bytes_text) = std::str::from_utf8(bytes_field)
+            && let Ok(value_len) = bytes_text.parse::<usize>()
+        {
+            let payload_start = line_consumed;
+            let expected_payload_end = payload_start.saturating_add(value_len);
+            let expected_command_end = expected_payload_end.saturating_add(2);
+            if self.read_buffer.len() >= expected_command_end {
+                if self.read_buffer[expected_payload_end..expected_command_end] == [b'\r', b'\n'] {
+                    consumed = expected_command_end;
+                } else if let Some(relative_crlf) = self.read_buffer[payload_start..]
+                    .windows(2)
+                    .position(|window| window == [b'\r', b'\n'])
+                {
+                    consumed = payload_start
+                        .saturating_add(relative_crlf)
+                        .saturating_add(2);
+                }
+            }
+        }
+
+        let consumed = consumed.min(self.read_buffer.len());
+        self.read_buffer.drain(..consumed);
+        true
+    }
+
     /// Returns the number of pending bytes still waiting to be parsed.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
@@ -152,5 +207,41 @@ mod tests {
         let expected_args = vec![b"profile:1".to_vec(), b"alice".to_vec()];
         assert_that!(parsed.name, eq("SET"));
         assert_that!(&parsed.args, eq(&expected_args));
+    }
+
+    #[rstest]
+    fn memcache_connection_recover_after_protocol_error_skips_bad_line() {
+        let mut connection = make_memcache_connection();
+        connection.feed_bytes(b"set bad 0 0 -1\r\nget key\r\n");
+
+        let first = connection.try_pop_command();
+        assert_that!(first.is_err(), eq(true));
+        assert_that!(connection.recover_after_protocol_error(), eq(true));
+
+        let second = connection
+            .try_pop_command()
+            .expect("parser should recover after dropping invalid line")
+            .expect("next valid command should be parsed");
+        let expected_args = vec![b"key".to_vec()];
+        assert_that!(second.name, eq("GET"));
+        assert_that!(&second.args, eq(&expected_args));
+    }
+
+    #[rstest]
+    fn memcache_connection_recover_after_protocol_error_skips_declared_set_payload() {
+        let mut connection = make_memcache_connection();
+        connection.feed_bytes(b"set bad 0 0 3\r\nabcxx\r\nget key\r\n");
+
+        let first = connection.try_pop_command();
+        assert_that!(first.is_err(), eq(true));
+        assert_that!(connection.recover_after_protocol_error(), eq(true));
+
+        let second = connection
+            .try_pop_command()
+            .expect("parser should recover after dropping malformed payload command")
+            .expect("next valid command should be parsed");
+        let expected_args = vec![b"key".to_vec()];
+        assert_that!(second.name, eq("GET"));
+        assert_that!(&second.args, eq(&expected_args));
     }
 }

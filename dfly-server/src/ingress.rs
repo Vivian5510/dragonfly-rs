@@ -21,17 +21,26 @@ pub(crate) fn ingress_connection_bytes(
     connection.parser.feed_bytes(bytes);
     let mut responses = Vec::new();
     loop {
-        let Some(parsed) = connection.parser.try_pop_command()? else {
-            break;
-        };
-        match app.execute_parsed_command_deferred(connection, parsed) {
-            ParsedCommandExecution::Immediate(encoded) => {
-                if let Some(encoded) = encoded {
-                    responses.push(encoded);
+        match connection.parser.try_pop_command() {
+            Ok(Some(parsed)) => match app.execute_parsed_command_deferred(connection, parsed) {
+                ParsedCommandExecution::Immediate(encoded) => {
+                    if let Some(encoded) = encoded {
+                        responses.push(encoded);
+                    }
                 }
-            }
-            ParsedCommandExecution::Deferred(ticket) => {
-                responses.push(resolve_deferred_ingress_reply(app, &ticket));
+                ParsedCommandExecution::Deferred(ticket) => {
+                    responses.push(resolve_deferred_ingress_reply(app, &ticket));
+                }
+            },
+            Ok(None) => break,
+            Err(error) => {
+                if connection.context.protocol != ClientProtocol::Memcache {
+                    return Err(error);
+                }
+                responses.push(format!("CLIENT_ERROR {error}\r\n").as_bytes().to_vec());
+                if !connection.parser.recover_after_protocol_error() {
+                    break;
+                }
             }
         }
     }
