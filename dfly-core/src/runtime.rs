@@ -388,6 +388,9 @@ impl InMemoryShardRuntime {
         let Some(sender) = self.senders.get(shard) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
+        let Some(execution_state) = self.execution_per_shard.get(shard) else {
+            return Err(DflyError::InvalidState("target shard is out of range"));
+        };
         let Some(queue_metrics) = self.queue_metrics_per_shard.get(shard) else {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
@@ -395,9 +398,10 @@ impl InMemoryShardRuntime {
             return Err(DflyError::InvalidState("target shard is out of range"));
         };
 
+        let queue_soft_limit = self.queue_soft_limit;
         let mut blocked_submitter_marked = false;
-        while self.queue_soft_limit != usize::MAX
-            && queue_metrics.pending.load(Ordering::Acquire) >= self.queue_soft_limit
+        while queue_soft_limit != usize::MAX
+            && queue_metrics.pending.load(Ordering::Acquire) >= queue_soft_limit
         {
             if !blocked_submitter_marked {
                 let _ = queue_metrics
@@ -405,7 +409,16 @@ impl InMemoryShardRuntime {
                     .fetch_add(1, Ordering::AcqRel);
                 blocked_submitter_marked = true;
             }
-            thread::yield_now();
+            let guard = execution_state
+                .inner
+                .lock()
+                .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+            let _guard = execution_state
+                .changed
+                .wait_while(guard, |_inner| {
+                    queue_metrics.pending.load(Ordering::Acquire) >= queue_soft_limit
+                })
+                .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
         }
         if blocked_submitter_marked {
             let _ = queue_metrics.blocked_submitters.fetch_update(
@@ -611,6 +624,9 @@ async fn shard_execution_fiber(
                             Some(pending.saturating_sub(1))
                         });
             }
+            if let Some(state) = execution_per_shard.get(shard) {
+                state.changed.notify_all();
+            }
             continue;
         }
 
@@ -636,6 +652,9 @@ async fn shard_execution_fiber(
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     Some(pending.saturating_sub(1))
                 });
+        }
+        if let Some(state) = execution_per_shard.get(shard) {
+            state.changed.notify_all();
         }
 
         processed_since_yield = processed_since_yield.saturating_add(1);
