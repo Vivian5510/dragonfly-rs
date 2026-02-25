@@ -4,6 +4,7 @@ pub mod plan;
 pub mod scheduler;
 pub mod session;
 
+use dfly_common::ids::ShardCount;
 use scheduler::InMemoryTransactionScheduler;
 
 /// Transaction subsystem bootstrap module.
@@ -14,11 +15,11 @@ pub struct TransactionModule {
 }
 
 impl TransactionModule {
-    /// Creates the transaction module with an in-memory scheduler.
+    /// Creates the transaction module with shard-scoped scheduler state.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(shard_count: ShardCount) -> Self {
         Self {
-            scheduler: InMemoryTransactionScheduler::default(),
+            scheduler: InMemoryTransactionScheduler::with_shard_count(shard_count),
         }
     }
 }

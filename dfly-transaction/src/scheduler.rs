@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use dfly_common::error::{DflyError, DflyResult};
-use dfly_common::ids::{ShardId, TxId};
+use dfly_common::ids::{ShardCount, ShardId, TxId};
 use dfly_core::{SingleKeyAccess, classify_single_key_access};
 
 use crate::plan::{TransactionMode, TransactionPlan};
@@ -68,8 +68,8 @@ pub trait TransactionScheduler: Send + Sync {
 /// so we allow only one active transaction per shard queue head at a time.
 #[derive(Debug)]
 pub struct InMemoryTransactionScheduler {
-    shard_queues: Mutex<HashMap<ShardId, Arc<ShardAdmission>>>,
-    key_locks: Mutex<HashMap<ShardId, Arc<Mutex<KeyLockMap>>>>,
+    shard_queues: Vec<Arc<ShardAdmission>>,
+    key_locks: Vec<Arc<Mutex<KeyLockMap>>>,
     active: Mutex<ActiveLeaseMap>,
 }
 
@@ -109,11 +109,9 @@ struct ActiveLease {
 
 impl Default for InMemoryTransactionScheduler {
     fn default() -> Self {
-        Self {
-            shard_queues: Mutex::new(HashMap::new()),
-            key_locks: Mutex::new(HashMap::new()),
-            active: Mutex::new(HashMap::new()),
-        }
+        let shard_count =
+            ShardCount::new(4).expect("literal default scheduler shard count must be non-zero");
+        Self::with_shard_count(shard_count)
     }
 }
 
@@ -129,6 +127,7 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
         }
 
         let shards = validate_touched_shard_footprint(plan)?;
+        self.ensure_shards_in_range(&shards)?;
 
         let key_accesses = match plan.mode {
             TransactionMode::LockAhead => collect_lock_ahead_accesses(plan)?,
@@ -257,6 +256,41 @@ impl TransactionScheduler for InMemoryTransactionScheduler {
 }
 
 impl InMemoryTransactionScheduler {
+    /// Creates scheduler state with one pre-allocated queue and key-lock map per shard.
+    ///
+    /// Dragonfly keeps per-shard scheduling ownership fixed for process lifetime.
+    /// We mirror that by avoiding hash lookups for shard-state handles on hot paths.
+    #[must_use]
+    pub fn with_shard_count(shard_count: ShardCount) -> Self {
+        let shard_len = usize::from(shard_count.get());
+        Self {
+            shard_queues: (0..shard_len)
+                .map(|_| Arc::new(ShardAdmission::default()))
+                .collect(),
+            key_locks: (0..shard_len)
+                .map(|_| Arc::new(Mutex::new(HashMap::new())))
+                .collect(),
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn ensure_shards_in_range(&self, shards: &[ShardId]) -> DflyResult<()> {
+        for shard in shards {
+            let _ = self.shard_index(*shard)?;
+        }
+        Ok(())
+    }
+
+    fn shard_index(&self, shard: ShardId) -> DflyResult<usize> {
+        let index = usize::from(shard);
+        if index >= self.shard_queues.len() {
+            return Err(DflyError::InvalidState(
+                "transaction plan shard id is out of scheduler range",
+            ));
+        }
+        Ok(index)
+    }
+
     fn is_active_txid(&self, txid: TxId) -> DflyResult<bool> {
         let active = self
             .active
@@ -415,43 +449,29 @@ impl InMemoryTransactionScheduler {
     }
 
     fn shard_queue_handle(&self, shard: ShardId) -> DflyResult<Arc<ShardAdmission>> {
-        let mut shard_queues = self.shard_queues.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
-        })?;
-        Ok(shard_queues
-            .entry(shard)
-            .or_insert_with(|| Arc::new(ShardAdmission::default()))
-            .clone())
+        let shard_index = self.shard_index(shard)?;
+        Ok(Arc::clone(&self.shard_queues[shard_index]))
     }
 
     fn shard_queue_handle_if_exists(
         &self,
         shard: ShardId,
     ) -> DflyResult<Option<Arc<ShardAdmission>>> {
-        let shard_queues = self.shard_queues.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler shard queue mutex is poisoned")
-        })?;
-        Ok(shard_queues.get(&shard).cloned())
+        let shard_index = self.shard_index(shard)?;
+        Ok(Some(Arc::clone(&self.shard_queues[shard_index])))
     }
 
     fn key_lock_handle(&self, shard: ShardId) -> DflyResult<Arc<Mutex<KeyLockMap>>> {
-        let mut key_locks = self.key_locks.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
-        })?;
-        Ok(key_locks
-            .entry(shard)
-            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
-            .clone())
+        let shard_index = self.shard_index(shard)?;
+        Ok(Arc::clone(&self.key_locks[shard_index]))
     }
 
     fn key_lock_handle_if_exists(
         &self,
         shard: ShardId,
     ) -> DflyResult<Option<Arc<Mutex<KeyLockMap>>>> {
-        let key_locks = self.key_locks.lock().map_err(|_| {
-            DflyError::InvalidState("transaction scheduler key lock mutex is poisoned")
-        })?;
-        Ok(key_locks.get(&shard).cloned())
+        let shard_index = self.shard_index(shard)?;
+        Ok(Some(Arc::clone(&self.key_locks[shard_index])))
     }
 }
 
@@ -618,6 +638,7 @@ mod tests {
     use super::{InMemoryTransactionScheduler, TransactionScheduler};
     use crate::plan::{TransactionHop, TransactionMode, TransactionPlan};
     use dfly_common::error::DflyError;
+    use dfly_common::ids::ShardCount;
     use dfly_core::command::CommandFrame;
     use googletest::prelude::*;
     use rstest::rstest;
@@ -691,6 +712,35 @@ mod tests {
 
         let result = scheduler.schedule(&plan);
         assert_that!(result.is_err(), eq(true));
+    }
+
+    #[rstest]
+    fn scheduler_rejects_out_of_range_shard_id_for_fixed_shard_count() {
+        let scheduler = InMemoryTransactionScheduler::with_shard_count(
+            ShardCount::new(2).expect("literal shard count must be non-zero"),
+        );
+        let plan = TransactionPlan {
+            txid: 1,
+            mode: TransactionMode::Global,
+            hops: vec![TransactionHop {
+                per_shard: vec![(
+                    2,
+                    CommandFrame::new("SET", vec![b"k".to_vec(), b"v".to_vec()]),
+                )],
+            }],
+            touched_shards: vec![2],
+        };
+
+        let result = scheduler.schedule(&plan);
+        match result {
+            Err(DflyError::InvalidState(message)) => {
+                assert_that!(
+                    message,
+                    eq("transaction plan shard id is out of scheduler range")
+                );
+            }
+            other => panic!("expected out-of-range shard error, got {other:?}"),
+        }
     }
 
     #[rstest]

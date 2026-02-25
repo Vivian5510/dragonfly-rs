@@ -89,7 +89,7 @@ impl ServerApp {
                     .active_expire_pass_on_shard(shard, ACTIVE_EXPIRE_KEYS_PER_TICK);
             },
         );
-        let transaction = TransactionModule::new();
+        let transaction = TransactionModule::new(config.shard_count);
         let storage = StorageModule::new();
         let replication = ReplicationModule::new(true);
         let cluster = ClusterModule::new(config.cluster_mode);
