@@ -709,16 +709,6 @@ async fn shard_execution_fiber(
         } else {
             None
         };
-        if let Some(state) = execution_per_shard.get(shard)
-            && let Ok(mut guard) = state.inner.lock()
-        {
-            guard.processed.push(envelope);
-            guard.processed_sequence = queued.sequence;
-            if let Some(reply) = reply {
-                let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
-            }
-            state.changed.notify_all();
-        }
         if let Some(metrics) = queue_metrics_per_shard.get(shard) {
             let _ = metrics
                 .pending
@@ -732,6 +722,15 @@ async fn shard_execution_fiber(
             );
         }
         if let Some(state) = execution_per_shard.get(shard) {
+            let mut guard = state
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.processed.push(envelope);
+            guard.processed_sequence = queued.sequence;
+            if let Some(reply) = reply {
+                let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
+            }
             state.changed.notify_all();
         }
 
