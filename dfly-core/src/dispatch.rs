@@ -373,19 +373,35 @@ impl DispatchState {
         true
     }
 
+    fn slot_candidate_keys(table: &DbTable, slot: u16) -> Vec<Vec<u8>> {
+        let mut indexed = table
+            .slot_keys
+            .get(&slot)
+            .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        indexed.retain(|key| table.prime.contains_key(key.as_slice()));
+
+        // Slot index is the fast path. If it is empty (or cardinality counters claim
+        // there should be more keys), fall back to a bounded slot scan in `prime` to
+        // heal possible drift from previous recovery/import stages.
+        let tracked_count = table.slot_stats.key_count(slot);
+        if indexed.is_empty() || indexed.len() < tracked_count {
+            let mut seen = indexed.iter().cloned().collect::<HashSet<_>>();
+            for key in table.prime.keys() {
+                if key_slot(key) == slot && seen.insert(key.clone()) {
+                    indexed.push(key.clone());
+                }
+            }
+        }
+        indexed
+    }
+
     /// Returns all keys tracked for one cluster slot in one logical DB.
     #[must_use]
     pub fn slot_keys(&self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
         let mut keys = self
             .db_table(db)
-            .map(|table| {
-                table
-                    .prime
-                    .keys()
-                    .filter(|key| key_slot(key) == slot)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .map(|table| Self::slot_candidate_keys(table, slot))
             .unwrap_or_default();
         keys.sort();
         keys
@@ -418,14 +434,10 @@ impl DispatchState {
     }
 
     fn collect_live_slot_keys(&mut self, db: DbIndex, slot: u16) -> Vec<Vec<u8>> {
-        let Some(candidate_keys) = self.db_table(db).map(|table| {
-            table
-                .prime
-                .keys()
-                .filter(|key| key_slot(key) == slot)
-                .cloned()
-                .collect::<Vec<_>>()
-        }) else {
+        let Some(candidate_keys) = self
+            .db_table(db)
+            .map(|table| Self::slot_candidate_keys(table, slot))
+        else {
             return Vec::new();
         };
 
@@ -2436,6 +2448,26 @@ mod tests {
             eq(key.len().saturating_add(b"value".len()))
         );
         assert_that!(&state.slot_keys(0, slot), eq(&vec![key.clone()]));
+    }
+
+    #[rstest]
+    fn dispatch_slot_keys_fallback_recovers_missing_slot_index_entry() {
+        let registry = CommandRegistry::with_builtin_commands();
+        let mut state = DispatchState::default();
+        let key = b"layered:slot:index:fallback".to_vec();
+        let slot = key_slot(&key);
+
+        let _ = registry.dispatch(
+            0,
+            &CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]),
+            &mut state,
+        );
+        if let Some(table) = state.db_tables.get_mut(&0) {
+            let _ = table.slot_keys.remove(&slot);
+            table.slot_stats.set_count(slot, 1_usize);
+        }
+
+        assert_that!(&state.slot_keys(0, slot), eq(&vec![key]));
     }
 
     #[rstest]
