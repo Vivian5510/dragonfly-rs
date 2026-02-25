@@ -231,7 +231,7 @@ impl ServerApp {
         )
     }
 
-    fn execute_command_after_runtime_barrier(
+    pub(super) fn execute_command_after_runtime_barrier(
         &mut self,
         db: u16,
         command: &CommandFrame,
@@ -246,7 +246,24 @@ impl ServerApp {
         {
             return reply;
         }
+        if self.cluster.mode == ClusterMode::Disabled
+            && self.command_requires_shard_worker_execution(command)
+        {
+            return CommandReply::Error(
+                "runtime dispatch failed: key command escaped shard worker execution".to_owned(),
+            );
+        }
         self.execute_command_without_side_effects(db, command)
+    }
+
+    fn command_requires_shard_worker_execution(&self, command: &CommandFrame) -> bool {
+        if matches!(
+            self.core.command_routing(command),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return true;
+        }
+        matches!(command.name.as_str(), "COPY" | "RENAME" | "RENAMENX")
     }
 
     pub(super) fn collect_worker_hop_replies(

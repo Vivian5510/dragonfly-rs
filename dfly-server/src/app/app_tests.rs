@@ -2320,6 +2320,26 @@ fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
 }
 
 #[rstest]
+fn runtime_post_barrier_rejects_single_key_coordinator_fallback() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let key = b"plan:rt:fallback:single:key".to_vec();
+    let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
+
+    let reply = app.execute_command_after_runtime_barrier(0, &frame);
+    assert_that!(
+        &reply,
+        eq(&CommandReply::Error(
+            "runtime dispatch failed: key command escaped shard worker execution".to_owned()
+        ))
+    );
+
+    let value = app
+        .core
+        .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
+    assert_that!(&value, eq(&CommandReply::Null));
+}
+
+#[rstest]
 fn direct_command_respects_scheduler_barrier() {
     let app = ServerApp::new(RuntimeConfig::default());
     let key = b"direct:rt:block".to_vec();
