@@ -1,6 +1,7 @@
 //! Binary entrypoint for `dfly-server`.
 
 mod app;
+mod ingress;
 mod network;
 
 fn main() {

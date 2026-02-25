@@ -15,6 +15,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use crate::app::{ServerApp, ServerConnection};
+use crate::ingress::ingress_connection_bytes;
 
 const RESP_LISTENER_TOKEN: Token = Token(0);
 const MEMCACHE_LISTENER_TOKEN: Token = Token(1);
@@ -429,11 +430,8 @@ impl ServerReactor {
                     return;
                 }
                 Ok(read_len) => {
-                    match Self::ingress_connection_bytes(
-                        app,
-                        &mut connection.logical,
-                        &chunk[..read_len],
-                    ) {
+                    match ingress_connection_bytes(app, &mut connection.logical, &chunk[..read_len])
+                    {
                         Ok(replies) => {
                             for reply in replies {
                                 connection.write_buffer.extend_from_slice(&reply);
@@ -463,24 +461,6 @@ impl ServerReactor {
                 }
             }
         }
-    }
-
-    fn ingress_connection_bytes(
-        app: &mut ServerApp,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>> {
-        connection.parser.feed_bytes(bytes);
-        let mut responses = Vec::new();
-        loop {
-            let Some(parsed) = connection.parser.try_pop_command()? else {
-                break;
-            };
-            if let Some(encoded) = app.execute_parsed_command(connection, parsed) {
-                responses.push(encoded);
-            }
-        }
-        Ok(responses)
     }
 
     fn flush_connection_writes(

@@ -1,7 +1,8 @@
-use super::{ServerApp, ServerConnection};
+use super::ServerApp;
+use crate::ingress::ingress_connection_bytes;
 use dfly_cluster::slot::{SlotRange, key_slot};
 use dfly_common::config::{ClusterMode, RuntimeConfig};
-use dfly_common::error::{DflyError, DflyResult};
+use dfly_common::error::DflyError;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::protocol::ClientProtocol;
 use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
@@ -12,43 +13,26 @@ use rstest::rstest;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-impl ServerApp {
-    fn feed_connection_bytes(
-        &mut self,
-        connection: &mut ServerConnection,
-        bytes: &[u8],
-    ) -> DflyResult<Vec<Vec<u8>>> {
-        connection.parser.feed_bytes(bytes);
-        let mut responses = Vec::new();
-        loop {
-            let Some(parsed) = connection.parser.try_pop_command()? else {
-                break;
-            };
-            if let Some(encoded) = self.execute_parsed_command(connection, parsed) {
-                responses.push(encoded);
-            }
-        }
-        Ok(responses)
-    }
-}
-
 #[rstest]
 fn resp_connection_executes_set_then_get() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let set_responses = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET command should execute");
+    let set_responses = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET command should execute");
     let expected_set = vec![b"+OK\r\n".to_vec()];
     assert_that!(&set_responses, eq(&expected_set));
 
-    let get_responses = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET command should execute");
+    let get_responses = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET command should execute");
     let expected_get = vec![b"$3\r\nbar\r\n".to_vec()];
     assert_that!(&get_responses, eq(&expected_get));
 }
@@ -58,49 +42,49 @@ fn resp_set_supports_conditional_and_get_options() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
-        )
-        .expect("SET NX should execute");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
+    )
+    .expect("SET NX should execute");
     assert_that!(&first, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let skipped = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
-        )
-        .expect("SET NX on existing key should execute");
+    let skipped = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
+    )
+    .expect("SET NX on existing key should execute");
     assert_that!(&skipped, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let skipped_with_get = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
-        )
-        .expect("SET NX GET should execute");
+    let skipped_with_get = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
+    )
+    .expect("SET NX GET should execute");
     assert_that!(&skipped_with_get, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 
-    let missing_with_xx_get = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"missing", b"value", b"XX", b"GET"]),
-        )
-        .expect("SET XX GET on missing key should execute");
+    let missing_with_xx_get = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"missing", b"value", b"XX", b"GET"]),
+    )
+    .expect("SET XX GET on missing key should execute");
     assert_that!(&missing_with_xx_get, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let existing_with_xx_get = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
-        )
-        .expect("SET XX GET on existing key should execute");
+    let existing_with_xx_get = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
+    )
+    .expect("SET XX GET on existing key should execute");
     assert_that!(&existing_with_xx_get, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 
-    let current = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
-        .expect("GET should execute");
+    let current =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET should execute");
     assert_that!(&current, eq(&vec![b"$2\r\nv2\r\n".to_vec()]));
 }
 
@@ -109,56 +93,68 @@ fn resp_set_applies_expire_and_keepttl_options() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let with_ex = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"ttl:key", b"value", b"EX", b"30"]),
-        )
-        .expect("SET EX should execute");
+    let with_ex = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ttl:key", b"value", b"EX", b"30"]),
+    )
+    .expect("SET EX should execute");
     assert_that!(&with_ex, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let ttl_before = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
-        .expect("TTL should execute");
+    let ttl_before = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"ttl:key"]),
+    )
+    .expect("TTL should execute");
     assert_that!(parse_resp_integer(&ttl_before[0]) > 0, eq(true));
 
-    let keep_ttl = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"ttl:key", b"next", b"KEEPTTL"]),
-        )
-        .expect("SET KEEPTTL should execute");
+    let keep_ttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ttl:key", b"next", b"KEEPTTL"]),
+    )
+    .expect("SET KEEPTTL should execute");
     assert_that!(&keep_ttl, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let ttl_after_keep = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
-        .expect("TTL should execute");
+    let ttl_after_keep = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"ttl:key"]),
+    )
+    .expect("TTL should execute");
     assert_that!(parse_resp_integer(&ttl_after_keep[0]) > 0, eq(true));
 
-    let clear_ttl = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"ttl:key", b"final"]),
-        )
-        .expect("plain SET should execute");
+    let clear_ttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ttl:key", b"final"]),
+    )
+    .expect("plain SET should execute");
     assert_that!(&clear_ttl, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let ttl_after_plain = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
-        .expect("TTL should execute");
+    let ttl_after_plain = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"ttl:key"]),
+    )
+    .expect("TTL should execute");
     assert_that!(&ttl_after_plain, eq(&vec![b":-1\r\n".to_vec()]));
 
-    let with_px = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"px:key", b"value", b"PX", b"1200"]),
-        )
-        .expect("SET PX should execute");
+    let with_px = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"px:key", b"value", b"PX", b"1200"]),
+    )
+    .expect("SET PX should execute");
     assert_that!(&with_px, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let pttl = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"px:key"]))
-        .expect("PTTL should execute");
+    let pttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"px:key"]),
+    )
+    .expect("PTTL should execute");
     assert_that!(parse_resp_integer(&pttl[0]) > 0, eq(true));
 }
 
@@ -167,42 +163,42 @@ fn resp_set_rejects_invalid_option_combinations() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let nx_xx = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"key", b"value", b"NX", b"XX"]),
-        )
-        .expect("SET NX XX should parse");
+    let nx_xx = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"key", b"value", b"NX", b"XX"]),
+    )
+    .expect("SET NX XX should parse");
     assert_that!(&nx_xx, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 
-    let duplicate_expire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"PX", b"1000"]),
-        )
-        .expect("SET EX PX should parse");
+    let duplicate_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"PX", b"1000"]),
+    )
+    .expect("SET EX PX should parse");
     assert_that!(
         &duplicate_expire,
         eq(&vec![b"-ERR syntax error\r\n".to_vec()])
     );
 
-    let keep_with_expire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"KEEPTTL"]),
-        )
-        .expect("SET EX KEEPTTL should parse");
+    let keep_with_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"key", b"value", b"EX", b"1", b"KEEPTTL"]),
+    )
+    .expect("SET EX KEEPTTL should parse");
     assert_that!(
         &keep_with_expire,
         eq(&vec![b"-ERR syntax error\r\n".to_vec()])
     );
 
-    let invalid_integer = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"key", b"value", b"EX", b"abc"]),
-        )
-        .expect("SET EX invalid integer should parse");
+    let invalid_integer = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"key", b"value", b"EX", b"abc"]),
+    )
+    .expect("SET EX invalid integer should parse");
     assert_that!(
         &invalid_integer,
         eq(&vec![
@@ -210,12 +206,12 @@ fn resp_set_rejects_invalid_option_combinations() {
         ])
     );
 
-    let invalid_expire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"key", b"value", b"PX", b"0"]),
-        )
-        .expect("SET PX zero should parse");
+    let invalid_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"key", b"value", b"PX", b"0"]),
+    )
+    .expect("SET PX zero should parse");
     assert_that!(
         &invalid_expire,
         eq(&vec![
@@ -229,17 +225,23 @@ fn resp_type_reports_none_or_string() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let missing = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"missing"]))
-        .expect("TYPE should execute");
+    let missing = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TYPE", b"missing"]),
+    )
+    .expect("TYPE should execute");
     assert_that!(&missing, eq(&vec![b"+none\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should execute");
-    let existing = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"k"]))
-        .expect("TYPE should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should execute");
+    let existing =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"TYPE", b"k"]))
+            .expect("TYPE should execute");
     assert_that!(&existing, eq(&vec![b"+string\r\n".to_vec()]));
 }
 
@@ -248,26 +250,28 @@ fn resp_dbsize_counts_keys_in_selected_database() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k0", b"v0"]))
-        .expect("SET db0 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k0", b"v0"]),
+    )
+    .expect("SET db0 should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
-        .expect("SET db1 should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k1", b"v1"]),
+    )
+    .expect("SET db1 should execute");
 
-    let db1_size = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE"]))
+    let db1_size = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"DBSIZE"]))
         .expect("DBSIZE db1 should execute");
     assert_that!(&db1_size, eq(&vec![b":1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should execute");
-    let db0_size = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE"]))
+    let db0_size = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"DBSIZE"]))
         .expect("DBSIZE db0 should execute");
     assert_that!(&db0_size, eq(&vec![b":1\r\n".to_vec()]));
 }
@@ -277,9 +281,12 @@ fn resp_dbsize_rejects_extra_arguments() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DBSIZE", b"extra"]))
-        .expect("DBSIZE should parse");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DBSIZE", b"extra"]),
+    )
+    .expect("DBSIZE should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -293,8 +300,7 @@ fn resp_randomkey_returns_null_for_empty_database() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"RANDOMKEY"]))
         .expect("RANDOMKEY should execute");
     assert_that!(&reply, eq(&vec![b"$-1\r\n".to_vec()]));
 }
@@ -304,33 +310,30 @@ fn resp_randomkey_returns_existing_key_from_selected_database() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"random:one", b"v1"]),
-        )
-        .expect("SET random:one should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"random:two", b"v2"]),
-        )
-        .expect("SET random:two should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"random:one", b"v1"]),
+    )
+    .expect("SET random:one should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"random:two", b"v2"]),
+    )
+    .expect("SET random:two should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"random:db1", b"x"]),
-        )
-        .expect("SET random:db1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"random:db1", b"x"]),
+    )
+    .expect("SET random:db1 should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should execute");
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"RANDOMKEY"]))
         .expect("RANDOMKEY should execute");
     assert_that!(reply.len(), eq(1_usize));
     let key = decode_resp_bulk_payload(&reply[0]);
@@ -342,9 +345,12 @@ fn resp_randomkey_rejects_arguments() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RANDOMKEY", b"extra"]))
-        .expect("RANDOMKEY should parse");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RANDOMKEY", b"extra"]),
+    )
+    .expect("RANDOMKEY should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -358,36 +364,52 @@ fn resp_keys_filters_matching_keys_in_selected_database() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:1", b"v1"]))
-        .expect("SET user:1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:2", b"v2"]))
-        .expect("SET user:2 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"admin:1", b"v3"]))
-        .expect("SET admin:1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"user:1", b"v1"]),
+    )
+    .expect("SET user:1 should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"user:2", b"v2"]),
+    )
+    .expect("SET user:2 should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"admin:1", b"v3"]),
+    )
+    .expect("SET admin:1 should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"user:db1", b"x"]))
-        .expect("SET db1 key should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"user:db1", b"x"]),
+    )
+    .expect("SET db1 key should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should execute");
 
-    let user_keys = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"user:*"]))
-        .expect("KEYS user:* should execute");
+    let user_keys = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"KEYS", b"user:*"]),
+    )
+    .expect("KEYS user:* should execute");
     assert_that!(
         &user_keys,
         eq(&vec![b"*2\r\n$6\r\nuser:1\r\n$6\r\nuser:2\r\n".to_vec()])
     );
 
-    let no_match = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"missing:*"]))
-        .expect("KEYS missing:* should execute");
+    let no_match = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"KEYS", b"missing:*"]),
+    )
+    .expect("KEYS missing:* should execute");
     assert_that!(&no_match, eq(&vec![b"*0\r\n".to_vec()]));
 }
 
@@ -396,8 +418,7 @@ fn resp_keys_rejects_wrong_arity() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let too_few = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS"]))
+    let too_few = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"KEYS"]))
         .expect("KEYS should parse");
     assert_that!(
         &too_few,
@@ -406,9 +427,12 @@ fn resp_keys_rejects_wrong_arity() {
         ])
     );
 
-    let too_many = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"KEYS", b"a*", b"extra"]))
-        .expect("KEYS should parse");
+    let too_many = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"KEYS", b"a*", b"extra"]),
+    )
+    .expect("KEYS should parse");
     assert_that!(
         &too_many,
         eq(&vec![
@@ -422,8 +446,7 @@ fn resp_time_returns_unix_seconds_and_microseconds() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TIME"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"TIME"]))
         .expect("TIME should execute");
     assert_that!(reply.len(), eq(1_usize));
     let text = std::str::from_utf8(&reply[0]).expect("TIME reply should be UTF-8");
@@ -444,9 +467,12 @@ fn resp_time_rejects_arguments() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TIME", b"extra"]))
-        .expect("TIME should parse");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TIME", b"extra"]),
+    )
+    .expect("TIME should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -461,15 +487,13 @@ fn resp_mset_then_mget_roundtrip() {
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let mset = resp_command(&[b"MSET", b"foo", b"bar", b"baz", b"qux"]);
-    let mset_reply = app
-        .feed_connection_bytes(&mut connection, &mset)
-        .expect("MSET should execute");
+    let mset_reply =
+        ingress_connection_bytes(&mut app, &mut connection, &mset).expect("MSET should execute");
     assert_that!(&mset_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
     let mget = resp_command(&[b"MGET", b"foo", b"baz"]);
-    let mget_reply = app
-        .feed_connection_bytes(&mut connection, &mget)
-        .expect("MGET should execute");
+    let mget_reply =
+        ingress_connection_bytes(&mut app, &mut connection, &mget).expect("MGET should execute");
     let expected = vec![b"*2\r\n$3\r\nbar\r\n$3\r\nqux\r\n".to_vec()];
     assert_that!(&mget_reply, eq(&expected));
 }
@@ -480,9 +504,8 @@ fn resp_mset_rejects_odd_arity() {
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let invalid = resp_command(&[b"MSET", b"foo", b"bar", b"baz"]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &invalid)
-        .expect("MSET should parse");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut connection, &invalid).expect("MSET should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -496,25 +519,28 @@ fn resp_msetnx_sets_all_or_none() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
-        )
-        .expect("first MSETNX should execute");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
+    )
+    .expect("first MSETNX should execute");
     assert_that!(&first, eq(&vec![b":1\r\n".to_vec()]));
 
-    let second = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
-        )
-        .expect("second MSETNX should execute");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
+    )
+    .expect("second MSETNX should execute");
     assert_that!(&second, eq(&vec![b":0\r\n".to_vec()]));
 
-    let values = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MGET", b"a", b"b", b"c"]))
-        .expect("MGET should execute");
+    let values = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MGET", b"a", b"b", b"c"]),
+    )
+    .expect("MGET should execute");
     assert_that!(
         &values,
         eq(&vec![b"*3\r\n$1\r\n1\r\n$1\r\n2\r\n$-1\r\n".to_vec()])
@@ -527,9 +553,8 @@ fn resp_msetnx_rejects_odd_arity() {
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let invalid = resp_command(&[b"MSETNX", b"a", b"1", b"b"]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &invalid)
-        .expect("MSETNX should parse");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut connection, &invalid).expect("MSETNX should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -543,32 +568,41 @@ fn resp_exists_and_del_follow_multi_key_count_semantics() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
-        .expect("SET k1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
-        .expect("SET k2 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k1", b"v1"]),
+    )
+    .expect("SET k1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k2", b"v2"]),
+    )
+    .expect("SET k2 should succeed");
 
-    let exists = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXISTS", b"k1", b"k2", b"missing", b"k1"]),
-        )
-        .expect("EXISTS should execute");
+    let exists = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXISTS", b"k1", b"k2", b"missing", b"k1"]),
+    )
+    .expect("EXISTS should execute");
     assert_that!(&exists, eq(&vec![b":3\r\n".to_vec()]));
 
-    let deleted = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DEL", b"k1", b"k2", b"missing", b"k1"]),
-        )
-        .expect("DEL should execute");
+    let deleted = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DEL", b"k1", b"k2", b"missing", b"k1"]),
+    )
+    .expect("DEL should execute");
     assert_that!(&deleted, eq(&vec![b":2\r\n".to_vec()]));
 
-    let exists_after = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
-        .expect("EXISTS should execute");
+    let exists_after = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXISTS", b"k1", b"k2"]),
+    )
+    .expect("EXISTS should execute");
     assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -577,24 +611,33 @@ fn resp_unlink_follows_multi_key_count_semantics() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
-        .expect("SET k1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
-        .expect("SET k2 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k1", b"v1"]),
+    )
+    .expect("SET k1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k2", b"v2"]),
+    )
+    .expect("SET k2 should succeed");
 
-    let unlinked = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"UNLINK", b"k1", b"k2", b"missing", b"k1"]),
-        )
-        .expect("UNLINK should execute");
+    let unlinked = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"UNLINK", b"k1", b"k2", b"missing", b"k1"]),
+    )
+    .expect("UNLINK should execute");
     assert_that!(&unlinked, eq(&vec![b":2\r\n".to_vec()]));
 
-    let exists_after = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXISTS", b"k1", b"k2"]))
-        .expect("EXISTS should execute");
+    let exists_after = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXISTS", b"k1", b"k2"]),
+    )
+    .expect("EXISTS should execute");
     assert_that!(&exists_after, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -603,19 +646,25 @@ fn resp_touch_counts_existing_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
-        .expect("SET k1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k2", b"v2"]))
-        .expect("SET k2 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k1", b"v1"]),
+    )
+    .expect("SET k1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k2", b"v2"]),
+    )
+    .expect("SET k2 should succeed");
 
-    let touched = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"TOUCH", b"k1", b"k2", b"missing", b"k1"]),
-        )
-        .expect("TOUCH should execute");
+    let touched = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TOUCH", b"k1", b"k2", b"missing", b"k1"]),
+    )
+    .expect("TOUCH should execute");
     assert_that!(&touched, eq(&vec![b":3\r\n".to_vec()]));
 }
 
@@ -624,28 +673,36 @@ fn resp_move_transfers_key_between_databases() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"move:key", b"v"]))
-        .expect("SET should execute");
-    let moved = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"MOVE", b"move:key", b"1"]),
-        )
-        .expect("MOVE should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"move:key", b"v"]),
+    )
+    .expect("SET should execute");
+    let moved = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MOVE", b"move:key", b"1"]),
+    )
+    .expect("MOVE should execute");
     assert_that!(&moved, eq(&vec![b":1\r\n".to_vec()]));
 
-    let source = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"move:key"]))
-        .expect("GET source should execute");
+    let source = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"move:key"]),
+    )
+    .expect("GET source should execute");
     assert_that!(&source, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should execute");
-    let target = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"move:key"]))
-        .expect("GET target should execute");
+    let target = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"move:key"]),
+    )
+    .expect("GET target should execute");
     assert_that!(&target, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
 }
 
@@ -654,27 +711,34 @@ fn resp_move_returns_zero_when_target_contains_key() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dup", b"db0"]))
-        .expect("SET db0 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"dup", b"db0"]),
+    )
+    .expect("SET db0 should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dup", b"db1"]))
-        .expect("SET db1 should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"dup", b"db1"]),
+    )
+    .expect("SET db1 should execute");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should execute");
 
-    let moved = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"dup", b"1"]))
-        .expect("MOVE should execute");
+    let moved = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MOVE", b"dup", b"1"]),
+    )
+    .expect("MOVE should execute");
     assert_that!(&moved, eq(&vec![b":0\r\n".to_vec()]));
 
-    let source = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dup"]))
-        .expect("GET source should execute");
+    let source =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"dup"]))
+            .expect("GET source should execute");
     assert_that!(&source, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
 }
 
@@ -683,49 +747,56 @@ fn resp_copy_follows_dragonfly_replace_and_error_semantics() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let missing = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", b"missing", b"dst"]),
-        )
-        .expect("COPY missing key should parse");
+    let missing = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"missing", b"dst"]),
+    )
+    .expect("COPY missing key should parse");
     assert_that!(&missing, eq(&vec![b":0\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"src", b"60", b"v1"]),
-        )
-        .expect("SETEX src should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dst", b"v2"]))
-        .expect("SET dst should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"src", b"60", b"v1"]),
+    )
+    .expect("SETEX src should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"dst", b"v2"]),
+    )
+    .expect("SET dst should execute");
 
-    let blocked = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
-        .expect("COPY without REPLACE should execute");
+    let blocked = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst"]),
+    )
+    .expect("COPY without REPLACE should execute");
     assert_that!(&blocked, eq(&vec![b":0\r\n".to_vec()]));
 
-    let replaced = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
-        )
-        .expect("COPY REPLACE should execute");
+    let replaced = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
+    )
+    .expect("COPY REPLACE should execute");
     assert_that!(&replaced, eq(&vec![b":1\r\n".to_vec()]));
 
-    let src = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"src"]))
+    let src = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"src"]))
         .expect("GET src should execute");
-    let dst = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dst"]))
+    let dst = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"dst"]))
         .expect("GET dst should execute");
     assert_that!(&src, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
     assert_that!(&dst, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 
-    let same = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"dst", b"dst"]))
-        .expect("COPY same key should parse");
+    let same = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"dst", b"dst"]),
+    )
+    .expect("COPY same key should parse");
     assert_that!(
         &same,
         eq(&vec![
@@ -733,12 +804,12 @@ fn resp_copy_follows_dragonfly_replace_and_error_semantics() {
         ])
     );
 
-    let unsupported_db = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", b"src", b"dst2", b"DB", b"1"]),
-        )
-        .expect("COPY with DB option should parse");
+    let unsupported_db = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst2", b"DB", b"1"]),
+    )
+    .expect("COPY with DB option should parse");
     assert_that!(
         &unsupported_db,
         eq(&vec![b"-ERR syntax error\r\n".to_vec()])
@@ -762,18 +833,18 @@ fn resp_copy_rejects_crossslot_keys_in_cluster_mode() {
         destination_key = format!("copy:{{200}}:{suffix}").into_bytes();
     }
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &source_key, b"value"]),
-        )
-        .expect("SET source should execute");
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", &source_key, &destination_key]),
-        )
-        .expect("COPY should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &source_key, b"value"]),
+    )
+    .expect("SET source should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", &source_key, &destination_key]),
+    )
+    .expect("COPY should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -787,54 +858,64 @@ fn resp_rename_and_renamenx_follow_redis_style_outcomes() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let missing = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAME", b"missing", b"dst"]),
-        )
-        .expect("RENAME missing should parse");
+    let missing = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAME", b"missing", b"dst"]),
+    )
+    .expect("RENAME missing should parse");
     assert_that!(&missing, eq(&vec![b"-ERR no such key\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v1"]))
-        .expect("SET src should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"dst", b"v2"]))
-        .expect("SET dst should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"src", b"v1"]),
+    )
+    .expect("SET src should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"dst", b"v2"]),
+    )
+    .expect("SET dst should execute");
 
-    let blocked = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAMENX", b"src", b"dst"]),
-        )
-        .expect("RENAMENX should execute");
+    let blocked = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAMENX", b"src", b"dst"]),
+    )
+    .expect("RENAMENX should execute");
     assert_that!(&blocked, eq(&vec![b":0\r\n".to_vec()]));
 
-    let renamed = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"src", b"dst"]))
-        .expect("RENAME should execute");
+    let renamed = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAME", b"src", b"dst"]),
+    )
+    .expect("RENAME should execute");
     assert_that!(&renamed, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let src = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"src"]))
+    let src = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"src"]))
         .expect("GET src should execute");
     assert_that!(&src, eq(&vec![b"$-1\r\n".to_vec()]));
-    let dst = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"dst"]))
+    let dst = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"dst"]))
         .expect("GET dst should execute");
     assert_that!(&dst, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 
-    let same = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"dst", b"dst"]))
-        .expect("RENAME same key should execute");
+    let same = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAME", b"dst", b"dst"]),
+    )
+    .expect("RENAME same key should execute");
     assert_that!(&same, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let same_nx = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
-        )
-        .expect("RENAMENX same key should execute");
+    let same_nx = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
+    )
+    .expect("RENAMENX same key should execute");
     assert_that!(&same_nx, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -855,15 +936,18 @@ fn resp_rename_rejects_crossslot_keys_in_cluster_mode() {
         destination_key = format!("acct:{{200}}:{suffix}").into_bytes();
     }
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", &source_key, b"v"]))
-        .expect("SET source should execute");
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAME", &source_key, &destination_key]),
-        )
-        .expect("RENAME should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &source_key, b"v"]),
+    )
+    .expect("SET source should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAME", &source_key, &destination_key]),
+    )
+    .expect("RENAME should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -877,29 +961,41 @@ fn resp_persist_clears_expire_without_removing_key() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ttl:key", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"ttl:key", b"10"]),
-        )
-        .expect("EXPIRE should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ttl:key", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"ttl:key", b"10"]),
+    )
+    .expect("EXPIRE should succeed");
 
-    let persist = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"ttl:key"]))
-        .expect("PERSIST should execute");
+    let persist = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PERSIST", b"ttl:key"]),
+    )
+    .expect("PERSIST should execute");
     assert_that!(&persist, eq(&vec![b":1\r\n".to_vec()]));
 
-    let ttl = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"ttl:key"]))
-        .expect("TTL should execute");
+    let ttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"ttl:key"]),
+    )
+    .expect("TTL should execute");
     assert_that!(&ttl, eq(&vec![b":-1\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"ttl:key"]))
-        .expect("GET should execute");
+    let value = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"ttl:key"]),
+    )
+    .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
 }
 
@@ -908,31 +1004,37 @@ fn resp_setex_sets_value_with_ttl_and_rejects_non_positive_ttl() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let ok = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"session", b"60", b"alive"]),
-        )
-        .expect("SETEX should execute");
+    let ok = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"session", b"60", b"alive"]),
+    )
+    .expect("SETEX should execute");
     assert_that!(&ok, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"session"]))
-        .expect("GET should execute");
+    let value = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"session"]),
+    )
+    .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$5\r\nalive\r\n".to_vec()]));
 
-    let ttl = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"session"]))
-        .expect("TTL should execute");
+    let ttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"session"]),
+    )
+    .expect("TTL should execute");
     let ttl_value = parse_resp_integer(&ttl[0]);
     assert_that!(ttl_value > 0, eq(true));
 
-    let bad = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"session", b"0", b"alive"]),
-        )
-        .expect("SETEX should parse");
+    let bad = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"session", b"0", b"alive"]),
+    )
+    .expect("SETEX should parse");
     assert_that!(
         &bad,
         eq(&vec![
@@ -946,31 +1048,37 @@ fn resp_psetex_sets_value_with_pttl_and_rejects_non_positive_ttl() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let ok = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PSETEX", b"session", b"1500", b"alive"]),
-        )
-        .expect("PSETEX should execute");
+    let ok = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSETEX", b"session", b"1500", b"alive"]),
+    )
+    .expect("PSETEX should execute");
     assert_that!(&ok, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"session"]))
-        .expect("GET should execute");
+    let value = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"session"]),
+    )
+    .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$5\r\nalive\r\n".to_vec()]));
 
-    let pttl = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"session"]))
-        .expect("PTTL should execute");
+    let pttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"session"]),
+    )
+    .expect("PTTL should execute");
     let pttl_value = parse_resp_integer(&pttl[0]);
     assert_that!(pttl_value > 0, eq(true));
 
-    let bad = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PSETEX", b"session", b"0", b"alive"]),
-        )
-        .expect("PSETEX should parse");
+    let bad = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSETEX", b"session", b"0", b"alive"]),
+    )
+    .expect("PSETEX should parse");
     assert_that!(
         &bad,
         eq(&vec![
@@ -984,36 +1092,51 @@ fn resp_pttl_and_pexpire_follow_millisecond_expiry_lifecycle() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"temp", b"value"]))
-        .expect("SET should execute");
-    let pttl_without_expire = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
-        .expect("PTTL should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"temp", b"value"]),
+    )
+    .expect("SET should execute");
+    let pttl_without_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"temp"]),
+    )
+    .expect("PTTL should execute");
     assert_that!(&pttl_without_expire, eq(&vec![b":-1\r\n".to_vec()]));
 
-    let pexpire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIRE", b"temp", b"1500"]),
-        )
-        .expect("PEXPIRE should execute");
+    let pexpire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRE", b"temp", b"1500"]),
+    )
+    .expect("PEXPIRE should execute");
     assert_that!(&pexpire, eq(&vec![b":1\r\n".to_vec()]));
 
-    let pttl = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
-        .expect("PTTL should execute");
+    let pttl = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"temp"]),
+    )
+    .expect("PTTL should execute");
     let pttl_value = parse_resp_integer(&pttl[0]);
     assert_that!(pttl_value > 0, eq(true));
 
-    let pexpire_now = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"temp", b"0"]))
-        .expect("PEXPIRE should execute");
+    let pexpire_now = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRE", b"temp", b"0"]),
+    )
+    .expect("PEXPIRE should execute");
     assert_that!(&pexpire_now, eq(&vec![b":1\r\n".to_vec()]));
 
-    let pttl_after = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"temp"]))
-        .expect("PTTL should execute");
+    let pttl_after = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"temp"]),
+    )
+    .expect("PTTL should execute");
     assert_that!(&pttl_after, eq(&vec![b":-2\r\n".to_vec()]));
 }
 
@@ -1022,67 +1145,76 @@ fn resp_expire_family_supports_nx_xx_gt_lt_options() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"opt:key", b"v"]))
-        .expect("SET should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"opt:key", b"v"]),
+    )
+    .expect("SET should execute");
 
-    let gt_on_persistent = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"GT"]),
-        )
-        .expect("EXPIRE GT should parse");
+    let gt_on_persistent = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"GT"]),
+    )
+    .expect("EXPIRE GT should parse");
     assert_that!(&gt_on_persistent, eq(&vec![b":0\r\n".to_vec()]));
 
-    let lt_on_persistent = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"LT"]),
-        )
-        .expect("EXPIRE LT should parse");
+    let lt_on_persistent = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"10", b"LT"]),
+    )
+    .expect("EXPIRE LT should parse");
     assert_that!(&lt_on_persistent, eq(&vec![b":1\r\n".to_vec()]));
 
-    let first_expiretime = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"opt:key"]))
-        .expect("EXPIRETIME should execute");
+    let first_expiretime = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRETIME", b"opt:key"]),
+    )
+    .expect("EXPIRETIME should execute");
     let first_expiretime = parse_resp_integer(&first_expiretime[0]);
 
-    let nx_with_existing_expire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"NX"]),
-        )
-        .expect("EXPIRE NX should parse");
+    let nx_with_existing_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"NX"]),
+    )
+    .expect("EXPIRE NX should parse");
     assert_that!(&nx_with_existing_expire, eq(&vec![b":0\r\n".to_vec()]));
 
-    let xx_with_existing_expire = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"XX"]),
-        )
-        .expect("EXPIRE XX should parse");
+    let xx_with_existing_expire = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"20", b"XX"]),
+    )
+    .expect("EXPIRE XX should parse");
     assert_that!(&xx_with_existing_expire, eq(&vec![b":1\r\n".to_vec()]));
 
-    let second_expiretime = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"opt:key"]))
-        .expect("EXPIRETIME should execute");
+    let second_expiretime = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRETIME", b"opt:key"]),
+    )
+    .expect("EXPIRETIME should execute");
     let second_expiretime = parse_resp_integer(&second_expiretime[0]);
     assert_that!(second_expiretime > first_expiretime, eq(true));
 
-    let gt_with_smaller_target = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"GT"]),
-        )
-        .expect("EXPIRE GT should parse");
+    let gt_with_smaller_target = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"GT"]),
+    )
+    .expect("EXPIRE GT should parse");
     assert_that!(&gt_with_smaller_target, eq(&vec![b":0\r\n".to_vec()]));
 
-    let lt_with_smaller_target = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"LT"]),
-        )
-        .expect("EXPIRE LT should parse");
+    let lt_with_smaller_target = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"opt:key", b"5", b"LT"]),
+    )
+    .expect("EXPIRE LT should parse");
     assert_that!(&lt_with_smaller_target, eq(&vec![b":1\r\n".to_vec()]));
 }
 
@@ -1091,12 +1223,12 @@ fn resp_expire_family_rejects_invalid_option_sets() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let nx_xx = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"missing", b"10", b"NX", b"XX"]),
-        )
-        .expect("EXPIRE should parse");
+    let nx_xx = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"missing", b"10", b"NX", b"XX"]),
+    )
+    .expect("EXPIRE should parse");
     assert_that!(
         &nx_xx,
         eq(&vec![
@@ -1104,12 +1236,12 @@ fn resp_expire_family_rejects_invalid_option_sets() {
         ])
     );
 
-    let gt_lt = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIRE", b"missing", b"10", b"GT", b"LT"]),
-        )
-        .expect("PEXPIRE should parse");
+    let gt_lt = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRE", b"missing", b"10", b"GT", b"LT"]),
+    )
+    .expect("PEXPIRE should parse");
     assert_that!(
         &gt_lt,
         eq(&vec![
@@ -1117,12 +1249,12 @@ fn resp_expire_family_rejects_invalid_option_sets() {
         ])
     );
 
-    let unknown = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIREAT", b"missing", b"1", b"SOMETHING"]),
-        )
-        .expect("EXPIREAT should parse");
+    let unknown = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIREAT", b"missing", b"1", b"SOMETHING"]),
+    )
+    .expect("EXPIREAT should parse");
     assert_that!(
         &unknown,
         eq(&vec![b"-ERR Unsupported option: SOMETHING\r\n".to_vec()])
@@ -1134,28 +1266,40 @@ fn resp_expiretime_reports_missing_persistent_and_expiring_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let missing = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"missing"]))
-        .expect("EXPIRETIME should execute");
+    let missing = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRETIME", b"missing"]),
+    )
+    .expect("EXPIRETIME should execute");
     assert_that!(&missing, eq(&vec![b":-2\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"persist", b"v"]))
-        .expect("SET should execute");
-    let persistent = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"persist"]))
-        .expect("EXPIRETIME should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"persist", b"v"]),
+    )
+    .expect("SET should execute");
+    let persistent = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRETIME", b"persist"]),
+    )
+    .expect("EXPIRETIME should execute");
     assert_that!(&persistent, eq(&vec![b":-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"temp", b"60", b"v"]),
-        )
-        .expect("SETEX should execute");
-    let expiring = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRETIME", b"temp"]))
-        .expect("EXPIRETIME should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"temp", b"60", b"v"]),
+    )
+    .expect("SETEX should execute");
+    let expiring = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRETIME", b"temp"]),
+    )
+    .expect("EXPIRETIME should execute");
     let expire_at = parse_resp_integer(&expiring[0]);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1170,34 +1314,40 @@ fn resp_pexpiretime_reports_missing_persistent_and_expiring_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let missing = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIRETIME", b"missing"]),
-        )
-        .expect("PEXPIRETIME should execute");
+    let missing = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRETIME", b"missing"]),
+    )
+    .expect("PEXPIRETIME should execute");
     assert_that!(&missing, eq(&vec![b":-2\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"persist", b"v"]))
-        .expect("SET should execute");
-    let persistent = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIRETIME", b"persist"]),
-        )
-        .expect("PEXPIRETIME should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"persist", b"v"]),
+    )
+    .expect("SET should execute");
+    let persistent = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRETIME", b"persist"]),
+    )
+    .expect("PEXPIRETIME should execute");
     assert_that!(&persistent, eq(&vec![b":-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"temp", b"60", b"v"]),
-        )
-        .expect("SETEX should execute");
-    let expiring = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRETIME", b"temp"]))
-        .expect("PEXPIRETIME should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"temp", b"60", b"v"]),
+    )
+    .expect("SETEX should execute");
+    let expiring = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRETIME", b"temp"]),
+    )
+    .expect("PEXPIRETIME should execute");
     let expire_at = parse_resp_integer(&expiring[0]);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1212,35 +1362,44 @@ fn resp_incr_family_updates_counters_and_preserves_numeric_result() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let incr = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INCR", b"counter"]))
-        .expect("INCR should execute");
+    let incr = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INCR", b"counter"]),
+    )
+    .expect("INCR should execute");
     assert_that!(&incr, eq(&vec![b":1\r\n".to_vec()]));
 
-    let incrby = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"INCRBY", b"counter", b"9"]),
-        )
-        .expect("INCRBY should execute");
+    let incrby = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INCRBY", b"counter", b"9"]),
+    )
+    .expect("INCRBY should execute");
     assert_that!(&incrby, eq(&vec![b":10\r\n".to_vec()]));
 
-    let decr = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DECR", b"counter"]))
-        .expect("DECR should execute");
+    let decr = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DECR", b"counter"]),
+    )
+    .expect("DECR should execute");
     assert_that!(&decr, eq(&vec![b":9\r\n".to_vec()]));
 
-    let decrby = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DECRBY", b"counter", b"4"]),
-        )
-        .expect("DECRBY should execute");
+    let decrby = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DECRBY", b"counter", b"4"]),
+    )
+    .expect("DECRBY should execute");
     assert_that!(&decrby, eq(&vec![b":5\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"counter"]))
-        .expect("GET should execute");
+    let value = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GET", b"counter"]),
+    )
+    .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$1\r\n5\r\n".to_vec()]));
 }
 
@@ -1249,15 +1408,18 @@ fn resp_incr_rejects_non_integer_values() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"counter", b"abc"]),
-        )
-        .expect("SET should execute");
-    let incr = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INCR", b"counter"]))
-        .expect("INCR should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"counter", b"abc"]),
+    )
+    .expect("SET should execute");
+    let incr = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INCR", b"counter"]),
+    )
+    .expect("INCR should parse");
     assert_that!(
         &incr,
         eq(&vec![
@@ -1271,19 +1433,25 @@ fn resp_setnx_sets_only_missing_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"only", b"v1"]))
-        .expect("first SETNX should execute");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETNX", b"only", b"v1"]),
+    )
+    .expect("first SETNX should execute");
     assert_that!(&first, eq(&vec![b":1\r\n".to_vec()]));
 
-    let second = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"only", b"v2"]))
-        .expect("second SETNX should execute");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETNX", b"only", b"v2"]),
+    )
+    .expect("second SETNX should execute");
     assert_that!(&second, eq(&vec![b":0\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"only"]))
-        .expect("GET should execute");
+    let value =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"only"]))
+            .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 }
 
@@ -1292,18 +1460,23 @@ fn resp_getset_returns_previous_value_and_replaces_key() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v1"]))
-        .expect("first GETSET should execute");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GETSET", b"k", b"v1"]),
+    )
+    .expect("first GETSET should execute");
     assert_that!(&first, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let second = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v2"]))
-        .expect("second GETSET should execute");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GETSET", b"k", b"v2"]),
+    )
+    .expect("second GETSET should execute");
     assert_that!(&second, eq(&vec![b"$2\r\nv1\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+    let value = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
         .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$2\r\nv2\r\n".to_vec()]));
 }
@@ -1313,17 +1486,20 @@ fn resp_getdel_returns_value_and_deletes_key() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should execute");
-    let removed = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
-        .expect("GETDEL should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should execute");
+    let removed =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL should execute");
     assert_that!(&removed, eq(&vec![b"$1\r\nv\r\n".to_vec()]));
 
-    let missing = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
-        .expect("GETDEL should execute");
+    let missing =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
+            .expect("GETDEL should execute");
     assert_that!(&missing, eq(&vec![b"$-1\r\n".to_vec()]));
 }
 
@@ -1332,23 +1508,28 @@ fn resp_append_and_strlen_track_string_size() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"he"]))
-        .expect("first APPEND should execute");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"APPEND", b"k", b"he"]),
+    )
+    .expect("first APPEND should execute");
     assert_that!(&first, eq(&vec![b":2\r\n".to_vec()]));
 
-    let second = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"llo"]))
-        .expect("second APPEND should execute");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"APPEND", b"k", b"llo"]),
+    )
+    .expect("second APPEND should execute");
     assert_that!(&second, eq(&vec![b":5\r\n".to_vec()]));
 
-    let strlen = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"STRLEN", b"k"]))
-        .expect("STRLEN should execute");
+    let strlen =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"STRLEN", b"k"]))
+            .expect("STRLEN should execute");
     assert_that!(&strlen, eq(&vec![b":5\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+    let value = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
         .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$5\r\nhello\r\n".to_vec()]));
 }
@@ -1358,27 +1539,29 @@ fn resp_getrange_and_setrange_follow_redis_offset_rules() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"hello"]))
-        .expect("SET should execute");
-    let range = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"GETRANGE", b"k", b"1", b"3"]),
-        )
-        .expect("GETRANGE should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"hello"]),
+    )
+    .expect("SET should execute");
+    let range = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GETRANGE", b"k", b"1", b"3"]),
+    )
+    .expect("GETRANGE should execute");
     assert_that!(&range, eq(&vec![b"$3\r\nell\r\n".to_vec()]));
 
-    let setrange = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETRANGE", b"k", b"1", b"i"]),
-        )
-        .expect("SETRANGE should execute");
+    let setrange = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETRANGE", b"k", b"1", b"i"]),
+    )
+    .expect("SETRANGE should execute");
     assert_that!(&setrange, eq(&vec![b":5\r\n".to_vec()]));
 
-    let value = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+    let value = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
         .expect("GET should execute");
     assert_that!(&value, eq(&vec![b"$5\r\nhillo\r\n".to_vec()]));
 }
@@ -1388,9 +1571,12 @@ fn resp_expireat_sets_future_expire_and_deletes_past_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"future", b"v"]))
-        .expect("SET future should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"future", b"v"]),
+    )
+    .expect("SET future should execute");
     let future_timestamp = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -1398,34 +1584,40 @@ fn resp_expireat_sets_future_expire_and_deletes_past_keys() {
         + 120)
         .to_string()
         .into_bytes();
-    let expireat_future = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIREAT", b"future", &future_timestamp]),
-        )
-        .expect("EXPIREAT future should execute");
+    let expireat_future = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIREAT", b"future", &future_timestamp]),
+    )
+    .expect("EXPIREAT future should execute");
     assert_that!(&expireat_future, eq(&vec![b":1\r\n".to_vec()]));
 
-    let ttl_future = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TTL", b"future"]))
-        .expect("TTL should execute");
+    let ttl_future = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"TTL", b"future"]),
+    )
+    .expect("TTL should execute");
     let ttl_value = parse_resp_integer(&ttl_future[0]);
     assert_that!(ttl_value > 0, eq(true));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"past", b"v"]))
-        .expect("SET past should execute");
-    let expireat_past = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIREAT", b"past", b"1"]),
-        )
-        .expect("EXPIREAT past should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"past", b"v"]),
+    )
+    .expect("SET past should execute");
+    let expireat_past = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIREAT", b"past", b"1"]),
+    )
+    .expect("EXPIREAT past should execute");
     assert_that!(&expireat_past, eq(&vec![b":1\r\n".to_vec()]));
 
-    let removed = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"past"]))
-        .expect("GET should execute");
+    let removed =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"past"]))
+            .expect("GET should execute");
     assert_that!(&removed, eq(&vec![b"$-1\r\n".to_vec()]));
 }
 
@@ -1434,9 +1626,12 @@ fn resp_pexpireat_sets_future_expire_and_deletes_past_keys() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"future", b"v"]))
-        .expect("SET future should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"future", b"v"]),
+    )
+    .expect("SET future should execute");
     let future_timestamp = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -1444,34 +1639,40 @@ fn resp_pexpireat_sets_future_expire_and_deletes_past_keys() {
         + 120_000)
         .to_string()
         .into_bytes();
-    let pexpireat_future = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIREAT", b"future", &future_timestamp]),
-        )
-        .expect("PEXPIREAT future should execute");
+    let pexpireat_future = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIREAT", b"future", &future_timestamp]),
+    )
+    .expect("PEXPIREAT future should execute");
     assert_that!(&pexpireat_future, eq(&vec![b":1\r\n".to_vec()]));
 
-    let pttl_future = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PTTL", b"future"]))
-        .expect("PTTL should execute");
+    let pttl_future = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PTTL", b"future"]),
+    )
+    .expect("PTTL should execute");
     let pttl_value = parse_resp_integer(&pttl_future[0]);
     assert_that!(pttl_value > 0, eq(true));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"past", b"v"]))
-        .expect("SET past should execute");
-    let pexpireat_past = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIREAT", b"past", b"1"]),
-        )
-        .expect("PEXPIREAT past should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"past", b"v"]),
+    )
+    .expect("SET past should execute");
+    let pexpireat_past = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIREAT", b"past", b"1"]),
+    )
+    .expect("PEXPIREAT past should execute");
     assert_that!(&pexpireat_past, eq(&vec![b":1\r\n".to_vec()]));
 
-    let removed = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"past"]))
-        .expect("GET should execute");
+    let removed =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"past"]))
+            .expect("GET should execute");
     assert_that!(&removed, eq(&vec![b"$-1\r\n".to_vec()]));
 }
 
@@ -1492,14 +1693,12 @@ fn resp_mget_preserves_key_order_across_shards() {
     }
 
     let mset = resp_command(&[b"MSET", &first_key, b"alpha", &second_key, b"beta"]);
-    let _ = app
-        .feed_connection_bytes(&mut connection, &mset)
-        .expect("MSET should execute");
+    let _ =
+        ingress_connection_bytes(&mut app, &mut connection, &mset).expect("MSET should execute");
 
     let mget = resp_command(&[b"MGET", &second_key, &first_key, b"missing"]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &mget)
-        .expect("MGET should execute");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut connection, &mget).expect("MGET should execute");
     let expected = vec![b"*3\r\n$4\r\nbeta\r\n$5\r\nalpha\r\n$-1\r\n".to_vec()];
     assert_that!(&reply, eq(&expected));
 }
@@ -1509,13 +1708,12 @@ fn resp_connection_handles_partial_input() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let partial_responses = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
-        .expect("partial input should not fail");
+    let partial_responses =
+        ingress_connection_bytes(&mut app, &mut connection, b"*2\r\n$4\r\nECHO\r\n$5\r\nhe")
+            .expect("partial input should not fail");
     assert_that!(partial_responses.is_empty(), eq(true));
 
-    let final_responses = app
-        .feed_connection_bytes(&mut connection, b"llo\r\n")
+    let final_responses = ingress_connection_bytes(&mut app, &mut connection, b"llo\r\n")
         .expect("completion bytes should execute pending command");
     let expected = vec![b"$5\r\nhello\r\n".to_vec()];
     assert_that!(&final_responses, eq(&expected));
@@ -1526,12 +1724,12 @@ fn resp_connection_applies_parsed_prefix_before_protocol_error_in_same_chunk() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut broken_connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let error = app
-        .feed_connection_bytes(
-            &mut broken_connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$A\r\nPING\r\n",
-        )
-        .expect_err("malformed second command should fail");
+    let error = ingress_connection_bytes(
+        &mut app,
+        &mut broken_connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$A\r\nPING\r\n",
+    )
+    .expect_err("malformed second command should fail");
     let DflyError::Protocol(_) = error else {
         panic!("expected protocol error");
     };
@@ -1539,8 +1737,7 @@ fn resp_connection_applies_parsed_prefix_before_protocol_error_in_same_chunk() {
     // Keep readback on a clean connection because malformed bytes remain buffered on the
     // failing connection, while keyspace mutations from parsed prefix command must persist.
     let mut reader = ServerApp::new_connection(ClientProtocol::Resp);
-    let get = app
-        .feed_connection_bytes(&mut reader, &resp_command(&[b"GET", b"foo"]))
+    let get = ingress_connection_bytes(&mut app, &mut reader, &resp_command(&[b"GET", b"foo"]))
         .expect("GET should execute after malformed write chunk");
     assert_that!(&get, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
 }
@@ -1550,14 +1747,13 @@ fn memcache_connection_executes_set_then_get() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Memcache);
 
-    let set_responses = app
-        .feed_connection_bytes(&mut connection, b"set user:42 0 0 5\r\nalice\r\n")
-        .expect("memcache set should execute");
+    let set_responses =
+        ingress_connection_bytes(&mut app, &mut connection, b"set user:42 0 0 5\r\nalice\r\n")
+            .expect("memcache set should execute");
     let expected_set = vec![b"STORED\r\n".to_vec()];
     assert_that!(&set_responses, eq(&expected_set));
 
-    let get_responses = app
-        .feed_connection_bytes(&mut connection, b"get user:42\r\n")
+    let get_responses = ingress_connection_bytes(&mut app, &mut connection, b"get user:42\r\n")
         .expect("memcache get should execute");
     let expected_get = vec![b"VALUE user:42 0 5\r\nalice\r\nEND\r\n".to_vec()];
     assert_that!(&get_responses, eq(&expected_get));
@@ -1568,13 +1764,12 @@ fn memcache_set_handles_partial_value_payload() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Memcache);
 
-    let partial_responses = app
-        .feed_connection_bytes(&mut connection, b"set cache:key 0 0 7\r\nru")
-        .expect("partial memcache set should not fail");
+    let partial_responses =
+        ingress_connection_bytes(&mut app, &mut connection, b"set cache:key 0 0 7\r\nru")
+            .expect("partial memcache set should not fail");
     assert_that!(partial_responses.is_empty(), eq(true));
 
-    let final_responses = app
-        .feed_connection_bytes(&mut connection, b"sty42\r\n")
+    let final_responses = ingress_connection_bytes(&mut app, &mut connection, b"sty42\r\n")
         .expect("payload completion should execute set");
     let expected = vec![b"STORED\r\n".to_vec()];
     assert_that!(&final_responses, eq(&expected));
@@ -1585,26 +1780,27 @@ fn resp_multi_exec_runs_queued_commands_in_order() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let multi = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+    let multi = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
     assert_that!(&multi, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let queued_set = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET should be queued");
+    let queued_set = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET should be queued");
     assert_that!(&queued_set, eq(&vec![b"+QUEUED\r\n".to_vec()]));
 
-    let queued_get = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET should be queued");
+    let queued_get = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET should be queued");
     assert_that!(&queued_get, eq(&vec![b"+QUEUED\r\n".to_vec()]));
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+    let exec = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should execute queued commands");
     let expected_exec = vec![b"*2\r\n+OK\r\n$3\r\nbar\r\n".to_vec()];
     assert_that!(&exec, eq(&expected_exec));
@@ -1615,13 +1811,11 @@ fn resp_exec_with_empty_queue_returns_empty_array() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let multi = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let multi = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
     assert_that!(&multi, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should succeed");
     assert_that!(&exec, eq(&vec![b"*0\r\n".to_vec()]));
     assert_that!(app.replication.journal_entries().is_empty(), eq(true));
@@ -3516,23 +3710,22 @@ fn resp_exec_read_only_queue_uses_non_mutating_path() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("seed SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("seed SET should succeed");
     assert_that!(app.replication.journal_entries().len(), eq(1_usize));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
         .expect("GET should queue");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"TYPE", b"k"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"TYPE", b"k"]))
         .expect("TYPE should queue");
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should succeed");
     let expected = vec![b"*2\r\n$1\r\nv\r\n+string\r\n".to_vec()];
     assert_that!(&exec, eq(&expected));
@@ -3546,23 +3739,24 @@ fn resp_discard_drops_queued_commands() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET should be queued");
-    let discard = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$7\r\nDISCARD\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET should be queued");
+    let discard = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$7\r\nDISCARD\r\n")
         .expect("DISCARD should succeed");
     assert_that!(&discard, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET should run after discard");
+    let get = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET should run after discard");
     assert_that!(&get, eq(&vec![b"$-1\r\n".to_vec()]));
 }
 
@@ -3571,8 +3765,7 @@ fn resp_exec_without_multi_returns_error() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+    let exec = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC command should parse");
     assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
 }
@@ -3583,15 +3776,20 @@ fn resp_exec_without_multi_remains_error_even_when_watch_is_dirty() {
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"key"]))
-        .expect("WATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut writer_conn, &resp_command(&[b"SET", b"key", b"other"]))
-        .expect("writer SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"WATCH", b"key"]),
+    )
+    .expect("WATCH should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut writer_conn,
+        &resp_command(&[b"SET", b"key", b"other"]),
+    )
+    .expect("writer SET should succeed");
 
-    let exec = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(&exec, eq(&vec![b"-ERR EXEC without MULTI\r\n".to_vec()]));
 }
@@ -3601,19 +3799,17 @@ fn resp_execaborts_after_unknown_command_during_multi_queueing() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let queue_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"NOPE"]))
-        .expect("unknown command should parse");
+    let queue_error =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"NOPE"]))
+            .expect("unknown command should parse");
     assert_that!(
         &queue_error,
         eq(&vec![b"-ERR unknown command 'NOPE'\r\n".to_vec()])
     );
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -3628,11 +3824,9 @@ fn resp_execaborts_after_core_arity_error_during_multi_queueing() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let queue_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET"]))
+    let queue_error = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET"]))
         .expect("invalid GET arity should parse");
     assert_that!(
         &queue_error,
@@ -3641,8 +3835,7 @@ fn resp_execaborts_after_core_arity_error_during_multi_queueing() {
         ])
     );
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -3657,12 +3850,11 @@ fn resp_execaborts_after_server_command_arity_error_during_multi_queueing() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let queue_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1"]))
-        .expect("invalid WAIT arity should parse");
+    let queue_error =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"WAIT", b"1"]))
+            .expect("invalid WAIT arity should parse");
     assert_that!(
         &queue_error,
         eq(&vec![
@@ -3670,8 +3862,7 @@ fn resp_execaborts_after_server_command_arity_error_during_multi_queueing() {
         ])
     );
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -3686,16 +3877,17 @@ fn resp_execaborts_after_replconf_syntax_error_during_multi_queueing() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let queue_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK"]))
-        .expect("invalid REPLCONF shape should parse");
+    let queue_error = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK"]),
+    )
+    .expect("invalid REPLCONF shape should parse");
     assert_that!(&queue_error, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -3711,39 +3903,43 @@ fn resp_watch_aborts_exec_when_watched_key_changes() {
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nold\r\n",
-        )
-        .expect("seed SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
-        .expect("WATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nold\r\n",
+    )
+    .expect("seed SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n",
+    )
+    .expect("WATCH should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
-        )
-        .expect("queued SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut writer_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
-        )
-        .expect("concurrent SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
+    )
+    .expect("queued SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut writer_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
+    )
+    .expect("concurrent SET should succeed");
 
-    let exec = app
-        .feed_connection_bytes(&mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
+    let exec = ingress_connection_bytes(&mut app, &mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should parse");
     assert_that!(&exec, eq(&vec![b"*-1\r\n".to_vec()]));
 
-    let check = app
-        .feed_connection_bytes(&mut watch_conn, b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
-        .expect("GET should succeed");
+    let check = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+    )
+    .expect("GET should succeed");
     assert_that!(&check, eq(&vec![b"$5\r\nother\r\n".to_vec()]));
 }
 
@@ -3753,31 +3949,31 @@ fn resp_watch_aborts_exec_when_flushdb_deletes_watched_key() {
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            &resp_command(&[b"SET", b"watch:key", b"v"]),
-        )
-        .expect("seed SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"watch:key"]))
-        .expect("WATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut writer_conn, &resp_command(&[b"FLUSHDB"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"SET", b"watch:key", b"v"]),
+    )
+    .expect("seed SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"WATCH", b"watch:key"]),
+    )
+    .expect("WATCH should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut writer_conn, &resp_command(&[b"FLUSHDB"]))
         .expect("FLUSHDB should succeed");
 
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            &resp_command(&[b"SET", b"watch:key", b"mine"]),
-        )
-        .expect("SET should queue");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"SET", b"watch:key", b"mine"]),
+    )
+    .expect("SET should queue");
 
-    let exec = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(&exec, eq(&vec![b"*-1\r\n".to_vec()]));
 }
@@ -3787,21 +3983,20 @@ fn resp_execaborts_after_watch_or_unwatch_error_inside_multi() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let watch_error = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"WATCH", b"k"]))
-        .expect("WATCH should parse");
+    let watch_error =
+        ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"WATCH", b"k"]))
+            .expect("WATCH should parse");
     assert_that!(
         &watch_error,
         eq(&vec![
             b"-ERR WATCH inside MULTI is not allowed\r\n".to_vec()
         ])
     );
-    let exec_after_watch_error = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let exec_after_watch_error =
+        ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &exec_after_watch_error,
         eq(&vec![
@@ -3810,21 +4005,20 @@ fn resp_execaborts_after_watch_or_unwatch_error_inside_multi() {
     );
 
     let mut unwatch_conn = ServerApp::new_connection(ClientProtocol::Resp);
-    let _ = app
-        .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut unwatch_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let unwatch_error = app
-        .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"UNWATCH"]))
-        .expect("UNWATCH should parse");
+    let unwatch_error =
+        ingress_connection_bytes(&mut app, &mut unwatch_conn, &resp_command(&[b"UNWATCH"]))
+            .expect("UNWATCH should parse");
     assert_that!(
         &unwatch_error,
         eq(&vec![
             b"-ERR UNWATCH inside MULTI is not allowed\r\n".to_vec()
         ])
     );
-    let exec_after_unwatch_error = app
-        .feed_connection_bytes(&mut unwatch_conn, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let exec_after_unwatch_error =
+        ingress_connection_bytes(&mut app, &mut unwatch_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &exec_after_unwatch_error,
         eq(&vec![
@@ -3838,21 +4032,22 @@ fn resp_watch_exec_succeeds_when_key_unchanged() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
-        .expect("WATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n",
+    )
+    .expect("WATCH should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n",
-        )
-        .expect("SET should queue");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n",
+    )
+    .expect("SET should queue");
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+    let exec = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should succeed");
     assert_that!(&exec, eq(&vec![b"*1\r\n+OK\r\n".to_vec()]));
 }
@@ -3863,30 +4058,30 @@ fn resp_unwatch_clears_watch_set() {
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let mut writer_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n")
-        .expect("WATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, b"*1\r\n$7\r\nUNWATCH\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n",
+    )
+    .expect("WATCH should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, b"*1\r\n$7\r\nUNWATCH\r\n")
         .expect("UNWATCH should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut writer_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
-        )
-        .expect("external SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut writer_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nother\r\n",
+    )
+    .expect("external SET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
-        )
-        .expect("SET should queue");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\nmine\r\n",
+    )
+    .expect("SET should queue");
 
-    let exec = app
-        .feed_connection_bytes(&mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
+    let exec = ingress_connection_bytes(&mut app, &mut watch_conn, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should run queued SET");
     assert_that!(&exec, eq(&vec![b"*1\r\n+OK\r\n".to_vec()]));
 }
@@ -3896,25 +4091,25 @@ fn resp_exec_rejects_watch_and_exec_across_databases() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WATCH", b"cross:key"]))
-        .expect("WATCH should succeed in DB 0");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"WATCH", b"cross:key"]),
+    )
+    .expect("WATCH should succeed in DB 0");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let queued = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"cross:key", b"db1-value"]),
-        )
-        .expect("SET should queue");
+    let queued = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"cross:key", b"db1-value"]),
+    )
+    .expect("SET should queue");
     assert_that!(&queued, eq(&vec![b"+QUEUED\r\n".to_vec()]));
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -3923,9 +4118,9 @@ fn resp_exec_rejects_watch_and_exec_across_databases() {
         ])
     );
 
-    let multi_again = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
-        .expect("MULTI should succeed after EXEC failure cleanup");
+    let multi_again =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
+            .expect("MULTI should succeed after EXEC failure cleanup");
     assert_that!(&multi_again, eq(&vec![b"+OK\r\n".to_vec()]));
 }
 
@@ -3934,15 +4129,18 @@ fn journal_records_only_successful_write_commands() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET should succeed");
 
     assert_that!(app.replication.journal_entries().len(), eq(1_usize));
     assert_that!(
@@ -3956,42 +4154,42 @@ fn journal_records_set_only_when_mutation_happens_with_conditions_and_get() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
-        )
-        .expect("SET NX should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
-        )
-        .expect("SET NX should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
-        )
-        .expect("SET NX GET should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
-        )
-        .expect("SET XX GET should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"missing", b"v", b"XX", b"GET"]),
-        )
-        .expect("SET XX GET on missing key should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"fresh", b"v", b"GET"]),
-        )
-        .expect("SET GET should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v1", b"NX"]),
+    )
+    .expect("SET NX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v2", b"NX"]),
+    )
+    .expect("SET NX should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"ignored", b"NX", b"GET"]),
+    )
+    .expect("SET NX GET should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v2", b"XX", b"GET"]),
+    )
+    .expect("SET XX GET should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"missing", b"v", b"XX", b"GET"]),
+    )
+    .expect("SET XX GET on missing key should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"fresh", b"v", b"GET"]),
+    )
+    .expect("SET GET should execute");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(3_usize));
@@ -4014,18 +4212,18 @@ fn journal_records_setex_only_for_successful_updates() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"k", b"10", b"v"]),
-        )
-        .expect("SETEX should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETEX", b"k", b"0", b"v"]),
-        )
-        .expect("SETEX should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"k", b"10", b"v"]),
+    )
+    .expect("SETEX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETEX", b"k", b"0", b"v"]),
+    )
+    .expect("SETEX should parse");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4041,18 +4239,18 @@ fn journal_records_psetex_only_for_successful_updates() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PSETEX", b"k", b"1500", b"v"]),
-        )
-        .expect("PSETEX should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PSETEX", b"k", b"0", b"v"]),
-        )
-        .expect("PSETEX should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSETEX", b"k", b"1500", b"v"]),
+    )
+    .expect("PSETEX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSETEX", b"k", b"0", b"v"]),
+    )
+    .expect("PSETEX should parse");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4068,18 +4266,30 @@ fn journal_records_pexpire_as_command_or_expired_by_argument() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"k", b"1000"]))
-        .expect("PEXPIRE with positive timeout should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should recreate key");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIRE", b"k", b"0"]))
-        .expect("PEXPIRE with zero timeout should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRE", b"k", b"1000"]),
+    )
+    .expect("PEXPIRE with positive timeout should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should recreate key");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIRE", b"k", b"0"]),
+    )
+    .expect("PEXPIRE with zero timeout should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(4_usize));
@@ -4092,33 +4302,36 @@ fn journal_records_expire_options_only_when_update_is_applied() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"k", b"10", b"GT"]),
-        )
-        .expect("EXPIRE GT should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"k", b"10", b"LT"]),
-        )
-        .expect("EXPIRE LT should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"k", b"20", b"NX"]),
-        )
-        .expect("EXPIRE NX should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", b"k", b"0", b"LT"]),
-        )
-        .expect("EXPIRE LT delete should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"k", b"10", b"GT"]),
+    )
+    .expect("EXPIRE GT should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"k", b"10", b"LT"]),
+    )
+    .expect("EXPIRE LT should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"k", b"20", b"NX"]),
+    )
+    .expect("EXPIRE NX should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"k", b"0", b"LT"]),
+    )
+    .expect("EXPIRE LT delete should execute");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(3_usize));
@@ -4131,9 +4344,12 @@ fn journal_records_pexpireat_as_command_or_expired_by_timestamp() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
     let future_timestamp = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -4141,18 +4357,24 @@ fn journal_records_pexpireat_as_command_or_expired_by_timestamp() {
         + 120_000)
         .to_string()
         .into_bytes();
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"PEXPIREAT", b"k", &future_timestamp]),
-        )
-        .expect("PEXPIREAT future should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should recreate key");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PEXPIREAT", b"k", b"1"]))
-        .expect("PEXPIREAT past should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIREAT", b"k", &future_timestamp]),
+    )
+    .expect("PEXPIREAT future should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should recreate key");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PEXPIREAT", b"k", b"1"]),
+    )
+    .expect("PEXPIREAT past should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(4_usize));
@@ -4166,9 +4388,8 @@ fn journal_records_mset_as_single_write_command() {
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let mset = resp_command(&[b"MSET", b"a", b"1", b"b", b"2"]);
-    let _ = app
-        .feed_connection_bytes(&mut connection, &mset)
-        .expect("MSET should succeed");
+    let _ =
+        ingress_connection_bytes(&mut app, &mut connection, &mset).expect("MSET should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4184,18 +4405,18 @@ fn journal_records_msetnx_only_on_successful_insert_batch() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
-        )
-        .expect("first MSETNX should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
-        )
-        .expect("second MSETNX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MSETNX", b"a", b"1", b"b", b"2"]),
+    )
+    .expect("first MSETNX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MSETNX", b"a", b"x", b"c", b"3"]),
+    )
+    .expect("second MSETNX should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4210,24 +4431,30 @@ fn journal_records_rename_family_only_for_effective_mutations() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAMENX", b"src", b"dst"]),
-        )
-        .expect("RENAMENX success should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
-        )
-        .expect("RENAMENX same key should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"RENAME", b"dst", b"dst"]))
-        .expect("RENAME same key should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"src", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAMENX", b"src", b"dst"]),
+    )
+    .expect("RENAMENX success should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAMENX", b"dst", b"dst"]),
+    )
+    .expect("RENAMENX same key should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"RENAME", b"dst", b"dst"]),
+    )
+    .expect("RENAME same key should execute");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(2_usize));
@@ -4244,27 +4471,36 @@ fn journal_records_copy_only_when_destination_is_written() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"src", b"v1"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", b"missing", b"dst"]),
-        )
-        .expect("COPY missing should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
-        .expect("COPY success should execute");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"COPY", b"src", b"dst"]))
-        .expect("COPY blocked should execute");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
-        )
-        .expect("COPY REPLACE should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"src", b"v1"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"missing", b"dst"]),
+    )
+    .expect("COPY missing should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst"]),
+    )
+    .expect("COPY success should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst"]),
+    )
+    .expect("COPY blocked should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"COPY", b"src", b"dst", b"REPLACE"]),
+    )
+    .expect("COPY REPLACE should execute");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(3_usize));
@@ -4283,14 +4519,19 @@ fn journal_records_del_only_when_keyspace_changes() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DEL", b"missing"]))
-        .expect("DEL missing should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DEL", b"k"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DEL", b"missing"]),
+    )
+    .expect("DEL missing should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"DEL", b"k"]))
         .expect("DEL existing should succeed");
 
     let entries = app.replication.journal_entries();
@@ -4306,14 +4547,19 @@ fn journal_records_unlink_only_when_keyspace_changes() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"UNLINK", b"missing"]))
-        .expect("UNLINK missing should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"UNLINK", b"k"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"UNLINK", b"missing"]),
+    )
+    .expect("UNLINK missing should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"UNLINK", b"k"]))
         .expect("UNLINK existing should succeed");
 
     let entries = app.replication.journal_entries();
@@ -4329,15 +4575,24 @@ fn journal_records_move_only_when_transfer_happens() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"missing", b"1"]))
-        .expect("MOVE missing should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MOVE", b"k", b"1"]))
-        .expect("MOVE existing should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MOVE", b"missing", b"1"]),
+    )
+    .expect("MOVE missing should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"MOVE", b"k", b"1"]),
+    )
+    .expect("MOVE existing should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(2_usize));
@@ -4352,18 +4607,30 @@ fn journal_records_persist_only_when_it_changes_expiry() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"k"]))
-        .expect("PERSIST without expiry should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXPIRE", b"k", b"10"]))
-        .expect("EXPIRE should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PERSIST", b"k"]))
-        .expect("PERSIST should clear expiry");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PERSIST", b"k"]),
+    )
+    .expect("PERSIST without expiry should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", b"k", b"10"]),
+    )
+    .expect("EXPIRE should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PERSIST", b"k"]),
+    )
+    .expect("PERSIST should clear expiry");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(3_usize));
@@ -4378,20 +4645,25 @@ fn journal_records_incr_family_only_on_success() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INCR", b"counter"]))
-        .expect("INCR should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"INCRBY", b"counter", b"2"]),
-        )
-        .expect("INCRBY should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"bad", b"abc"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INCR", b"bad"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INCR", b"counter"]),
+    )
+    .expect("INCR should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INCRBY", b"counter", b"2"]),
+    )
+    .expect("INCRBY should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"bad", b"abc"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"INCR", b"bad"]))
         .expect("INCR bad should parse");
 
     let entries = app.replication.journal_entries();
@@ -4411,12 +4683,18 @@ fn journal_records_setnx_only_when_insert_happens() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"k", b"v1"]))
-        .expect("first SETNX should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SETNX", b"k", b"v2"]))
-        .expect("second SETNX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETNX", b"k", b"v1"]),
+    )
+    .expect("first SETNX should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETNX", b"k", b"v2"]),
+    )
+    .expect("second SETNX should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4431,17 +4709,21 @@ fn journal_records_getset_and_getdel_only_when_key_is_deleted() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v1"]))
-        .expect("first GETSET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETSET", b"k", b"v2"]))
-        .expect("second GETSET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GETSET", b"k", b"v1"]),
+    )
+    .expect("first GETSET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"GETSET", b"k", b"v2"]),
+    )
+    .expect("second GETSET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
         .expect("GETDEL existing key should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GETDEL", b"k"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
         .expect("GETDEL missing key should succeed");
 
     let entries = app.replication.journal_entries();
@@ -4465,12 +4747,18 @@ fn journal_records_append_writes() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"he"]))
-        .expect("first APPEND should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"APPEND", b"k", b"llo"]))
-        .expect("second APPEND should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"APPEND", b"k", b"he"]),
+    )
+    .expect("first APPEND should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"APPEND", b"k", b"llo"]),
+    )
+    .expect("second APPEND should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(2_usize));
@@ -4489,18 +4777,18 @@ fn journal_records_setrange_only_when_payload_is_non_empty() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETRANGE", b"k", b"0", b""]),
-        )
-        .expect("SETRANGE with empty payload should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SETRANGE", b"k", b"0", b"xy"]),
-        )
-        .expect("SETRANGE with payload should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETRANGE", b"k", b"0", b""]),
+    )
+    .expect("SETRANGE with empty payload should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SETRANGE", b"k", b"0", b"xy"]),
+    )
+    .expect("SETRANGE with payload should succeed");
 
     let entries = app.replication.journal_entries();
     assert_that!(entries.len(), eq(1_usize));
@@ -4515,14 +4803,15 @@ fn journal_records_flush_commands() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"v"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHDB"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"v"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHDB"]))
         .expect("FLUSHDB should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHALL"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHALL"]))
         .expect("FLUSHALL should succeed");
 
     let entries = app.replication.journal_entries();
@@ -4542,23 +4831,21 @@ fn journal_uses_same_txid_for_exec_batch_entries() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET should queue");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$1\r\n0\r\n",
-        )
-        .expect("EXPIRE should queue");
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$4\r\nEXEC\r\n")
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET should queue");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$1\r\n0\r\n",
+    )
+    .expect("EXPIRE should queue");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should succeed");
 
     let entries = app.replication.journal_entries();
@@ -4572,38 +4859,50 @@ fn resp_select_switches_logical_db_namespace() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
-        )
-        .expect("SET in DB 0 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
+    )
+    .expect("SET in DB 0 should succeed");
 
-    let select_db1 = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
-        .expect("SELECT 1 should succeed");
+    let select_db1 = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
+    )
+    .expect("SELECT 1 should succeed");
     assert_that!(&select_db1, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get_in_db1 = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n")
-        .expect("GET in DB 1 should succeed");
+    let get_in_db1 = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+    )
+    .expect("GET in DB 1 should succeed");
     assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb1\r\n",
-        )
-        .expect("SET in DB 1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb1\r\n",
+    )
+    .expect("SET in DB 1 should succeed");
 
-    let select_db0 = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
-        .expect("SELECT 0 should succeed");
+    let select_db0 = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n",
+    )
+    .expect("SELECT 0 should succeed");
     assert_that!(&select_db0, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get_in_db0 = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n")
-        .expect("GET in DB 0 should succeed");
+    let get_in_db0 = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+    )
+    .expect("GET in DB 0 should succeed");
     assert_that!(&get_in_db0, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
 }
 
@@ -4612,32 +4911,35 @@ fn resp_flushdb_clears_only_selected_database() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"db0"]))
-        .expect("SET in DB 0 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"db0"]),
+    )
+    .expect("SET in DB 0 should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k", b"db1"]))
-        .expect("SET in DB 1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k", b"db1"]),
+    )
+    .expect("SET in DB 1 should succeed");
 
-    let flushdb = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHDB"]))
+    let flushdb = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHDB"]))
         .expect("FLUSHDB should execute");
     assert_that!(&flushdb, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get_in_db1 = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
-        .expect("GET in DB 1 should execute");
+    let get_in_db1 =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET in DB 1 should execute");
     assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should succeed");
-    let get_in_db0 = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k"]))
-        .expect("GET in DB 0 should execute");
+    let get_in_db0 =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k"]))
+            .expect("GET in DB 0 should execute");
     assert_that!(&get_in_db0, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
 }
 
@@ -4646,32 +4948,36 @@ fn resp_flushall_clears_all_databases() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k0", b"v0"]))
-        .expect("SET in DB 0 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k0", b"v0"]),
+    )
+    .expect("SET in DB 0 should succeed");
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
         .expect("SELECT 1 should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"k1", b"v1"]))
-        .expect("SET in DB 1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"k1", b"v1"]),
+    )
+    .expect("SET in DB 1 should succeed");
 
-    let flushall = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"FLUSHALL"]))
-        .expect("FLUSHALL should execute");
+    let flushall =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHALL"]))
+            .expect("FLUSHALL should execute");
     assert_that!(&flushall, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get_in_db1 = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k1"]))
-        .expect("GET in DB 1 should execute");
+    let get_in_db1 =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k1"]))
+            .expect("GET in DB 1 should execute");
     assert_that!(&get_in_db1, eq(&vec![b"$-1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"0"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"0"]))
         .expect("SELECT 0 should succeed");
-    let get_in_db0 = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"GET", b"k0"]))
-        .expect("GET in DB 0 should execute");
+    let get_in_db0 =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GET", b"k0"]))
+            .expect("GET in DB 0 should execute");
     assert_that!(&get_in_db0, eq(&vec![b"$-1\r\n".to_vec()]));
 }
 
@@ -4680,21 +4986,20 @@ fn resp_flush_commands_are_rejected_inside_multi() {
     let mut app = ServerApp::new(RuntimeConfig::default());
 
     let mut flushall_conn = ServerApp::new_connection(ClientProtocol::Resp);
-    let _ = app
-        .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut flushall_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let flushall = app
-        .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"FLUSHALL"]))
-        .expect("FLUSHALL should parse");
+    let flushall =
+        ingress_connection_bytes(&mut app, &mut flushall_conn, &resp_command(&[b"FLUSHALL"]))
+            .expect("FLUSHALL should parse");
     assert_that!(
         &flushall,
         eq(&vec![
             b"-ERR 'FLUSHALL' not allowed inside a transaction\r\n".to_vec()
         ])
     );
-    let flushall_exec = app
-        .feed_connection_bytes(&mut flushall_conn, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let flushall_exec =
+        ingress_connection_bytes(&mut app, &mut flushall_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &flushall_exec,
         eq(&vec![
@@ -4703,21 +5008,20 @@ fn resp_flush_commands_are_rejected_inside_multi() {
     );
 
     let mut flushdb_conn = ServerApp::new_connection(ClientProtocol::Resp);
-    let _ = app
-        .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut flushdb_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let flushdb = app
-        .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"FLUSHDB"]))
-        .expect("FLUSHDB should parse");
+    let flushdb =
+        ingress_connection_bytes(&mut app, &mut flushdb_conn, &resp_command(&[b"FLUSHDB"]))
+            .expect("FLUSHDB should parse");
     assert_that!(
         &flushdb,
         eq(&vec![
             b"-ERR 'FLUSHDB' not allowed inside a transaction\r\n".to_vec()
         ])
     );
-    let flushdb_exec = app
-        .feed_connection_bytes(&mut flushdb_conn, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let flushdb_exec =
+        ingress_connection_bytes(&mut app, &mut flushdb_conn, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &flushdb_exec,
         eq(&vec![
@@ -4731,12 +5035,14 @@ fn resp_select_is_rejected_while_multi_is_open() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, b"*1\r\n$5\r\nMULTI\r\n")
+    let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$5\r\nMULTI\r\n")
         .expect("MULTI should succeed");
-    let select = app
-        .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
-        .expect("SELECT should parse");
+    let select = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
+    )
+    .expect("SELECT should parse");
     assert_that!(
         &select,
         eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
@@ -4748,19 +5054,17 @@ fn resp_execaborts_after_select_error_inside_multi() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let select = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SELECT", b"1"]))
-        .expect("SELECT should parse");
+    let select =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"SELECT", b"1"]))
+            .expect("SELECT should parse");
     assert_that!(
         &select,
         eq(&vec![b"-ERR SELECT is not allowed in MULTI\r\n".to_vec()])
     );
 
-    let exec = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
+    let exec = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(
         &exec,
@@ -4775,12 +5079,14 @@ fn resp_execaborts_after_exec_arity_error_inside_multi() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let exec_arity_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC", b"extra"]))
-        .expect("EXEC should parse");
+    let exec_arity_error = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXEC", b"extra"]),
+    )
+    .expect("EXEC should parse");
     assert_that!(
         &exec_arity_error,
         eq(&vec![
@@ -4788,9 +5094,9 @@ fn resp_execaborts_after_exec_arity_error_inside_multi() {
         ])
     );
 
-    let exec_after_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let exec_after_error =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &exec_after_error,
         eq(&vec![
@@ -4804,12 +5110,14 @@ fn resp_execaborts_after_discard_arity_error_inside_multi() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let discard_arity_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DISCARD", b"extra"]))
-        .expect("DISCARD should parse");
+    let discard_arity_error = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DISCARD", b"extra"]),
+    )
+    .expect("DISCARD should parse");
     assert_that!(
         &discard_arity_error,
         eq(&vec![
@@ -4817,9 +5125,9 @@ fn resp_execaborts_after_discard_arity_error_inside_multi() {
         ])
     );
 
-    let exec_after_error = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"EXEC"]))
-        .expect("EXEC should parse");
+    let exec_after_error =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"EXEC"]))
+            .expect("EXEC should parse");
     assert_that!(
         &exec_after_error,
         eq(&vec![
@@ -4833,8 +5141,7 @@ fn resp_role_reports_master_with_empty_replica_list() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
         .expect("ROLE should succeed");
     assert_that!(&reply, eq(&vec![b"*2\r\n$6\r\nmaster\r\n*0\r\n".to_vec()]));
 }
@@ -4844,16 +5151,19 @@ fn resp_info_replication_reports_master_offsets() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"info:key", b"info:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"info:key", b"info:value"]),
+    )
+    .expect("SET should succeed");
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("# Replication\r\n"), eq(true));
@@ -4869,8 +5179,7 @@ fn resp_info_default_sections_include_replication_and_persistence() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"INFO"]))
         .expect("INFO should succeed");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
@@ -4883,19 +5192,19 @@ fn resp_info_supports_multiple_sections_and_includes_persistence() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"info:multi:key", b"value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"info:multi:key", b"value"]),
+    )
+    .expect("SET should succeed");
 
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"INFO", b"REPLICATION", b"PERSISTENCE"]),
-        )
-        .expect("INFO should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION", b"PERSISTENCE"]),
+    )
+    .expect("INFO should succeed");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("# Replication\r\n"), eq(true));
@@ -4908,12 +5217,12 @@ fn resp_info_ignores_unknown_sections_when_valid_section_is_present() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"INFO", b"REPLICATION", b"INVALIDSECTION"]),
-        )
-        .expect("INFO should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION", b"INVALIDSECTION"]),
+    )
+    .expect("INFO should succeed");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("# Replication\r\n"), eq(true));
@@ -4925,31 +5234,34 @@ fn resp_replconf_ack_is_silent_and_tracks_ack_lsn() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
+    )
+    .expect("SET should succeed");
 
-    let ack_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
-        )
-        .expect("REPLCONF ACK should parse");
+    let ack_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
+    )
+    .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
     assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
 
-    let info = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
 }
@@ -4959,32 +5271,38 @@ fn resp_replconf_ack_without_registered_endpoint_is_tracked_via_implicit_endpoin
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ack:key", b"ack:value"]),
+    )
+    .expect("SET should succeed");
 
-    let ack_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
-        )
-        .expect("REPLCONF ACK should parse");
+    let ack_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK", b"999"]),
+    )
+    .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
     assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
 
-    let info = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
     assert_that!(body.contains("last_ack_lsn:1\r\n"), eq(true));
 
-    let wait = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"WAIT", b"1", b"0"]),
+    )
+    .expect("WAIT should execute");
     assert_that!(&wait, eq(&vec![b":1\r\n".to_vec()]));
 }
 
@@ -4993,17 +5311,20 @@ fn resp_replconf_ack_requires_standalone_pair() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"ACK", b"1", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("invalid REPLCONF ACK shape should parse");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("invalid REPLCONF ACK shape should parse");
     assert_that!(&reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 
-    let info = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:0\r\n"), eq(true));
 }
@@ -5013,30 +5334,30 @@ fn resp_replconf_client_id_is_stored_and_requires_standalone_pair() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let ok_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CLIENT-ID", b"replica-1"]),
-        )
-        .expect("REPLCONF CLIENT-ID should succeed");
+    let ok_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CLIENT-ID", b"replica-1"]),
+    )
+    .expect("REPLCONF CLIENT-ID should succeed");
     assert_that!(&ok_reply, eq(&vec![b"+OK\r\n".to_vec()]));
     assert_that!(
         &connection.replica_client_id,
         eq(&Some("replica-1".to_owned()))
     );
 
-    let error_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[
-                b"REPLCONF",
-                b"CLIENT-ID",
-                b"replica-2",
-                b"LISTENING-PORT",
-                b"7001",
-            ]),
-        )
-        .expect("invalid REPLCONF CLIENT-ID shape should parse");
+    let error_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[
+            b"REPLCONF",
+            b"CLIENT-ID",
+            b"replica-2",
+            b"LISTENING-PORT",
+            b"7001",
+        ]),
+    )
+    .expect("invalid REPLCONF CLIENT-ID shape should parse");
     assert_that!(&error_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 }
 
@@ -5045,12 +5366,12 @@ fn resp_replconf_client_version_requires_integer_and_standalone_pair() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let bad_int_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"abc"]),
-        )
-        .expect("invalid REPLCONF CLIENT-VERSION should parse");
+    let bad_int_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"abc"]),
+    )
+    .expect("invalid REPLCONF CLIENT-VERSION should parse");
     assert_that!(
         &bad_int_reply,
         eq(&vec![
@@ -5058,26 +5379,26 @@ fn resp_replconf_client_version_requires_integer_and_standalone_pair() {
         ])
     );
 
-    let mixed_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[
-                b"REPLCONF",
-                b"CLIENT-VERSION",
-                b"1",
-                b"LISTENING-PORT",
-                b"7001",
-            ]),
-        )
-        .expect("invalid REPLCONF CLIENT-VERSION shape should parse");
+    let mixed_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[
+            b"REPLCONF",
+            b"CLIENT-VERSION",
+            b"1",
+            b"LISTENING-PORT",
+            b"7001",
+        ]),
+    )
+    .expect("invalid REPLCONF CLIENT-VERSION shape should parse");
     assert_that!(&mixed_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 
-    let ok_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"3"]),
-        )
-        .expect("REPLCONF CLIENT-VERSION should succeed");
+    let ok_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CLIENT-VERSION", b"3"]),
+    )
+    .expect("REPLCONF CLIENT-VERSION should succeed");
     assert_that!(&ok_reply, eq(&vec![b"+OK\r\n".to_vec()]));
     assert_that!(&connection.replica_client_version, eq(&Some(3_u64)));
 }
@@ -5087,9 +5408,12 @@ fn resp_wait_reports_zero_without_replica_acks() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let wait = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"WAIT", b"1", b"0"]),
+    )
+    .expect("WAIT should execute");
     assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -5098,31 +5422,40 @@ fn resp_wait_counts_replicas_after_ack_reaches_current_offset() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"wait:key", b"v1"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"wait:key", b"v1"]),
+    )
+    .expect("SET should succeed");
 
-    let wait_before_ack = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait_before_ack = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"WAIT", b"1", b"0"]),
+    )
+    .expect("WAIT should execute");
     assert_that!(&wait_before_ack, eq(&vec![b":0\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("REPLCONF ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("REPLCONF ACK should parse");
 
-    let wait_after_ack = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait_after_ack = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"WAIT", b"1", b"0"]),
+    )
+    .expect("WAIT should execute");
     assert_that!(&wait_after_ack, eq(&vec![b":1\r\n".to_vec()]));
 }
 
@@ -5133,39 +5466,48 @@ fn resp_wait_counts_only_replicas_that_acked_target_offset() {
     let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica1 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica2,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
-        )
-        .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+    )
+    .expect("replica2 REPLCONF LISTENING-PORT should succeed");
 
-    let _ = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"wait:key", b"value"]),
+    )
+    .expect("SET should succeed");
 
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica1 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica1 ACK should parse");
 
-    let wait_one = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
-        .expect("WAIT should execute");
+    let wait_one =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait_one, eq(&vec![b":1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica2 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica2 ACK should parse");
 
-    let wait_two = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
-        .expect("WAIT should execute");
+    let wait_two =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"2", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait_two, eq(&vec![b":2\r\n".to_vec()]));
 }
 
@@ -5176,29 +5518,38 @@ fn resp_wait_honors_timeout_when_required_replica_count_is_unmet() {
     let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica1 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica2,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
-        )
-        .expect("replica2 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica1 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+    )
+    .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"wait:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica1 ACK should parse");
 
     let started = std::time::Instant::now();
-    let wait = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"2", b"12"]))
-        .expect("WAIT should execute");
+    let wait = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"WAIT", b"2", b"12"]),
+    )
+    .expect("WAIT should execute");
     let elapsed = started.elapsed();
     assert_that!(&wait, eq(&vec![b":1\r\n".to_vec()]));
     assert_that!(elapsed >= std::time::Duration::from_millis(6), eq(true));
@@ -5211,31 +5562,40 @@ fn resp_wait_reports_actual_acked_replica_count_even_when_requested_is_lower() {
     let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica1 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica2,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
-        )
-        .expect("replica2 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica1 ACK should parse");
-    let _ = app
-        .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica2 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+    )
+    .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"wait:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica1 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica2 ACK should parse");
 
-    let wait = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait, eq(&vec![b":2\r\n".to_vec()]));
 }
 
@@ -5245,34 +5605,40 @@ fn resp_wait_does_not_reuse_ack_after_replica_re_registers() {
     let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"SET", b"wait:key", b"value"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"wait:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica ACK should parse");
 
-    let wait_after_ack = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait_after_ack =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait_after_ack, eq(&vec![b":1\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica REPLCONF LISTENING-PORT re-registration should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica REPLCONF LISTENING-PORT re-registration should succeed");
 
-    let wait_after_reregister = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait_after_reregister =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait_after_reregister, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -5283,56 +5649,71 @@ fn resp_info_replication_recomputes_last_ack_after_replica_reregister() {
     let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica1 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica2,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
-        )
-        .expect("replica2 REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut client,
-            &resp_command(&[b"SET", b"info:ack:key1", b"value1"]),
-        )
-        .expect("first SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica1 first ACK should parse");
-    let _ = app
-        .feed_connection_bytes(&mut replica2, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica2 first ACK should parse");
-    let _ = app
-        .feed_connection_bytes(
-            &mut client,
-            &resp_command(&[b"SET", b"info:ack:key2", b"value2"]),
-        )
-        .expect("second SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"2"]))
-        .expect("replica1 second ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica1 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7002"]),
+    )
+    .expect("replica2 REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"info:ack:key1", b"value1"]),
+    )
+    .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica1 first ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica2 first ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"info:ack:key2", b"value2"]),
+    )
+    .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"2"]),
+    )
+    .expect("replica1 second ACK should parse");
 
-    let before = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let before = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let before_body = decode_resp_bulk_payload(&before[0]);
     assert_that!(before_body.contains("last_ack_lsn:2\r\n"), eq(true));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica1 REPLCONF LISTENING-PORT re-registration should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica1 REPLCONF LISTENING-PORT re-registration should succeed");
 
-    let after = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let after = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let after_body = decode_resp_bulk_payload(&after[0]);
     assert_that!(after_body.contains("last_ack_lsn:1\r\n"), eq(true));
 }
@@ -5344,44 +5725,50 @@ fn resp_info_replication_reports_per_replica_state_and_lag() {
     let mut replica2 = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica1,
-            &resp_command(&[
-                b"REPLCONF",
-                b"LISTENING-PORT",
-                b"7001",
-                b"IP-ADDRESS",
-                b"10.0.0.1",
-            ]),
-        )
-        .expect("replica1 REPLCONF endpoint registration should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica2,
-            &resp_command(&[
-                b"REPLCONF",
-                b"LISTENING-PORT",
-                b"7002",
-                b"IP-ADDRESS",
-                b"10.0.0.2",
-            ]),
-        )
-        .expect("replica2 REPLCONF endpoint registration should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[
+            b"REPLCONF",
+            b"LISTENING-PORT",
+            b"7001",
+            b"IP-ADDRESS",
+            b"10.0.0.1",
+        ]),
+    )
+    .expect("replica1 REPLCONF endpoint registration should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica2,
+        &resp_command(&[
+            b"REPLCONF",
+            b"LISTENING-PORT",
+            b"7002",
+            b"IP-ADDRESS",
+            b"10.0.0.2",
+        ]),
+    )
+    .expect("replica2 REPLCONF endpoint registration should succeed");
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut client,
-            &resp_command(&[b"SET", b"info:replica:key", b"value"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica1, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica1 ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"info:replica:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica1,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica1 ACK should parse");
 
-    let info = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:2\r\n"), eq(true));
     assert_that!(
@@ -5399,12 +5786,12 @@ fn resp_replconf_capa_dragonfly_returns_handshake_array() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     assert_that!(reply.len(), eq(1_usize));
 
     let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
@@ -5419,18 +5806,18 @@ fn resp_replconf_capa_dragonfly_allocates_monotonic_sync_ids() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let first = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("first REPLCONF CAPA dragonfly should succeed");
-    let second = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("second REPLCONF CAPA dragonfly should succeed");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("first REPLCONF CAPA dragonfly should succeed");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("second REPLCONF CAPA dragonfly should succeed");
 
     let first_sync_id = extract_sync_id_from_capa_reply(&first[0]);
     let second_sync_id = extract_sync_id_from_capa_reply(&second[0]);
@@ -5443,28 +5830,28 @@ fn resp_dfly_flow_returns_partial_when_lsn_is_available() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"flow:key", b"flow:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"flow:key", b"flow:value"]),
+    )
+    .expect("SET should succeed");
 
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
-        )
-        .expect("DFLY FLOW should succeed");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
+    )
+    .expect("DFLY FLOW should succeed");
     let (sync_type, eof_token) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("PARTIAL"));
     assert_that!(eof_token.len(), eq(40_usize));
@@ -5476,34 +5863,34 @@ fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
     app.replication.journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"flow:key", b"v1"]),
-        )
-        .expect("first SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"flow:key", b"v2"]),
-        )
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"flow:key", b"v1"]),
+    )
+    .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"flow:key", b"v2"]),
+    )
+    .expect("second SET should succeed");
 
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
-        )
-        .expect("DFLY FLOW should succeed");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
+    )
+    .expect("DFLY FLOW should succeed");
     let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("FULL"));
 }
@@ -5514,35 +5901,35 @@ fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     app.replication.journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id_text = extract_sync_id_from_capa_reply(&handshake[0]);
     let sync_id = sync_id_text.as_bytes().to_vec();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"flow:stale:key", b"v1"]),
-        )
-        .expect("first SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"flow:stale:key", b"v2"]),
-        )
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"flow:stale:key", b"v1"]),
+    )
+    .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"flow:stale:key", b"v2"]),
+    )
+    .expect("second SET should succeed");
 
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
-        )
-        .expect("DFLY FLOW should succeed");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0", b"0"]),
+    )
+    .expect("DFLY FLOW should succeed");
     let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("FULL"));
 
@@ -5559,59 +5946,59 @@ fn resp_dfly_sync_and_startstable_update_replica_role_state() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("REPLCONF LISTENING-PORT should succeed");
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
-        let flow_reply = app
-            .feed_connection_bytes(
-                &mut connection,
-                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
-            )
-            .expect("DFLY FLOW should succeed");
+        let flow_reply = ingress_connection_bytes(
+            &mut app,
+            &mut connection,
+            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
+        )
+        .expect("DFLY FLOW should succeed");
         let (sync_type, eof_token) = extract_dfly_flow_reply(&flow_reply[0]);
         assert_that!(sync_type.as_str(), eq("FULL"));
         assert_that!(eof_token.len(), eq(40_usize));
     }
 
-    let sync_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
-        )
-        .expect("DFLY SYNC should succeed");
+    let sync_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
+    )
+    .expect("DFLY SYNC should succeed");
     assert_that!(&sync_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let role_after_sync = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
-        .expect("ROLE should succeed");
+    let role_after_sync =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed");
     let role_payload = std::str::from_utf8(&role_after_sync[0]).expect("ROLE is UTF-8");
     assert_that!(role_payload.contains("full_sync"), eq(true));
 
-    let stable_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"STARTSTABLE", &sync_id]),
-        )
-        .expect("DFLY STARTSTABLE should succeed");
+    let stable_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"STARTSTABLE", &sync_id]),
+    )
+    .expect("DFLY STARTSTABLE should succeed");
     assert_that!(&stable_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let role_after_stable = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
-        .expect("ROLE should succeed");
+    let role_after_stable =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed");
     let role_payload = std::str::from_utf8(&role_after_stable[0]).expect("ROLE is UTF-8");
     assert_that!(role_payload.contains("stable_sync"), eq(true));
 }
@@ -5621,30 +6008,30 @@ fn resp_dfly_sync_requires_all_flows_registered() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
-        )
-        .expect("first DFLY FLOW should succeed");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+    )
+    .expect("first DFLY FLOW should succeed");
     let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("FULL"));
 
-    let sync_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
-        )
-        .expect("DFLY SYNC should parse");
+    let sync_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
+    )
+    .expect("DFLY SYNC should parse");
     assert_that!(&sync_reply, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
 }
 
@@ -5653,16 +6040,25 @@ fn resp_dfly_replicaoffset_reports_offsets_for_all_shards() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ro:key", b"v1"]))
-        .expect("first SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", b"ro:key", b"v2"]))
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ro:key", b"v1"]),
+    )
+    .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"ro:key", b"v2"]),
+    )
+    .expect("second SET should succeed");
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"DFLY", b"REPLICAOFFSET"]))
-        .expect("DFLY REPLICAOFFSET should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"REPLICAOFFSET"]),
+    )
+    .expect("DFLY REPLICAOFFSET should execute");
     let expected_entry = format!(":{}\r\n", app.replication.replication_offset());
     let expected = format!(
         "*{}\r\n{}",
@@ -5678,37 +6074,37 @@ fn resp_dfly_flow_rejects_after_session_leaves_preparation() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
-        let _ = app
-            .feed_connection_bytes(
-                &mut connection,
-                &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
-            )
-            .expect("DFLY FLOW should succeed");
+        let _ = ingress_connection_bytes(
+            &mut app,
+            &mut connection,
+            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, &flow_id_text]),
+        )
+        .expect("DFLY FLOW should succeed");
     }
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
-        )
-        .expect("DFLY SYNC should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"SYNC", &sync_id]),
+    )
+    .expect("DFLY SYNC should succeed");
 
-    let replay_flow = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
-        )
-        .expect("DFLY FLOW should parse");
+    let replay_flow = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+    )
+    .expect("DFLY FLOW should parse");
     assert_that!(&replay_flow, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
 }
 
@@ -5717,39 +6113,39 @@ fn resp_dfly_flow_accepts_master_lsn_vector_argument() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"vector:key", b"vector:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"vector:key", b"vector:value"]),
+    )
+    .expect("SET should succeed");
 
     let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
         .join("-")
         .into_bytes();
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[
-                b"DFLY",
-                b"FLOW",
-                &master_id,
-                &sync_id,
-                b"1",
-                b"LASTMASTER",
-                &lsn_vec,
-            ]),
-        )
-        .expect("DFLY FLOW should succeed");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[
+            b"DFLY",
+            b"FLOW",
+            &master_id,
+            &sync_id,
+            b"1",
+            b"LASTMASTER",
+            &lsn_vec,
+        ]),
+    )
+    .expect("DFLY FLOW should succeed");
     let (sync_type, _) = extract_dfly_flow_reply(&flow_reply[0]);
     assert_that!(sync_type.as_str(), eq("PARTIAL"));
 }
@@ -5759,32 +6155,32 @@ fn resp_dfly_flow_rejects_invalid_lastmaster_marker() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
     let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
         .join("-")
         .into_bytes();
 
-    let flow_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[
-                b"DFLY",
-                b"FLOW",
-                &master_id,
-                &sync_id,
-                b"0",
-                b"BADMARKER",
-                &lsn_vec,
-            ]),
-        )
-        .expect("DFLY FLOW should parse");
+    let flow_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[
+            b"DFLY",
+            b"FLOW",
+            &master_id,
+            &sync_id,
+            b"0",
+            b"BADMARKER",
+            &lsn_vec,
+        ]),
+    )
+    .expect("DFLY FLOW should parse");
     assert_that!(&flow_reply, eq(&vec![b"-ERR syntax error\r\n".to_vec()]));
 }
 
@@ -5793,29 +6189,29 @@ fn resp_dfly_flow_rejects_duplicate_flow_registration() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let handshake = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
-        )
-        .expect("REPLCONF CAPA dragonfly should succeed");
+    let handshake = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"CAPA", b"dragonfly"]),
+    )
+    .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
     let master_id = app.replication.master_replid().as_bytes().to_vec();
-    let first = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
-        )
-        .expect("first DFLY FLOW should succeed");
+    let first = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+    )
+    .expect("first DFLY FLOW should succeed");
     let (sync_type, _) = extract_dfly_flow_reply(&first[0]);
     assert_that!(sync_type.as_str(), eq("FULL"));
 
-    let second = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
-        )
-        .expect("second DFLY FLOW should parse");
+    let second = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"FLOW", &master_id, &sync_id, b"0"]),
+    )
+    .expect("second DFLY FLOW should parse");
     assert_that!(&second, eq(&vec![b"-ERR invalid state\r\n".to_vec()]));
 }
 
@@ -5824,52 +6220,61 @@ fn resp_replconf_registration_and_psync_update_role_replica_state() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let register = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[
-                b"REPLCONF",
-                b"LISTENING-PORT",
-                b"7001",
-                b"IP-ADDRESS",
-                b"10.0.0.2",
-            ]),
-        )
-        .expect("REPLCONF LISTENING-PORT/IP-ADDRESS should succeed");
+    let register = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[
+            b"REPLCONF",
+            b"LISTENING-PORT",
+            b"7001",
+            b"IP-ADDRESS",
+            b"10.0.0.2",
+        ]),
+    )
+    .expect("REPLCONF LISTENING-PORT/IP-ADDRESS should succeed");
     assert_that!(&register, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let role_after_register = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
-        .expect("ROLE should succeed");
+    let role_after_register =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed");
     let role_payload = std::str::from_utf8(&role_after_register[0]).expect("ROLE is UTF-8");
     assert_that!(role_payload.contains("10.0.0.2"), eq(true));
     assert_that!(role_payload.contains("7001"), eq(true));
     assert_that!(role_payload.contains("preparation"), eq(true));
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", b"?", b"-1"]))
-        .expect("PSYNC should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSYNC", b"?", b"-1"]),
+    )
+    .expect("PSYNC should succeed");
 
-    let role_after_fullsync = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
-        .expect("ROLE should succeed after PSYNC");
+    let role_after_fullsync =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed after PSYNC");
     let role_payload = std::str::from_utf8(&role_after_fullsync[0]).expect("ROLE is UTF-8");
     assert_that!(role_payload.contains("full_sync"), eq(true));
 
-    let ack_reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"REPLCONF", b"ACK", b"0"]))
-        .expect("REPLCONF ACK should parse");
+    let ack_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"REPLCONF", b"ACK", b"0"]),
+    )
+    .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
 
-    let role_after_ack = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"ROLE"]))
-        .expect("ROLE should succeed after ACK");
+    let role_after_ack =
+        ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"ROLE"]))
+            .expect("ROLE should succeed after ACK");
     let role_payload = std::str::from_utf8(&role_after_ack[0]).expect("ROLE is UTF-8");
     assert_that!(role_payload.contains("stable_sync"), eq(true));
 
-    let info = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
 }
@@ -5880,33 +6285,39 @@ fn resp_replconf_endpoint_identity_update_replaces_stale_endpoint_row() {
     let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut client,
-            &resp_command(&[b"SET", b"replconf:identity:key", b"value"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"replconf:identity:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica ACK should parse");
     assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica,
-            &resp_command(&[b"REPLCONF", b"IP-ADDRESS", b"10.0.0.8"]),
-        )
-        .expect("replica REPLCONF IP-ADDRESS should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"IP-ADDRESS", b"10.0.0.8"]),
+    )
+    .expect("replica REPLCONF IP-ADDRESS should succeed");
 
-    let info = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:1\r\n"), eq(true));
     assert_that!(
@@ -5915,9 +6326,9 @@ fn resp_replconf_endpoint_identity_update_replaces_stale_endpoint_row() {
     );
     assert_that!(body.contains("127.0.0.1"), eq(false));
 
-    let wait = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -5927,35 +6338,41 @@ fn disconnect_connection_unregisters_replica_endpoint_and_ack_progress() {
     let mut replica = ServerApp::new_connection(ClientProtocol::Resp);
     let mut client = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut replica,
-            &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
-        )
-        .expect("replica REPLCONF LISTENING-PORT should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut client,
-            &resp_command(&[b"SET", b"disconnect:replica:key", b"value"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(&mut replica, &resp_command(&[b"REPLCONF", b"ACK", b"1"]))
-        .expect("replica ACK should parse");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"LISTENING-PORT", b"7001"]),
+    )
+    .expect("replica REPLCONF LISTENING-PORT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"SET", b"disconnect:replica:key", b"value"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut replica,
+        &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
+    )
+    .expect("replica ACK should parse");
     assert_that!(app.replication.last_acked_lsn(), eq(1_u64));
 
     app.disconnect_connection(&mut replica);
 
-    let info = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"INFO", b"REPLICATION"]))
-        .expect("INFO REPLICATION should succeed");
+    let info = ingress_connection_bytes(
+        &mut app,
+        &mut client,
+        &resp_command(&[b"INFO", b"REPLICATION"]),
+    )
+    .expect("INFO REPLICATION should succeed");
     let body = decode_resp_bulk_payload(&info[0]);
     assert_that!(body.contains("connected_slaves:0\r\n"), eq(true));
     assert_that!(body.contains("last_ack_lsn:0\r\n"), eq(true));
 
-    let wait = app
-        .feed_connection_bytes(&mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
-        .expect("WAIT should execute");
+    let wait =
+        ingress_connection_bytes(&mut app, &mut client, &resp_command(&[b"WAIT", b"1", b"0"]))
+            .expect("WAIT should execute");
     assert_that!(&wait, eq(&vec![b":0\r\n".to_vec()]));
 }
 
@@ -5964,9 +6381,12 @@ fn resp_psync_with_unknown_replid_returns_full_resync_header() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", b"?", b"-1"]))
-        .expect("PSYNC should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSYNC", b"?", b"-1"]),
+    )
+    .expect("PSYNC should succeed");
     let expected = format!("+FULLRESYNC {} 0\r\n", app.replication.master_replid()).into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
 }
@@ -5976,17 +6396,20 @@ fn resp_psync_returns_continue_when_offset_is_available() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"psync:key", b"psync:value"]),
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"psync:key", b"psync:value"]),
+    )
+    .expect("SET should succeed");
 
     let replid = app.replication.master_replid().as_bytes().to_vec();
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", &replid, b"0"]))
-        .expect("PSYNC should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSYNC", &replid, b"0"]),
+    )
+    .expect("PSYNC should succeed");
     assert_that!(&reply, eq(&vec![b"+CONTINUE\r\n".to_vec()]));
 }
 
@@ -5996,23 +6419,26 @@ fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     app.replication.journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"stale:key", b"v1"]),
-        )
-        .expect("first SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"stale:key", b"v2"]),
-        )
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"stale:key", b"v1"]),
+    )
+    .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"stale:key", b"v2"]),
+    )
+    .expect("second SET should succeed");
 
     let replid = app.replication.master_replid().as_bytes().to_vec();
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"PSYNC", &replid, b"0"]))
-        .expect("PSYNC should succeed");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"PSYNC", &replid, b"0"]),
+    )
+    .expect("PSYNC should succeed");
     let expected = format!("+FULLRESYNC {} 2\r\n", app.replication.master_replid()).into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
 }
@@ -6022,21 +6448,24 @@ fn server_snapshot_roundtrip_restores_data_across_databases() {
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
-        )
-        .expect("db0 SET should succeed");
-    let _ = source
-        .feed_connection_bytes(&mut source_connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n")
-        .expect("SELECT 2 should succeed");
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb2\r\n",
-        )
-        .expect("db2 SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb0\r\n",
+    )
+    .expect("db0 SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n",
+    )
+    .expect("SELECT 2 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$6\r\nshared\r\n$3\r\ndb2\r\n",
+    )
+    .expect("db2 SET should succeed");
 
     let snapshot_bytes = source
         .create_snapshot_bytes()
@@ -6048,26 +6477,26 @@ fn server_snapshot_roundtrip_restores_data_across_databases() {
         .expect("snapshot import should succeed");
 
     let mut restored_connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let db0_get = restored
-        .feed_connection_bytes(
-            &mut restored_connection,
-            b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
-        )
-        .expect("db0 GET should succeed");
+    let db0_get = ingress_connection_bytes(
+        &mut restored,
+        &mut restored_connection,
+        b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+    )
+    .expect("db0 GET should succeed");
     assert_that!(&db0_get, eq(&vec![b"$3\r\ndb0\r\n".to_vec()]));
 
-    let _ = restored
-        .feed_connection_bytes(
-            &mut restored_connection,
-            b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n",
-        )
-        .expect("SELECT 2 should succeed after restore");
-    let db2_get = restored
-        .feed_connection_bytes(
-            &mut restored_connection,
-            b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
-        )
-        .expect("db2 GET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut restored,
+        &mut restored_connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n",
+    )
+    .expect("SELECT 2 should succeed after restore");
+    let db2_get = ingress_connection_bytes(
+        &mut restored,
+        &mut restored_connection,
+        b"*2\r\n$3\r\nGET\r\n$6\r\nshared\r\n",
+    )
+    .expect("db2 GET should succeed");
     assert_that!(&db2_get, eq(&vec![b"$3\r\ndb2\r\n".to_vec()]));
 }
 
@@ -6095,8 +6524,7 @@ fn resp_cluster_keyslot_returns_redis_slot() {
 
     let key = b"user:{42}:meta";
     let command = resp_command(&[b"CLUSTER", b"KEYSLOT", key]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &command)
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &command)
         .expect("CLUSTER KEYSLOT should execute");
     let expected = vec![format!(":{}\r\n", key_slot(key)).into_bytes()];
     assert_that!(&reply, eq(&expected));
@@ -6111,9 +6539,12 @@ fn resp_cluster_myid_returns_local_node_id() {
     let mut app = ServerApp::new(config);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"MYID"]))
-        .expect("CLUSTER MYID should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"MYID"]),
+    )
+    .expect("CLUSTER MYID should execute");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.as_str(), eq(app.cluster.node_id.as_str()));
@@ -6124,9 +6555,12 @@ fn resp_cluster_commands_are_rejected_when_cluster_mode_is_disabled() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"INFO"]))
-        .expect("CLUSTER INFO should parse");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"INFO"]),
+    )
+    .expect("CLUSTER INFO should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -6140,8 +6574,7 @@ fn resp_readonly_returns_ok() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"READONLY"]))
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"READONLY"]))
         .expect("READONLY should execute");
     assert_that!(&reply, eq(&vec![b"+OK\r\n".to_vec()]));
 }
@@ -6150,9 +6583,12 @@ fn resp_readonly_returns_ok() {
 fn resp_readwrite_requires_cluster_emulated_mode() {
     let mut disabled = ServerApp::new(RuntimeConfig::default());
     let mut disabled_connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let disabled_reply = disabled
-        .feed_connection_bytes(&mut disabled_connection, &resp_command(&[b"READWRITE"]))
-        .expect("READWRITE should parse");
+    let disabled_reply = ingress_connection_bytes(
+        &mut disabled,
+        &mut disabled_connection,
+        &resp_command(&[b"READWRITE"]),
+    )
+    .expect("READWRITE should parse");
     assert_that!(
         &disabled_reply,
         eq(&vec![
@@ -6166,9 +6602,12 @@ fn resp_readwrite_requires_cluster_emulated_mode() {
     };
     let mut emulated = ServerApp::new(config);
     let mut emulated_connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let emulated_reply = emulated
-        .feed_connection_bytes(&mut emulated_connection, &resp_command(&[b"READWRITE"]))
-        .expect("READWRITE should execute in emulated mode");
+    let emulated_reply = ingress_connection_bytes(
+        &mut emulated,
+        &mut emulated_connection,
+        &resp_command(&[b"READWRITE"]),
+    )
+    .expect("READWRITE should execute in emulated mode");
     assert_that!(&emulated_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 }
 
@@ -6181,9 +6620,12 @@ fn resp_cluster_help_returns_help_entries() {
     let mut app = ServerApp::new(config);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"HELP"]))
-        .expect("CLUSTER HELP should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"HELP"]),
+    )
+    .expect("CLUSTER HELP should execute");
     assert_that!(reply.len(), eq(1_usize));
     let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
     assert_that!(payload.starts_with("*15\r\n"), eq(true));
@@ -6213,41 +6655,44 @@ fn resp_cluster_getkeysinslot_returns_slot_keys_using_layered_index() {
     let other_slot_key = b"{43}:x".to_vec();
     let slot = key_slot(&first_key);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", &first_key, b"v1"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &second_key, b"v2"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &other_slot_key, b"x"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &expired_key, b"gone"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", &expired_key, b"0"]),
-        )
-        .expect("EXPIRE should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &first_key, b"v1"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &second_key, b"v2"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &other_slot_key, b"x"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &expired_key, b"gone"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", &expired_key, b"0"]),
+    )
+    .expect("EXPIRE should succeed");
 
     let slot_text = slot.to_string().into_bytes();
-    let limited = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", &slot_text, b"1"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should execute");
+    let limited = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", &slot_text, b"1"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should execute");
     assert_that!(
         &limited,
         eq(&vec![
@@ -6260,12 +6705,12 @@ fn resp_cluster_getkeysinslot_returns_slot_keys_using_layered_index() {
         ])
     );
 
-    let full = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", &slot_text, b"10"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should execute");
+    let full = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", &slot_text, b"10"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should execute");
     assert_that!(
         &full,
         eq(&vec![
@@ -6290,12 +6735,12 @@ fn resp_cluster_getkeysinslot_validates_arguments() {
     let mut app = ServerApp::new(config);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let arity = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"42"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should parse");
+    let arity = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"42"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should parse");
     assert_that!(
         &arity,
         eq(&vec![
@@ -6303,12 +6748,12 @@ fn resp_cluster_getkeysinslot_validates_arguments() {
         ])
     );
 
-    let invalid_slot = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"abc", b"10"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should parse");
+    let invalid_slot = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"abc", b"10"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should parse");
     assert_that!(
         &invalid_slot,
         eq(&vec![
@@ -6316,23 +6761,23 @@ fn resp_cluster_getkeysinslot_validates_arguments() {
         ])
     );
 
-    let out_of_range = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"20000", b"10"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should parse");
+    let out_of_range = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"20000", b"10"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should parse");
     assert_that!(
         &out_of_range,
         eq(&vec![b"-ERR slot is out of range\r\n".to_vec()])
     );
 
-    let invalid_count = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"42", b"-1"]),
-        )
-        .expect("CLUSTER GETKEYSINSLOT should parse");
+    let invalid_count = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"GETKEYSINSLOT", b"42", b"-1"]),
+    )
+    .expect("CLUSTER GETKEYSINSLOT should parse");
     assert_that!(
         &invalid_count,
         eq(&vec![
@@ -6356,41 +6801,44 @@ fn resp_cluster_countkeysinslot_returns_live_cardinality() {
     let other_slot_key = b"{8}:x".to_vec();
     let slot = key_slot(&first_key);
 
-    let _ = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"SET", &first_key, b"v1"]))
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &second_key, b"v2"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &other_slot_key, b"x"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", &expired_key, b"gone"]),
-        )
-        .expect("SET should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"EXPIRE", &expired_key, b"0"]),
-        )
-        .expect("EXPIRE should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &first_key, b"v1"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &second_key, b"v2"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &other_slot_key, b"x"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", &expired_key, b"gone"]),
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"EXPIRE", &expired_key, b"0"]),
+    )
+    .expect("EXPIRE should succeed");
 
     let slot_text = slot.to_string().into_bytes();
-    let reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", &slot_text]),
-        )
-        .expect("CLUSTER COUNTKEYSINSLOT should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", &slot_text]),
+    )
+    .expect("CLUSTER COUNTKEYSINSLOT should execute");
     assert_that!(&reply, eq(&vec![b":2\r\n".to_vec()]));
 }
 
@@ -6403,12 +6851,12 @@ fn resp_cluster_countkeysinslot_validates_arguments() {
     let mut app = ServerApp::new(config);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let arity = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT"]),
-        )
-        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    let arity = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT"]),
+    )
+    .expect("CLUSTER COUNTKEYSINSLOT should parse");
     assert_that!(
         &arity,
         eq(&vec![
@@ -6416,12 +6864,12 @@ fn resp_cluster_countkeysinslot_validates_arguments() {
         ])
     );
 
-    let invalid_slot = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"abc"]),
-        )
-        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    let invalid_slot = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"abc"]),
+    )
+    .expect("CLUSTER COUNTKEYSINSLOT should parse");
     assert_that!(
         &invalid_slot,
         eq(&vec![
@@ -6429,12 +6877,12 @@ fn resp_cluster_countkeysinslot_validates_arguments() {
         ])
     );
 
-    let out_of_range = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"20000"]),
-        )
-        .expect("CLUSTER COUNTKEYSINSLOT should parse");
+    let out_of_range = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"20000"]),
+    )
+    .expect("CLUSTER COUNTKEYSINSLOT should parse");
     assert_that!(
         &out_of_range,
         eq(&vec![b"-ERR slot is out of range\r\n".to_vec()])
@@ -6457,9 +6905,12 @@ fn resp_cluster_shards_reports_single_master_descriptor() {
     ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"SHARDS"]))
-        .expect("CLUSTER SHARDS should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"SHARDS"]),
+    )
+    .expect("CLUSTER SHARDS should execute");
     assert_that!(reply.len(), eq(1_usize));
 
     let payload = std::str::from_utf8(&reply[0]).expect("payload must be UTF-8");
@@ -6488,8 +6939,7 @@ fn resp_cluster_slots_returns_owned_ranges() {
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let command = resp_command(&[b"CLUSTER", b"SLOTS"]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &command)
+    let reply = ingress_connection_bytes(&mut app, &mut connection, &command)
         .expect("CLUSTER SLOTS should execute");
     let expected = vec![
             b"*2\r\n*3\r\n:0\r\n:99\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n*3\r\n:200\r\n:300\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n".to_vec(),
@@ -6513,9 +6963,12 @@ fn resp_cluster_info_reports_slot_summary() {
     ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"INFO"]))
-        .expect("CLUSTER INFO should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"INFO"]),
+    )
+    .expect("CLUSTER INFO should execute");
     assert_that!(reply.len(), eq(1_usize));
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("cluster_state:ok\r\n"), eq(true));
@@ -6539,9 +6992,12 @@ fn resp_cluster_nodes_reports_myself_master_topology() {
     ]);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let reply = app
-        .feed_connection_bytes(&mut connection, &resp_command(&[b"CLUSTER", b"NODES"]))
-        .expect("CLUSTER NODES should execute");
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"CLUSTER", b"NODES"]),
+    )
+    .expect("CLUSTER NODES should execute");
     let body = decode_resp_bulk_payload(&reply[0]);
     assert_that!(body.contains("myself,master"), eq(true));
     assert_that!(body.contains(&app.cluster.node_id), eq(true));
@@ -6566,9 +7022,8 @@ fn cluster_mode_rejects_crossslot_mset() {
     }
 
     let request = resp_command(&[b"MSET", &first_key, b"v1", &second_key, b"v2"]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &request)
-        .expect("MSET should parse");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut connection, &request).expect("MSET should parse");
     assert_that!(
         &reply,
         eq(&vec![
@@ -6599,9 +7054,8 @@ fn cluster_mode_redirects_unowned_single_key_command_with_moved() {
     app.cluster.set_owned_ranges(vec![owned]);
 
     let command = resp_command(&[b"GET", key]);
-    let reply = app
-        .feed_connection_bytes(&mut connection, &command)
-        .expect("GET should parse");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut connection, &command).expect("GET should parse");
     let expected = vec![format!("-MOVED {slot} 127.0.0.1:7000\r\n").into_bytes()];
     assert_that!(&reply, eq(&expected));
 }
@@ -6613,30 +7067,31 @@ fn dfly_save_then_load_restores_snapshot_file() {
 
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_conn = ServerApp::new_connection(ClientProtocol::Resp);
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_conn,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("seed SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_conn,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("seed SET should succeed");
 
     let save = resp_command(&[b"DFLY", b"SAVE", &path_bytes]);
-    let save_reply = source
-        .feed_connection_bytes(&mut source_conn, &save)
+    let save_reply = ingress_connection_bytes(&mut source, &mut source_conn, &save)
         .expect("DFLY SAVE should execute");
     assert_that!(&save_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
     let mut restored = ServerApp::new(RuntimeConfig::default());
     let mut restored_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let load = resp_command(&[b"DFLY", b"LOAD", &path_bytes]);
-    let load_reply = restored
-        .feed_connection_bytes(&mut restored_conn, &load)
+    let load_reply = ingress_connection_bytes(&mut restored, &mut restored_conn, &load)
         .expect("DFLY LOAD should execute");
     assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let get_reply = restored
-        .feed_connection_bytes(&mut restored_conn, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET after LOAD should succeed");
+    let get_reply = ingress_connection_bytes(
+        &mut restored,
+        &mut restored_conn,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET after LOAD should succeed");
     assert_that!(&get_reply, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
 
     let _ = std::fs::remove_file(path);
@@ -6649,49 +7104,47 @@ fn resp_watch_aborts_exec_when_dfly_load_creates_watched_key() {
 
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_conn = ServerApp::new_connection(ClientProtocol::Resp);
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_conn,
-            &resp_command(&[b"SET", b"load:watch:key", b"seed"]),
-        )
-        .expect("seed key should be created for snapshot");
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_conn,
-            &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
-        )
-        .expect("DFLY SAVE should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_conn,
+        &resp_command(&[b"SET", b"load:watch:key", b"seed"]),
+    )
+    .expect("seed key should be created for snapshot");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_conn,
+        &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
+    )
+    .expect("DFLY SAVE should succeed");
 
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut watch_conn = ServerApp::new_connection(ClientProtocol::Resp);
     let mut admin_conn = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            &resp_command(&[b"WATCH", b"load:watch:key"]),
-        )
-        .expect("WATCH should succeed");
-    let load_reply = app
-        .feed_connection_bytes(
-            &mut admin_conn,
-            &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
-        )
-        .expect("DFLY LOAD should execute");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"WATCH", b"load:watch:key"]),
+    )
+    .expect("WATCH should succeed");
+    let load_reply = ingress_connection_bytes(
+        &mut app,
+        &mut admin_conn,
+        &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+    )
+    .expect("DFLY LOAD should execute");
     assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"MULTI"]))
+    let _ = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
-    let _ = app
-        .feed_connection_bytes(
-            &mut watch_conn,
-            &resp_command(&[b"SET", b"load:watch:key", b"mine"]),
-        )
-        .expect("SET should queue");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut watch_conn,
+        &resp_command(&[b"SET", b"load:watch:key", b"mine"]),
+    )
+    .expect("SET should queue");
 
-    let exec_reply = app
-        .feed_connection_bytes(&mut watch_conn, &resp_command(&[b"EXEC"]))
+    let exec_reply = ingress_connection_bytes(&mut app, &mut watch_conn, &resp_command(&[b"EXEC"]))
         .expect("EXEC should parse");
     assert_that!(&exec_reply, eq(&vec![b"*-1\r\n".to_vec()]));
 
@@ -6706,9 +7159,8 @@ fn dfly_load_reports_missing_file_error() {
     let path_bytes = path.to_string_lossy().as_bytes().to_vec();
 
     let load = resp_command(&[b"DFLY", b"LOAD", &path_bytes]);
-    let reply = app
-        .feed_connection_bytes(&mut conn, &load)
-        .expect("DFLY LOAD should parse");
+    let reply =
+        ingress_connection_bytes(&mut app, &mut conn, &load).expect("DFLY LOAD should parse");
     assert_that!(
         reply[0].starts_with(b"-ERR DFLY LOAD failed: io error:"),
         eq(true)
@@ -6720,39 +7172,39 @@ fn resp_dfly_load_resets_replication_state() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"load:reset:key", b"initial"]),
-        )
-        .expect("initial SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"load:reset:key", b"initial"]),
+    )
+    .expect("initial SET should succeed");
     assert_that!(app.replication.replication_offset(), gt(0_u64));
 
     let path = unique_test_snapshot_path("dfly-load-reset");
     let path_bytes = path.to_string_lossy().as_bytes().to_vec();
 
-    let save_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
-        )
-        .expect("DFLY SAVE should execute");
+    let save_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
+    )
+    .expect("DFLY SAVE should execute");
     assert_that!(&save_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    let _ = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"SET", b"load:reset:key", b"new"]),
-        )
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"SET", b"load:reset:key", b"new"]),
+    )
+    .expect("second SET should succeed");
     assert_that!(app.replication.replication_offset(), gt(1_u64));
 
-    let load_reply = app
-        .feed_connection_bytes(
-            &mut connection,
-            &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
-        )
-        .expect("DFLY LOAD should execute");
+    let load_reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+    )
+    .expect("DFLY LOAD should execute");
     assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
     assert_that!(app.replication.replication_offset(), eq(0_u64));
@@ -6767,21 +7219,24 @@ fn journal_replay_restores_state_in_fresh_server() {
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-        )
-        .expect("SET should succeed");
-    let _ = source
-        .feed_connection_bytes(&mut source_connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
-        .expect("SELECT should succeed");
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
-        )
-        .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .expect("SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
+    )
+    .expect("SELECT should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
+    )
+    .expect("SET should succeed");
 
     let entries = source.replication.journal_entries();
 
@@ -6795,17 +7250,26 @@ fn journal_replay_restores_state_in_fresh_server() {
     assert_that!(applied, eq(2_usize));
 
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let db0 = restored
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET in db0 should succeed");
+    let db0 = ingress_connection_bytes(
+        &mut restored,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET in db0 should succeed");
     assert_that!(&db0, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
 
-    let _ = restored
-        .feed_connection_bytes(&mut connection, b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
-        .expect("SELECT should succeed");
-    let db1 = restored
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET in db1 should succeed");
+    let _ = ingress_connection_bytes(
+        &mut restored,
+        &mut connection,
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
+    )
+    .expect("SELECT should succeed");
+    let db1 = ingress_connection_bytes(
+        &mut restored,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET in db1 should succeed");
     assert_that!(&db1, eq(&vec![b"$3\r\nbaz\r\n".to_vec()]));
 }
 
@@ -6814,19 +7278,19 @@ fn journal_replay_from_lsn_applies_only_suffix() {
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
-        )
-        .expect("first SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
+    )
+    .expect("first SET should succeed");
     let start_lsn = source.replication.journal_lsn();
-    let _ = source
-        .feed_connection_bytes(
-            &mut source_connection,
-            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n",
-        )
-        .expect("second SET should succeed");
+    let _ = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n",
+    )
+    .expect("second SET should succeed");
 
     let entries = source.replication.journal_entries();
     let mut restored = ServerApp::new(RuntimeConfig::default());
@@ -6840,9 +7304,12 @@ fn journal_replay_from_lsn_applies_only_suffix() {
     assert_that!(applied, eq(1_usize));
 
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let get_reply = restored
-        .feed_connection_bytes(&mut connection, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
-        .expect("GET should succeed");
+    let get_reply = ingress_connection_bytes(
+        &mut restored,
+        &mut connection,
+        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+    )
+    .expect("GET should succeed");
     assert_that!(&get_reply, eq(&vec![b"$3\r\nnew\r\n".to_vec()]));
 }
 
