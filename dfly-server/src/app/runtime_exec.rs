@@ -295,6 +295,76 @@ impl ServerApp {
         }
     }
 
+    fn execute_grouped_worker_commands(
+        &mut self,
+        db: u16,
+        grouped_commands: Vec<(u16, CommandFrame)>,
+        enforce_scheduler_barrier: bool,
+    ) -> Result<Vec<CommandReply>, CommandReply> {
+        if grouped_commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let touched_shards = grouped_commands
+            .iter()
+            .map(|(shard, _)| *shard)
+            .collect::<Vec<_>>();
+        if enforce_scheduler_barrier
+            && let Err(error) = self
+                .transaction
+                .scheduler
+                .ensure_shards_available(&touched_shards)
+        {
+            return Err(CommandReply::Error(format!(
+                "runtime dispatch failed: {error}"
+            )));
+        }
+
+        let mut barriers = Vec::with_capacity(grouped_commands.len());
+        for (shard, grouped_frame) in grouped_commands {
+            let sequence =
+                match self.submit_runtime_envelope_with_sequence(shard, db, &grouped_frame, true) {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        return Err(CommandReply::Error(format!(
+                            "runtime dispatch failed: {error}"
+                        )));
+                    }
+                };
+            barriers.push((shard, sequence));
+        }
+        for (shard, sequence) in &barriers {
+            if let Err(error) = self
+                .runtime
+                .wait_until_processed_sequence(*shard, *sequence)
+            {
+                return Err(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+            }
+        }
+
+        let mut replies = Vec::with_capacity(barriers.len());
+        for (shard, sequence) in barriers {
+            let reply = match self.runtime.take_processed_reply(shard, sequence) {
+                Ok(Some(reply)) => reply,
+                Ok(None) => {
+                    return Err(CommandReply::Error(
+                        "runtime dispatch failed: missing worker reply".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(CommandReply::Error(format!(
+                        "runtime dispatch failed: {error}"
+                    )));
+                }
+            };
+            replies.push(reply);
+        }
+
+        Ok(replies)
+    }
+
     pub(super) fn execute_user_command(
         &mut self,
         db: u16,
@@ -467,17 +537,64 @@ impl ServerApp {
             return error_reply;
         }
 
-        let mut replies = Vec::with_capacity(frame.args.len());
-        for key in &frame.args {
-            let get_frame = CommandFrame::new("GET", vec![key.clone()]);
-            let reply = self.execute_single_shard_command_via_runtime(db, &get_frame);
-            match reply {
-                CommandReply::BulkString(_) | CommandReply::Null => replies.push(reply),
-                CommandReply::Moved { .. } | CommandReply::Error(_) => return reply,
+        let mut grouped_keys = BTreeMap::<u16, Vec<(usize, Vec<u8>)>>::new();
+        for (position, key) in frame.args.iter().enumerate() {
+            let shard = self.core.resolve_shard_for_key(key);
+            grouped_keys
+                .entry(shard)
+                .or_default()
+                .push((position, key.clone()));
+        }
+
+        let grouped_entries = grouped_keys.into_iter().collect::<Vec<_>>();
+        let grouped_commands = grouped_entries
+            .iter()
+            .map(|(shard, keys)| {
+                let args = keys.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+                (*shard, CommandFrame::new("MGET", args))
+            })
+            .collect::<Vec<_>>();
+        let worker_replies = match self.execute_grouped_worker_commands(db, grouped_commands, true)
+        {
+            Ok(replies) => replies,
+            Err(reply) => return reply,
+        };
+
+        let mut replies = vec![CommandReply::Null; frame.args.len()];
+        for ((_, keys), worker_reply) in grouped_entries.into_iter().zip(worker_replies) {
+            let values = match worker_reply {
+                CommandReply::Array(values) => values,
+                CommandReply::Moved { slot, endpoint } => {
+                    return CommandReply::Moved { slot, endpoint };
+                }
+                CommandReply::Error(message) => return CommandReply::Error(message),
                 _ => {
                     return CommandReply::Error(
-                        "internal error: GET did not return bulk-string or null reply".to_owned(),
+                        "internal error: MGET did not return array reply".to_owned(),
                     );
+                }
+            };
+            if values.len() != keys.len() {
+                return CommandReply::Error(
+                    "internal error: MGET worker reply cardinality mismatch".to_owned(),
+                );
+            }
+
+            for ((position, _), value) in keys.into_iter().zip(values) {
+                match value {
+                    CommandReply::BulkString(_) | CommandReply::Null => {
+                        replies[position] = value;
+                    }
+                    CommandReply::Moved { slot, endpoint } => {
+                        return CommandReply::Moved { slot, endpoint };
+                    }
+                    CommandReply::Error(message) => return CommandReply::Error(message),
+                    _ => {
+                        return CommandReply::Error(
+                            "internal error: MGET value reply was not bulk-string or null"
+                                .to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -495,11 +612,35 @@ impl ServerApp {
             return error_reply;
         }
 
+        let mut grouped_pairs = BTreeMap::<u16, Vec<Vec<u8>>>::new();
         for pair in frame.args.chunks_exact(2) {
-            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
-            let reply = self.execute_single_shard_command_via_runtime(db, &set_frame);
-            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
-                return reply;
+            let shard = self.core.resolve_shard_for_key(&pair[0]);
+            let grouped = grouped_pairs.entry(shard).or_default();
+            grouped.push(pair[0].clone());
+            grouped.push(pair[1].clone());
+        }
+        let grouped_commands = grouped_pairs
+            .into_iter()
+            .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
+            .collect::<Vec<_>>();
+        let worker_replies = match self.execute_grouped_worker_commands(db, grouped_commands, true)
+        {
+            Ok(replies) => replies,
+            Err(reply) => return reply,
+        };
+
+        for reply in worker_replies {
+            match reply {
+                CommandReply::SimpleString(ok) if ok == "OK" => {}
+                CommandReply::Moved { slot, endpoint } => {
+                    return CommandReply::Moved { slot, endpoint };
+                }
+                CommandReply::Error(message) => return CommandReply::Error(message),
+                _ => {
+                    return CommandReply::Error(
+                        "internal error: MSET did not return simple-string reply".to_owned(),
+                    );
+                }
             }
         }
 
@@ -518,13 +659,34 @@ impl ServerApp {
             return error_reply;
         }
 
+        let mut grouped_exists_keys = BTreeMap::<u16, Vec<Vec<u8>>>::new();
         for pair in frame.args.chunks_exact(2) {
-            let exists_frame = CommandFrame::new("EXISTS", vec![pair[0].clone()]);
-            let reply = self.execute_single_shard_command_via_runtime(db, &exists_frame);
+            let shard = self.core.resolve_shard_for_key(&pair[0]);
+            grouped_exists_keys
+                .entry(shard)
+                .or_default()
+                .push(pair[0].clone());
+        }
+        let grouped_exists_commands = grouped_exists_keys
+            .into_iter()
+            .map(|(shard, keys)| (shard, CommandFrame::new("EXISTS", keys)))
+            .collect::<Vec<_>>();
+        let exists_replies =
+            match self.execute_grouped_worker_commands(db, grouped_exists_commands, true) {
+                Ok(replies) => replies,
+                Err(reply) => return reply,
+            };
+
+        let mut existing = 0_i64;
+        for reply in exists_replies {
             match reply {
-                CommandReply::Integer(1) => return CommandReply::Integer(0),
-                CommandReply::Integer(_) => {}
-                CommandReply::Moved { .. } | CommandReply::Error(_) => return reply,
+                CommandReply::Integer(count) => {
+                    existing = existing.saturating_add(count.max(0));
+                }
+                CommandReply::Moved { slot, endpoint } => {
+                    return CommandReply::Moved { slot, endpoint };
+                }
+                CommandReply::Error(message) => return CommandReply::Error(message),
                 _ => {
                     return CommandReply::Error(
                         "internal error: EXISTS did not return integer reply".to_owned(),
@@ -532,12 +694,37 @@ impl ServerApp {
                 }
             }
         }
+        if existing > 0 {
+            return CommandReply::Integer(0);
+        }
 
+        let mut grouped_pairs = BTreeMap::<u16, Vec<Vec<u8>>>::new();
         for pair in frame.args.chunks_exact(2) {
-            let set_frame = CommandFrame::new("SET", vec![pair[0].clone(), pair[1].clone()]);
-            let reply = self.execute_single_shard_command_via_runtime(db, &set_frame);
-            if !matches!(reply, CommandReply::SimpleString(ref ok) if ok == "OK") {
-                return CommandReply::Error("MSETNX failed while setting key".to_owned());
+            let shard = self.core.resolve_shard_for_key(&pair[0]);
+            let grouped = grouped_pairs.entry(shard).or_default();
+            grouped.push(pair[0].clone());
+            grouped.push(pair[1].clone());
+        }
+        let grouped_set_commands = grouped_pairs
+            .into_iter()
+            .map(|(shard, args)| (shard, CommandFrame::new("MSET", args)))
+            .collect::<Vec<_>>();
+        let set_replies = match self.execute_grouped_worker_commands(db, grouped_set_commands, true)
+        {
+            Ok(replies) => replies,
+            Err(reply) => return reply,
+        };
+
+        for reply in set_replies {
+            match reply {
+                CommandReply::SimpleString(ok) if ok == "OK" => {}
+                CommandReply::Moved { slot, endpoint } => {
+                    return CommandReply::Moved { slot, endpoint };
+                }
+                CommandReply::Error(message) => return CommandReply::Error(message),
+                _ => {
+                    return CommandReply::Error("MSETNX failed while setting key".to_owned());
+                }
             }
         }
 
@@ -565,60 +752,13 @@ impl ServerApp {
         }
 
         let grouped_commands = self.group_multikey_count_frame_by_shard(frame);
-        let touched_shards = grouped_commands
-            .iter()
-            .map(|(shard, _)| *shard)
-            .collect::<Vec<_>>();
-        if let Err(error) = self
-            .transaction
-            .scheduler
-            .ensure_shards_available(&touched_shards)
-        {
-            return Some(CommandReply::Error(format!(
-                "runtime dispatch failed: {error}"
-            )));
-        }
-
-        let mut barriers = Vec::with_capacity(grouped_commands.len());
-        for (shard, grouped_frame) in grouped_commands {
-            let sequence =
-                match self.submit_runtime_envelope_with_sequence(shard, db, &grouped_frame, true) {
-                    Ok(sequence) => sequence,
-                    Err(error) => {
-                        return Some(CommandReply::Error(format!(
-                            "runtime dispatch failed: {error}"
-                        )));
-                    }
-                };
-            barriers.push((shard, sequence));
-        }
-        for (shard, sequence) in &barriers {
-            if let Err(error) = self
-                .runtime
-                .wait_until_processed_sequence(*shard, *sequence)
-            {
-                return Some(CommandReply::Error(format!(
-                    "runtime dispatch failed: {error}"
-                )));
-            }
-        }
+        let replies = match self.execute_grouped_worker_commands(db, grouped_commands, true) {
+            Ok(replies) => replies,
+            Err(reply) => return Some(reply),
+        };
 
         let mut total = 0_i64;
-        for (shard, sequence) in barriers {
-            let reply = match self.runtime.take_processed_reply(shard, sequence) {
-                Ok(Some(reply)) => reply,
-                Ok(None) => {
-                    return Some(CommandReply::Error(
-                        "runtime dispatch failed: missing worker reply".to_owned(),
-                    ));
-                }
-                Err(error) => {
-                    return Some(CommandReply::Error(format!(
-                        "runtime dispatch failed: {error}"
-                    )));
-                }
-            };
-
+        for reply in replies {
             match reply {
                 CommandReply::Integer(delta) => {
                     total = total.saturating_add(delta.max(0));
