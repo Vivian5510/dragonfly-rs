@@ -235,6 +235,18 @@ impl ServerApp {
         db: u16,
         command: &CommandFrame,
     ) -> CommandReply {
+        // If pre-dispatch did not assign a worker callback for one key-affine command, try
+        // to recover by routing it through the shard worker now instead of falling back to
+        // coordinator-local execution.
+        if let Some(reply) = self.execute_copy_rename_via_runtime(db, command, false) {
+            return reply;
+        }
+        if matches!(
+            self.core.command_routing(command),
+            CommandRouting::SingleKey { .. }
+        ) {
+            return self.execute_single_shard_command_via_runtime_internal(db, command, false);
+        }
         if let Some(reply) =
             self.execute_multikey_string_commands_via_runtime_internal(db, command, false)
         {

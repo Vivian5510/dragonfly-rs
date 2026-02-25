@@ -2394,23 +2394,27 @@ fn exec_plan_global_non_key_command_uses_planner_shard_hint() {
 }
 
 #[rstest]
-fn runtime_post_barrier_rejects_single_key_coordinator_fallback() {
+fn runtime_post_barrier_recovers_single_key_via_worker_execution() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let key = b"plan:rt:fallback:single:key".to_vec();
     let frame = CommandFrame::new("SET", vec![key.clone(), b"value".to_vec()]);
+    let shard = app.core.resolve_shard_for_key(&key);
 
     let reply = app.execute_command_after_runtime_barrier(0, &frame);
-    assert_that!(
-        &reply,
-        eq(&CommandReply::Error(
-            "runtime dispatch failed: key command escaped shard worker execution".to_owned()
-        ))
-    );
+    assert_that!(&reply, eq(&CommandReply::SimpleString("OK".to_owned())));
 
     let value = app
         .core
         .execute_in_db(0, &CommandFrame::new("GET", vec![key]));
-    assert_that!(&value, eq(&CommandReply::Null));
+    assert_that!(&value, eq(&CommandReply::BulkString(b"value".to_vec())));
+
+    let runtime = app
+        .runtime
+        .drain_processed_for_shard(shard)
+        .expect("drain should succeed");
+    assert_that!(runtime.len(), eq(1_usize));
+    assert_that!(&runtime[0].command, eq(&frame));
+    assert_that!(runtime[0].execute_on_worker, eq(true));
 }
 
 #[rstest]
