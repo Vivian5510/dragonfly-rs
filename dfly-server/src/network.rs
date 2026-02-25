@@ -1880,6 +1880,144 @@ mod tests {
     }
 
     #[rstest]
+    fn threaded_reactor_workers_progress_two_pipelines_concurrently() {
+        const PIPELINE_GETS: usize = 16;
+
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            ..ServerReactorConfig::default()
+        };
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
+            .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local addr should be available");
+
+        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
+        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
+        client_a
+            .set_nonblocking(true)
+            .expect("first client should be nonblocking");
+        client_b
+            .set_nonblocking(true)
+            .expect("second client should be nonblocking");
+
+        let distribution_deadline = Instant::now() + Duration::from_millis(800);
+        let mut counts = Vec::new();
+        while Instant::now() < distribution_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            counts = reactor.worker_connection_counts();
+            if counts.iter().filter(|count| **count > 0).count() == 2 {
+                break;
+            }
+        }
+        assert_that!(counts.len(), eq(2_usize));
+        assert_that!(
+            counts.iter().filter(|count| **count > 0).count(),
+            eq(2_usize)
+        );
+
+        client_a
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nka\r\n$1\r\n1\r\n")
+            .expect("first SET should write");
+        client_b
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nkb\r\n$1\r\n2\r\n")
+            .expect("second SET should write");
+
+        let mut set_reply_a = Vec::new();
+        let mut set_reply_b = Vec::new();
+        let set_deadline = Instant::now() + Duration::from_millis(900);
+        while Instant::now() < set_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+
+            let mut chunk_a = [0_u8; 64];
+            match client_a.read(&mut chunk_a) {
+                Ok(0) => {}
+                Ok(read_len) => set_reply_a.extend_from_slice(&chunk_a[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("first set reply read failed: {error}"),
+            }
+
+            let mut chunk_b = [0_u8; 64];
+            match client_b.read(&mut chunk_b) {
+                Ok(0) => {}
+                Ok(read_len) => set_reply_b.extend_from_slice(&chunk_b[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("second set reply read failed: {error}"),
+            }
+
+            if set_reply_a.ends_with(b"+OK\r\n") && set_reply_b.ends_with(b"+OK\r\n") {
+                break;
+            }
+        }
+        assert_that!(&set_reply_a, eq(&b"+OK\r\n".to_vec()));
+        assert_that!(&set_reply_b, eq(&b"+OK\r\n".to_vec()));
+
+        let mut pipeline_a = Vec::new();
+        let mut pipeline_b = Vec::new();
+        let one_get_a = b"*2\r\n$3\r\nGET\r\n$2\r\nka\r\n";
+        let one_get_b = b"*2\r\n$3\r\nGET\r\n$2\r\nkb\r\n";
+        for _ in 0..PIPELINE_GETS {
+            pipeline_a.extend_from_slice(one_get_a);
+            pipeline_b.extend_from_slice(one_get_b);
+        }
+
+        client_a
+            .write_all(&pipeline_a)
+            .expect("first pipeline write should succeed");
+        client_b
+            .write_all(&pipeline_b)
+            .expect("second pipeline write should succeed");
+
+        let mut expected_a = Vec::new();
+        let mut expected_b = Vec::new();
+        for _ in 0..PIPELINE_GETS {
+            expected_a.extend_from_slice(b"$1\r\n1\r\n");
+            expected_b.extend_from_slice(b"$1\r\n2\r\n");
+        }
+
+        let mut pipeline_reply_a = Vec::new();
+        let mut pipeline_reply_b = Vec::new();
+        let pipeline_deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < pipeline_deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+
+            let mut chunk_a = [0_u8; 512];
+            match client_a.read(&mut chunk_a) {
+                Ok(0) => {}
+                Ok(read_len) => pipeline_reply_a.extend_from_slice(&chunk_a[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("first pipeline reply read failed: {error}"),
+            }
+
+            let mut chunk_b = [0_u8; 512];
+            match client_b.read(&mut chunk_b) {
+                Ok(0) => {}
+                Ok(read_len) => pipeline_reply_b.extend_from_slice(&chunk_b[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("second pipeline reply read failed: {error}"),
+            }
+
+            if pipeline_reply_a.len() >= expected_a.len()
+                && pipeline_reply_b.len() >= expected_b.len()
+            {
+                break;
+            }
+        }
+
+        assert_that!(&pipeline_reply_a, eq(&expected_a));
+        assert_that!(&pipeline_reply_b, eq(&expected_b));
+    }
+
+    #[rstest]
     fn threaded_reactor_executes_resp_and_memcache_roundtrip() {
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let config = ServerReactorConfig {
