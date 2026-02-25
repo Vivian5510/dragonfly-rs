@@ -2,6 +2,7 @@
 
 mod runtime_exec;
 
+use crate::network::{ServerReactor, ServerReactorConfig};
 use dfly_cluster::ClusterModule;
 use dfly_cluster::slot::key_slot;
 use dfly_common::config::{ClusterMode, RuntimeConfig};
@@ -232,8 +233,10 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         affinity
     }
 
-    /// Test-only helper that detaches one connection and releases its replica endpoint identity.
-    #[cfg(test)]
+    /// Detaches one connection and releases worker-owned/parser-replication resources.
+    ///
+    /// Network ingress uses this when a TCP peer disconnects so worker-local parser state and
+    /// replica endpoint identity do not leak across reused OS sockets.
     pub fn disconnect_connection(&mut self, connection: &mut ServerConnection) {
         if let Some(affinity) = connection.io_affinity.take() {
             let _ = self.facade.proactor_pool.release_connection(affinity);
@@ -2229,6 +2232,14 @@ pub fn run() -> DflyResult<()> {
     app.load_snapshot_bytes(&snapshot)?;
     let _ = app.recover_from_replication_journal()?;
     let _ = app.recover_from_replication_journal_from_lsn(app.replication.journal_lsn())?;
+
+    // Optional ingress probe that exercises real socket reactor wiring without forcing
+    // the default binary path into a long-running server loop.
+    if std::env::var_os("DFLY_RS_ENABLE_REACTOR_BOOTSTRAP").is_some() {
+        let bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut reactor = ServerReactor::bind(bind_addr, ServerReactorConfig::default())?;
+        let _ = reactor.poll_once(&mut app, Some(Duration::from_millis(1)))?;
+    }
 
     println!("{}", app.startup_summary());
     Ok(())

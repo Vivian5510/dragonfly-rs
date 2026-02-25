@@ -13,6 +13,7 @@ dfly-search = { path = "../dfly-search" }
 dfly-storage = { path = "../dfly-storage" }
 dfly-tiering = { path = "../dfly-tiering" }
 dfly-transaction = { path = "../dfly-transaction" }
+mio = { version = "1.0", features = ["os-poll", "net"] }
 
 [dev-dependencies]
 googletest = { workspace = true }

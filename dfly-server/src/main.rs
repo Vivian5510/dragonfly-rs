@@ -1,6 +1,7 @@
 //! Binary entrypoint for `dfly-server`.
 
 mod app;
+mod network;
 
 fn main() {
     if let Err(err) = app::run() {
