@@ -40,6 +40,11 @@ pub struct CommandSpec {
 
 /// Redis cluster defines a fixed 16384-slot hash space.
 const CLUSTER_SLOT_COUNT: usize = (MAX_SLOT_ID as usize) + 1;
+const DEFAULT_DB_PRIME_CAPACITY: usize = 64;
+const DEFAULT_DB_EXPIRE_CAPACITY: usize = 64;
+const DEFAULT_DB_SLOT_INDEX_CAPACITY: usize = 32;
+const DEFAULT_SHARD_DB_TABLE_CAPACITY: usize = 16;
+const DEFAULT_SHARD_VERSION_TABLE_CAPACITY: usize = 16;
 
 /// Dense per-slot key cardinality table.
 ///
@@ -167,7 +172,7 @@ pub struct SlotStatsSnapshot {
 /// - `expire`: expiration index (`ExpireTable` concept),
 /// - `slot_stats`: per-slot counters (cardinality + read/write totals),
 /// - `slot_keys`: per-slot key membership index used by slot-local scans/migrations.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbTable {
     /// Main key/value dictionary.
     pub prime: HashMap<Vec<u8>, ValueEntry>,
@@ -181,11 +186,23 @@ pub struct DbTable {
     pub slot_keys: HashMap<u16, HashSet<Vec<u8>>>,
 }
 
+impl Default for DbTable {
+    fn default() -> Self {
+        Self {
+            prime: HashMap::with_capacity(DEFAULT_DB_PRIME_CAPACITY),
+            expire: HashMap::with_capacity(DEFAULT_DB_EXPIRE_CAPACITY),
+            expire_order: BTreeMap::new(),
+            slot_stats: SlotStats::default(),
+            slot_keys: HashMap::with_capacity(DEFAULT_DB_SLOT_INDEX_CAPACITY),
+        }
+    }
+}
+
 /// Mutable execution state used by command handlers.
 ///
 /// Dragonfly keeps per-DB tables in one shard-local `DbSlice`. This learning implementation uses
 /// the same high-level structure and maintains a layered table per DB.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchState {
     /// Per-DB layered tables in this shard.
     pub db_tables: HashMap<DbIndex, DbTable>,
@@ -193,6 +210,16 @@ pub struct DispatchState {
     db_versions: HashMap<DbIndex, HashMap<Vec<u8>, u64>>,
     /// Round-robin starting point for per-pass active-expire DB scans.
     active_expire_db_cursor: usize,
+}
+
+impl Default for DispatchState {
+    fn default() -> Self {
+        Self {
+            db_tables: HashMap::with_capacity(DEFAULT_SHARD_DB_TABLE_CAPACITY),
+            db_versions: HashMap::with_capacity(DEFAULT_SHARD_VERSION_TABLE_CAPACITY),
+            active_expire_db_cursor: 0,
+        }
+    }
 }
 
 /// Stored value with optional expiration metadata.
