@@ -61,6 +61,7 @@ pub struct ServerApp {
     pub tiering: TieringModule,
     /// Monotonic transaction id allocator.
     next_txid: TxId,
+    #[cfg(test)]
     /// Monotonic id used for deterministic proactor-worker connection affinity.
     next_connection_id: u64,
     /// Monotonic id used for implicit replica endpoint registration on ACK-only connections.
@@ -108,6 +109,7 @@ impl ServerApp {
             search,
             tiering,
             next_txid: 1,
+            #[cfg(test)]
             next_connection_id: 1,
             next_implicit_replica_id: 1,
         }
@@ -219,6 +221,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         }
     }
 
+    #[cfg(test)]
     fn ensure_connection_io_affinity(
         &mut self,
         connection: &mut ServerConnection,
@@ -257,6 +260,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     ///
     /// Returns `DflyError::Protocol` when connection input bytes violate the active
     /// wire protocol framing rules.
+    #[cfg(test)]
     pub fn feed_connection_bytes(
         &mut self,
         connection: &mut ServerConnection,
@@ -2234,10 +2238,6 @@ pub fn run() -> DflyResult<()> {
         .memcached_port
         .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
     let mut app = ServerApp::new(config);
-    let mut bootstrap_connection = ServerApp::new_connection(ClientProtocol::Resp);
-
-    // Keep parser/proactor ingress path exercised by regular startup as a fallback path.
-    let _ = app.feed_connection_bytes(&mut bootstrap_connection, b"*1\r\n$4\r\nPING\r\n")?;
 
     // Keep subsystem initialization paths exercised in regular server startup.
     let snapshot = app.create_snapshot_bytes()?;
