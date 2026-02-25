@@ -878,6 +878,8 @@ mod tests {
     use crate::protocol::ClientProtocol;
     use googletest::prelude::*;
     use rstest::rstest;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn resp_parser() -> ConnectionState {
         ConnectionState::new(ConnectionContext {
@@ -1118,7 +1120,12 @@ mod tests {
         let _ = pool
             .parse_on_worker(0, resp_parser(), b"*1\r\n$4\r\nPING\r\n")
             .expect("first parse should succeed");
-        let after_first = pool.pooled_request_buffer_count(0);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut after_first = pool.pooled_request_buffer_count(0);
+        while after_first < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+            after_first = pool.pooled_request_buffer_count(0);
+        }
         assert_that!(after_first >= 1, eq(true));
 
         let _ = pool
