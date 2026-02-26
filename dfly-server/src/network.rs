@@ -31,6 +31,8 @@ use tokio::sync::mpsc::{
     unbounded_channel as tokio_unbounded_channel,
 };
 #[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
+#[cfg(target_os = "linux")]
 use tokio_uring::net::TcpStream as IoUringTcpStream;
 
 use crate::app::{
@@ -1519,10 +1521,73 @@ impl EpollBackend {
 #[derive(Debug)]
 enum IoUringWorkerCommand {
     AddConnection {
+        connection_id: u64,
         protocol: ClientProtocol,
         socket: StdTcpStream,
     },
+    TakeConnectionForMigration {
+        connection_id: u64,
+        response: Sender<Result<IoUringMigratedConnection, String>>,
+    },
+    AdoptMigratedConnection {
+        connection: Box<IoUringMigratedConnection>,
+        response: IoUringMigrationAdoptSender,
+    },
     Shutdown,
+}
+
+#[cfg(target_os = "linux")]
+type IoUringMigrationAdoptResult = Result<(), Box<IoUringMigratedConnection>>;
+#[cfg(target_os = "linux")]
+type IoUringMigrationAdoptSender = Sender<IoUringMigrationAdoptResult>;
+#[cfg(target_os = "linux")]
+type IoUringMigrationAdoptReceiver = Receiver<IoUringMigrationAdoptResult>;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct IoUringMigrationDispatchFailure {
+    error: DflyError,
+    connection: Box<IoUringMigratedConnection>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum IoUringWorkerEvent {
+    ConnectionClosed { connection_id: u64 },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum IoUringConnectionControl {
+    Migrate {
+        response: oneshot::Sender<Result<IoUringMigratedConnection, String>>,
+    },
+    Shutdown,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct IoUringMigratedConnection {
+    connection_id: u64,
+    socket: StdTcpStream,
+    logical: ServerConnection,
+    read_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
+    draining: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringMigratedConnection {
+    fn new(connection_id: u64, socket: StdTcpStream, protocol: ClientProtocol) -> Self {
+        Self {
+            connection_id,
+            socket,
+            logical: ServerApp::new_connection(protocol),
+            read_buffer: vec![0_u8; READ_CHUNK_BYTES],
+            write_buffer: Vec::new(),
+            draining: false,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1541,9 +1606,14 @@ pub struct IoUringBackend {
     acceptor_events: Events,
     listeners: Vec<ReactorListener>,
     workers: Vec<IoUringWorkerHandle>,
+    worker_events: Receiver<IoUringWorkerEvent>,
     dispatch_window: WorkerDispatchWindow,
     next_rr_offset: usize,
     use_peer_hash_dispatch: bool,
+    migration_enabled: bool,
+    next_connection_id: u64,
+    connection_owner_by_id: HashMap<u64, usize>,
+    migrated_connections: HashSet<u64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1559,12 +1629,6 @@ impl IoUringBackend {
         config: ServerReactorConfig,
         app_executor: &AppExecutor,
     ) -> DflyResult<Self> {
-        if config.enable_connection_migration {
-            return Err(DflyError::InvalidConfig(
-                "io_uring backend currently does not support connection migration",
-            ));
-        }
-
         let acceptor_poll =
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
         let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
@@ -1578,6 +1642,7 @@ impl IoUringBackend {
             count: config.normalized_dispatch_count(worker_count),
         };
         let max_events = config.normalized_max_events();
+        let (worker_event_sender, worker_event_receiver) = mpsc::channel::<IoUringWorkerEvent>();
 
         let mut resp_listener = TcpListener::bind(resp_addr)
             .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
@@ -1628,10 +1693,16 @@ impl IoUringBackend {
             let (sender, receiver) = tokio_unbounded_channel::<IoUringWorkerCommand>();
             let worker_app = app_executor.clone();
             let worker_backpressure = backpressure;
+            let worker_event_sender = worker_event_sender.clone();
             let join = thread::Builder::new()
                 .name(format!("dfly-io-uring-worker-{worker_id}"))
                 .spawn(move || {
-                    io_uring_worker_thread_main(receiver, worker_app, worker_backpressure);
+                    io_uring_worker_thread_main(
+                        receiver,
+                        worker_app,
+                        worker_backpressure,
+                        worker_event_sender,
+                    );
                 })
                 .map_err(|error| {
                     DflyError::Io(format!("spawn io_uring worker {worker_id} failed: {error}"))
@@ -1647,22 +1718,40 @@ impl IoUringBackend {
             acceptor_events: Events::with_capacity(max_events),
             listeners,
             workers,
+            worker_events: worker_event_receiver,
             dispatch_window,
             next_rr_offset: 0,
             use_peer_hash_dispatch: config.use_peer_hash_dispatch,
+            migration_enabled: config.enable_connection_migration,
+            next_connection_id: 1,
+            connection_owner_by_id: HashMap::new(),
+            migrated_connections: HashSet::new(),
         })
     }
 
-    /// Runs one cycle. `io_uring` workers are long-running, so single-step polling
-    /// is intentionally unsupported in this backend.
+    /// Runs one acceptor cycle and dispatches accepted sockets to `io_uring` workers.
     ///
     /// # Errors
     ///
-    /// Always returns `DflyError::InvalidState`.
-    pub fn poll_once(&mut self, _timeout: Option<Duration>) -> DflyResult<usize> {
-        Err(DflyError::InvalidState(
-            "io_uring backend does not support poll_once; use run()",
-        ))
+    /// Returns `DflyError::Io` when polling/accept/dispatch fails.
+    pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
+        self.acceptor_poll
+            .poll(&mut self.acceptor_events, timeout)
+            .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
+        let snapshots = self
+            .acceptor_events
+            .iter()
+            .map(EventSnapshot::from_mio_event)
+            .collect::<Vec<_>>();
+        let mut accepted = 0_usize;
+        for snapshot in &snapshots {
+            if let Some(listener_index) = self.listener_index(snapshot.token) {
+                accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
+            }
+        }
+        self.drain_worker_events();
+        self.maybe_rebalance_connections();
+        Ok(snapshots.len().saturating_add(accepted))
     }
 
     /// Runs accept loop and dispatches accepted sockets to `io_uring` workers.
@@ -1672,19 +1761,7 @@ impl IoUringBackend {
     /// Returns `DflyError::Io` when acceptor poll/accept/dispatch fails.
     pub fn run(&mut self) -> DflyResult<()> {
         loop {
-            self.acceptor_poll
-                .poll(&mut self.acceptor_events, Some(Duration::from_millis(10)))
-                .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
-            let snapshots = self
-                .acceptor_events
-                .iter()
-                .map(EventSnapshot::from_mio_event)
-                .collect::<Vec<_>>();
-            for snapshot in &snapshots {
-                if let Some(listener_index) = self.listener_index(snapshot.token) {
-                    self.accept_new_connections(listener_index)?;
-                }
-            }
+            let _ = self.poll_once(Some(Duration::from_millis(10)))?;
         }
     }
 
@@ -1694,7 +1771,7 @@ impl IoUringBackend {
             .position(|listener| listener.token == token)
     }
 
-    fn accept_new_connections(&mut self, listener_index: usize) -> DflyResult<()> {
+    fn accept_new_connections(&mut self, listener_index: usize) -> DflyResult<usize> {
         let protocol = self
             .listeners
             .get(listener_index)
@@ -1702,6 +1779,7 @@ impl IoUringBackend {
             .ok_or(DflyError::InvalidState(
                 "io_uring listener index is out of range",
             ))?;
+        let mut accepted = 0_usize;
 
         loop {
             let accept_result = {
@@ -1717,14 +1795,23 @@ impl IoUringBackend {
             match accept_result {
                 Ok((socket, _peer)) => {
                     let _ = socket.set_nodelay(true);
+                    let connection_id = self.allocate_connection_id();
                     let worker_id = self.allocate_worker_index(&socket);
                     let socket = mio_stream_into_std(socket);
                     self.dispatch_to_worker(
                         worker_id,
-                        IoUringWorkerCommand::AddConnection { protocol, socket },
+                        IoUringWorkerCommand::AddConnection {
+                            connection_id,
+                            protocol,
+                            socket,
+                        },
                     )?;
+                    let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
+                    accepted = accepted.saturating_add(1);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(accepted);
+                }
                 Err(error) => {
                     return Err(DflyError::Io(format!("accept connection failed: {error}")));
                 }
@@ -1749,6 +1836,12 @@ impl IoUringBackend {
         })
     }
 
+    fn allocate_connection_id(&mut self) -> u64 {
+        let connection_id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.saturating_add(1);
+        connection_id
+    }
+
     fn allocate_worker_index(&mut self, socket: &TcpStream) -> usize {
         if self.use_peer_hash_dispatch
             && let Some(worker_id) = self.select_worker_by_peer_hash(socket)
@@ -1769,6 +1862,208 @@ impl IoUringBackend {
         let bucket_u64 = hasher.finish() % span_u64;
         let bucket = usize::try_from(bucket_u64).ok()?;
         Some((self.dispatch_window.start + bucket) % self.workers.len().max(1))
+    }
+
+    fn drain_worker_events(&mut self) {
+        while let Ok(IoUringWorkerEvent::ConnectionClosed { connection_id }) =
+            self.worker_events.try_recv()
+        {
+            let _ = self.connection_owner_by_id.remove(&connection_id);
+            let _ = self.migrated_connections.remove(&connection_id);
+        }
+    }
+
+    fn dispatch_adopt_for_migration(
+        &self,
+        worker_id: usize,
+        migrated: IoUringMigratedConnection,
+    ) -> Result<IoUringMigrationAdoptReceiver, IoUringMigrationDispatchFailure> {
+        let Some(worker) = self.workers.get(worker_id) else {
+            return Err(IoUringMigrationDispatchFailure {
+                error: DflyError::InvalidState("io_uring worker index is out of range"),
+                connection: Box::new(migrated),
+            });
+        };
+        let (response_sender, response_receiver) = mpsc::channel::<IoUringMigrationAdoptResult>();
+        let command = IoUringWorkerCommand::AdoptMigratedConnection {
+            connection: Box::new(migrated),
+            response: response_sender,
+        };
+        match worker.sender.send(command) {
+            Ok(()) => Ok(response_receiver),
+            Err(send_error) => {
+                let IoUringWorkerCommand::AdoptMigratedConnection { connection, .. } = send_error.0
+                else {
+                    unreachable!("send error must return the same command variant");
+                };
+                Err(IoUringMigrationDispatchFailure {
+                    error: DflyError::Io(format!(
+                        "send migration adopt command to io_uring worker {worker_id} failed because worker is unavailable"
+                    )),
+                    connection,
+                })
+            }
+        }
+    }
+
+    fn rollback_migration_to_source(
+        &self,
+        source_worker: usize,
+        migrated: IoUringMigratedConnection,
+    ) -> DflyResult<()> {
+        let receiver = match self.dispatch_adopt_for_migration(source_worker, migrated) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                return Err(DflyError::Io(format!(
+                    "migration rollback failed before reaching source io_uring worker: {}",
+                    error.error
+                )));
+            }
+        };
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DflyError::Io(
+                "migration rollback failed because source io_uring worker rejected restored connection"
+                    .to_owned(),
+            )),
+            Err(_) => Err(DflyError::InvalidState(
+                "migration rollback timed out while restoring source io_uring worker",
+            )),
+        }
+    }
+
+    fn maybe_rebalance_connections(&mut self) {
+        if !self.migration_enabled
+            || self.workers.len() < 2
+            || self.connection_owner_by_id.len() < 2
+        {
+            return;
+        }
+        let mut counts = vec![0_usize; self.workers.len()];
+        for owner in self.connection_owner_by_id.values().copied() {
+            if let Some(count) = counts.get_mut(owner) {
+                *count = count.saturating_add(1);
+            }
+        }
+        let Some((source_worker, source_count)) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| **count)
+            .map(|(index, count)| (index, *count))
+        else {
+            return;
+        };
+        let Some((target_worker, target_count)) = counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, count)| **count)
+            .map(|(index, count)| (index, *count))
+        else {
+            return;
+        };
+        if source_count <= target_count.saturating_add(1) {
+            return;
+        }
+
+        let Some(connection_id) =
+            self.connection_owner_by_id
+                .iter()
+                .find_map(|(connection_id, owner)| {
+                    if *owner == source_worker && !self.migrated_connections.contains(connection_id)
+                    {
+                        Some(*connection_id)
+                    } else {
+                        None
+                    }
+                })
+        else {
+            return;
+        };
+        let _ = self.migrate_connection(connection_id, target_worker);
+    }
+
+    /// Migrates one live connection to a target worker using constrained Dragonfly-style rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when migration is disabled, the connection is unknown,
+    /// migration already happened for this connection, or source/target worker handoff fails.
+    pub fn migrate_connection(
+        &mut self,
+        connection_id: u64,
+        target_worker: usize,
+    ) -> DflyResult<()> {
+        if !self.migration_enabled {
+            return Err(DflyError::InvalidState(
+                "connection migration is disabled by config",
+            ));
+        }
+        if self.migrated_connections.contains(&connection_id) {
+            return Err(DflyError::InvalidState(
+                "connection has already been migrated once",
+            ));
+        }
+        let Some(source_worker) = self.connection_owner_by_id.get(&connection_id).copied() else {
+            return Err(DflyError::InvalidState(
+                "connection is not tracked by io_uring acceptor",
+            ));
+        };
+        if source_worker == target_worker {
+            return Ok(());
+        }
+        if target_worker >= self.workers.len() {
+            return Err(DflyError::InvalidState(
+                "target io_uring worker index is out of range",
+            ));
+        }
+
+        let (reply_sender, reply_receiver) =
+            mpsc::channel::<Result<IoUringMigratedConnection, String>>();
+        self.dispatch_to_worker(
+            source_worker,
+            IoUringWorkerCommand::TakeConnectionForMigration {
+                connection_id,
+                response: reply_sender,
+            },
+        )?;
+        let migrated = reply_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| {
+                DflyError::InvalidState(
+                    "migration source io_uring worker timed out while detaching",
+                )
+            })?
+            .map_err(|message| {
+                DflyError::Io(format!(
+                    "migration source io_uring worker rejected handoff: {message}"
+                ))
+            })?;
+        let adopt_receiver = match self.dispatch_adopt_for_migration(target_worker, migrated) {
+            Ok(receiver) => receiver,
+            Err(dispatch_error) => {
+                self.rollback_migration_to_source(source_worker, *dispatch_error.connection)?;
+                return Err(dispatch_error.error);
+            }
+        };
+        match adopt_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => {}
+            Ok(Err(rollback_connection)) => {
+                self.rollback_migration_to_source(source_worker, *rollback_connection)?;
+                return Err(DflyError::Io(
+                    "migration target io_uring worker rejected handoff".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(DflyError::InvalidState(
+                    "migration target io_uring worker timed out while adopting connection",
+                ));
+            }
+        }
+        let _ = self
+            .connection_owner_by_id
+            .insert(connection_id, target_worker);
+        let _ = self.migrated_connections.insert(connection_id);
+        Ok(())
     }
 }
 
@@ -1797,122 +2092,250 @@ fn io_uring_worker_thread_main(
     mut receiver: TokioUnboundedReceiver<IoUringWorkerCommand>,
     app_executor: AppExecutor,
     backpressure: BackpressureThresholds,
+    worker_event_sender: Sender<IoUringWorkerEvent>,
 ) {
     tokio_uring::start(async move {
+        let mut controls = HashMap::<u64, TokioUnboundedSender<IoUringConnectionControl>>::new();
         while let Some(command) = receiver.recv().await {
             match command {
-                IoUringWorkerCommand::AddConnection { protocol, socket } => {
-                    let app_executor = app_executor.clone();
-                    tokio_uring::spawn(async move {
-                        let stream = IoUringTcpStream::from_std(socket);
-                        let _ = stream.set_nodelay(true);
-                        io_uring_connection_main(stream, protocol, app_executor, backpressure)
-                            .await;
-                    });
+                IoUringWorkerCommand::AddConnection {
+                    connection_id,
+                    protocol,
+                    socket,
+                } => {
+                    let control = spawn_io_uring_connection_task(
+                        IoUringMigratedConnection::new(connection_id, socket, protocol),
+                        app_executor.clone(),
+                        backpressure,
+                        worker_event_sender.clone(),
+                    );
+                    let _ = controls.insert(connection_id, control);
                 }
-                IoUringWorkerCommand::Shutdown => break,
+                IoUringWorkerCommand::TakeConnectionForMigration {
+                    connection_id,
+                    response,
+                } => {
+                    let Some(control) = controls.remove(&connection_id) else {
+                        let _ = response.send(Err(
+                            "connection is not tracked by io_uring worker".to_owned()
+                        ));
+                        continue;
+                    };
+                    let (migrate_sender, migrate_receiver) =
+                        oneshot::channel::<Result<IoUringMigratedConnection, String>>();
+                    if control
+                        .send(IoUringConnectionControl::Migrate {
+                            response: migrate_sender,
+                        })
+                        .is_err()
+                    {
+                        let _ = response.send(Err(
+                            "connection task is unavailable while migrating".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let migration = match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        migrate_receiver,
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(_)) => Err("connection task dropped migration response".to_owned()),
+                        Err(_) => {
+                            Err("io_uring connection task timed out during migration".to_owned())
+                        }
+                    };
+                    let _ = response.send(migration);
+                }
+                IoUringWorkerCommand::AdoptMigratedConnection {
+                    connection,
+                    response,
+                } => {
+                    let connection = *connection;
+                    let connection_id = connection.connection_id;
+                    if controls.contains_key(&connection_id) {
+                        let _ = response.send(Err(Box::new(connection)));
+                        continue;
+                    }
+                    let control = spawn_io_uring_connection_task(
+                        connection,
+                        app_executor.clone(),
+                        backpressure,
+                        worker_event_sender.clone(),
+                    );
+                    let _ = controls.insert(connection_id, control);
+                    let _ = response.send(Ok(()));
+                }
+                IoUringWorkerCommand::Shutdown => {
+                    for control in controls.values() {
+                        let _ = control.send(IoUringConnectionControl::Shutdown);
+                    }
+                    break;
+                }
             }
         }
     });
 }
 
 #[cfg(target_os = "linux")]
-async fn io_uring_connection_main(
-    stream: IoUringTcpStream,
-    protocol: ClientProtocol,
+fn spawn_io_uring_connection_task(
+    connection: IoUringMigratedConnection,
     app_executor: AppExecutor,
     backpressure: BackpressureThresholds,
+    worker_event_sender: Sender<IoUringWorkerEvent>,
+) -> TokioUnboundedSender<IoUringConnectionControl> {
+    let (control_sender, control_receiver) = tokio_unbounded_channel::<IoUringConnectionControl>();
+    tokio_uring::spawn(async move {
+        io_uring_connection_main(
+            connection,
+            app_executor,
+            backpressure,
+            control_receiver,
+            worker_event_sender,
+        )
+        .await;
+    });
+    control_sender
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_stream_from_connection_socket(
+    socket: &StdTcpStream,
+) -> Result<IoUringTcpStream, std::io::Error> {
+    let cloned = socket.try_clone()?;
+    Ok(IoUringTcpStream::from_std(cloned))
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_connection_main(
+    mut connection: IoUringMigratedConnection,
+    app_executor: AppExecutor,
+    backpressure: BackpressureThresholds,
+    mut control_receiver: TokioUnboundedReceiver<IoUringConnectionControl>,
+    worker_event_sender: Sender<IoUringWorkerEvent>,
 ) {
-    let mut logical = ServerApp::new_connection(protocol);
-    let mut read_buffer = vec![0_u8; READ_CHUNK_BYTES];
-    let mut write_buffer = Vec::<u8>::new();
-    let mut draining = false;
+    let stream = match io_uring_stream_from_connection_socket(&connection.socket) {
+        Ok(stream) => stream,
+        Err(_) => {
+            app_executor.disconnect_connection(&mut connection.logical);
+            let _ = worker_event_sender.send(IoUringWorkerEvent::ConnectionClosed {
+                connection_id: connection.connection_id,
+            });
+            return;
+        }
+    };
 
     loop {
-        if !draining {
-            let (read_result, next_buffer) = stream.read(read_buffer).await;
-            read_buffer = next_buffer;
+        match control_receiver.try_recv() {
+            Ok(IoUringConnectionControl::Migrate { response }) => {
+                let _ = response.send(Ok(connection));
+                return;
+            }
+            Ok(IoUringConnectionControl::Shutdown) => {
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+
+        if !connection.draining {
+            let read_input = std::mem::take(&mut connection.read_buffer);
+            let (read_result, read_output) = stream.read(read_input).await;
+            connection.read_buffer = read_output;
             match read_result {
                 Ok(0) => {
-                    draining = true;
+                    connection.draining = true;
                 }
                 Ok(read_len) => {
-                    logical.parser.feed_bytes(&read_buffer[..read_len]);
+                    connection
+                        .logical
+                        .parser
+                        .feed_bytes(&connection.read_buffer[..read_len]);
                     io_uring_drain_parsed_commands(
                         &stream,
                         &app_executor,
-                        &mut logical,
-                        &mut write_buffer,
-                        &mut draining,
+                        &mut connection,
                         backpressure,
                     )
                     .await;
                 }
-                Err(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                }
+                Err(_) => {
+                    break;
+                }
             }
         }
 
-        if !write_buffer.is_empty()
-            && io_uring_flush_write_buffer(&stream, &mut write_buffer)
+        if !connection.write_buffer.is_empty()
+            && io_uring_flush_write_buffer(&stream, &mut connection.write_buffer)
                 .await
                 .is_err()
         {
             break;
         }
 
-        if draining {
+        if connection.draining {
             break;
         }
     }
 
-    app_executor.disconnect_connection(&mut logical);
+    app_executor.disconnect_connection(&mut connection.logical);
+    let _ = worker_event_sender.send(IoUringWorkerEvent::ConnectionClosed {
+        connection_id: connection.connection_id,
+    });
 }
 
 #[cfg(target_os = "linux")]
 async fn io_uring_drain_parsed_commands(
     stream: &IoUringTcpStream,
     app_executor: &AppExecutor,
-    logical: &mut ServerConnection,
-    write_buffer: &mut Vec<u8>,
-    draining: &mut bool,
+    connection: &mut IoUringMigratedConnection,
     backpressure: BackpressureThresholds,
 ) {
     loop {
-        match logical.parser.try_pop_command() {
-            Ok(Some(parsed)) => match app_executor.execute_parsed_command_deferred(logical, parsed)
+        match connection.logical.parser.try_pop_command() {
+            Ok(Some(parsed)) => match app_executor
+                .execute_parsed_command_deferred(&mut connection.logical, parsed)
             {
                 ParsedCommandExecution::Immediate(reply) => {
                     if let Some(reply) = reply {
-                        write_buffer.extend_from_slice(&reply);
+                        connection.write_buffer.extend_from_slice(&reply);
                     }
                 }
                 ParsedCommandExecution::Deferred(mut ticket) => {
                     let reply = io_uring_wait_runtime_reply(app_executor, &mut ticket).await;
-                    write_buffer.extend_from_slice(&reply);
+                    connection.write_buffer.extend_from_slice(&reply);
                 }
             },
             Ok(None) => break,
             Err(error) => {
-                let protocol = logical.context.protocol;
-                write_buffer.extend_from_slice(&protocol_parse_error_reply(protocol, &error));
+                let protocol = connection.logical.context.protocol;
+                connection
+                    .write_buffer
+                    .extend_from_slice(&protocol_parse_error_reply(protocol, &error));
                 if protocol == ClientProtocol::Resp {
-                    *draining = true;
+                    connection.draining = true;
                     break;
                 }
-                if !logical.parser.recover_after_protocol_error() {
+                if !connection.logical.parser.recover_after_protocol_error() {
                     break;
                 }
             }
         }
 
-        if write_buffer.len() >= backpressure.high {
-            if io_uring_flush_write_buffer(stream, write_buffer)
+        if connection.write_buffer.len() >= backpressure.high {
+            if io_uring_flush_write_buffer(stream, &mut connection.write_buffer)
                 .await
                 .is_err()
             {
-                *draining = true;
+                connection.draining = true;
             }
-            if write_buffer.len() > backpressure.low {
+            if connection.write_buffer.len() > backpressure.low {
                 break;
             }
         }
