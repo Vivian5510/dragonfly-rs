@@ -1556,6 +1556,7 @@ enum IoUringWorkerCommand {
         connection_id: u64,
         protocol: ClientProtocol,
         socket: StdTcpStream,
+        response: IoUringAddConnectionAckSender,
     },
     TakeConnectionForMigration {
         connection_id: u64,
@@ -1568,6 +1569,10 @@ enum IoUringWorkerCommand {
     Shutdown,
 }
 
+#[cfg(target_os = "linux")]
+type IoUringAddConnectionAckResult = Result<(), String>;
+#[cfg(target_os = "linux")]
+type IoUringAddConnectionAckSender = Sender<IoUringAddConnectionAckResult>;
 #[cfg(target_os = "linux")]
 type IoUringMigrationAdoptResult = Result<(), Box<IoUringMigratedConnection>>;
 #[cfg(target_os = "linux")]
@@ -1605,6 +1610,12 @@ struct IoUringMigratedConnection {
     logical: ServerConnection,
     read_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
+    next_request_id: u64,
+    pending_request_count: usize,
+    pending_runtime_requests: Vec<PendingRuntimeRequest>,
+    reply_order: ConnectionReplyOrder,
+    read_paused_by_backpressure: bool,
+    read_paused_by_command_backpressure: bool,
     draining: bool,
 }
 
@@ -1617,8 +1628,45 @@ impl IoUringMigratedConnection {
             logical: ServerApp::new_connection(protocol),
             read_buffer: vec![0_u8; READ_CHUNK_BYTES],
             write_buffer: Vec::new(),
+            next_request_id: 1,
+            pending_request_count: 0,
+            pending_runtime_requests: Vec::new(),
+            reply_order: ConnectionReplyOrder::new(),
+            read_paused_by_backpressure: false,
+            read_paused_by_command_backpressure: false,
             draining: false,
         }
+    }
+
+    fn can_read(&self) -> bool {
+        !self.draining && !self.read_paused_by_backpressure && !self.read_paused_by_command_backpressure
+    }
+
+    fn should_close_now(&self) -> bool {
+        self.draining && self.pending_request_count == 0 && self.write_buffer.is_empty()
+    }
+
+    fn update_backpressure_state(&mut self, high_watermark: usize, low_watermark: usize) {
+        if self.read_paused_by_backpressure {
+            if self.write_buffer.len() <= low_watermark {
+                self.read_paused_by_backpressure = false;
+            }
+            return;
+        }
+        if self.write_buffer.len() >= high_watermark {
+            self.read_paused_by_backpressure = true;
+        }
+    }
+
+    fn update_command_backpressure_state(
+        &mut self,
+        pending_for_worker: usize,
+        max_pending_per_connection: usize,
+        max_pending_per_worker: usize,
+    ) {
+        self.read_paused_by_command_backpressure = self.pending_request_count
+            >= max_pending_per_connection
+            || pending_for_worker >= max_pending_per_worker;
     }
 }
 
@@ -1729,6 +1777,7 @@ impl IoUringBackend {
             let worker_app = app_executor.clone();
             let worker_backpressure = backpressure;
             let worker_event_sender = worker_event_sender.clone();
+            let worker_pending_requests = Arc::new(AtomicUsize::new(0));
             let join = thread::Builder::new()
                 .name(format!("dfly-io-uring-worker-{worker_id}"))
                 .spawn(move || {
@@ -1737,6 +1786,7 @@ impl IoUringBackend {
                         worker_app,
                         worker_backpressure,
                         worker_event_sender,
+                        worker_pending_requests,
                     );
                 })
                 .map_err(|error| {
@@ -1836,14 +1886,30 @@ impl IoUringBackend {
                     let connection_id = self.allocate_connection_id();
                     let worker_id = self.allocate_worker_index(&socket);
                     let socket = mio_stream_into_std(socket);
+                    let (response_sender, response_receiver) =
+                        mpsc::channel::<IoUringAddConnectionAckResult>();
                     self.dispatch_to_worker(
                         worker_id,
                         IoUringWorkerCommand::AddConnection {
                             connection_id,
                             protocol,
                             socket,
+                            response: response_sender,
                         },
                     )?;
+                    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(message)) => {
+                            return Err(DflyError::Io(format!(
+                                "io_uring worker {worker_id} rejected connection {connection_id}: {message}"
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(DflyError::Io(format!(
+                                "io_uring worker {worker_id} did not acknowledge connection {connection_id}: {error}"
+                            )));
+                        }
+                    }
                     let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
                     self.mark_rebalance_dirty();
                     accepted = accepted.saturating_add(1);
@@ -2155,6 +2221,7 @@ fn io_uring_worker_thread_main(
     app_executor: AppExecutor,
     backpressure: BackpressureThresholds,
     worker_event_sender: Sender<IoUringWorkerEvent>,
+    worker_pending_requests: Arc<AtomicUsize>,
 ) {
     tokio_uring::start(async move {
         let mut controls = HashMap::<u64, TokioUnboundedSender<IoUringConnectionControl>>::new();
@@ -2164,14 +2231,21 @@ fn io_uring_worker_thread_main(
                     connection_id,
                     protocol,
                     socket,
+                    response,
                 } => {
+                    if controls.contains_key(&connection_id) {
+                        let _ = response.send(Err("connection is already tracked by io_uring worker".to_owned()));
+                        continue;
+                    }
                     let control = spawn_io_uring_connection_task(
                         IoUringMigratedConnection::new(connection_id, socket, protocol),
                         app_executor.clone(),
                         backpressure,
                         worker_event_sender.clone(),
+                        Arc::clone(&worker_pending_requests),
                     );
                     let _ = controls.insert(connection_id, control);
+                    let _ = response.send(Ok(()));
                 }
                 IoUringWorkerCommand::TakeConnectionForMigration {
                     connection_id,
@@ -2208,7 +2282,15 @@ fn io_uring_worker_thread_main(
                             Err("io_uring connection task timed out during migration".to_owned())
                         }
                     };
-                    let _ = response.send(migration);
+                    match migration {
+                        Ok(connection) => {
+                            let _ = response.send(Ok(connection));
+                        }
+                        Err(message) => {
+                            let _ = controls.insert(connection_id, control);
+                            let _ = response.send(Err(message));
+                        }
+                    }
                 }
                 IoUringWorkerCommand::AdoptMigratedConnection {
                     connection,
@@ -2225,6 +2307,7 @@ fn io_uring_worker_thread_main(
                         app_executor.clone(),
                         backpressure,
                         worker_event_sender.clone(),
+                        Arc::clone(&worker_pending_requests),
                     );
                     let _ = controls.insert(connection_id, control);
                     let _ = response.send(Ok(()));
@@ -2246,6 +2329,7 @@ fn spawn_io_uring_connection_task(
     app_executor: AppExecutor,
     backpressure: BackpressureThresholds,
     worker_event_sender: Sender<IoUringWorkerEvent>,
+    worker_pending_requests: Arc<AtomicUsize>,
 ) -> TokioUnboundedSender<IoUringConnectionControl> {
     let (control_sender, control_receiver) = tokio_unbounded_channel::<IoUringConnectionControl>();
     tokio_uring::spawn(async move {
@@ -2255,6 +2339,7 @@ fn spawn_io_uring_connection_task(
             backpressure,
             control_receiver,
             worker_event_sender,
+            worker_pending_requests,
         )
         .await;
     });
@@ -2276,6 +2361,7 @@ async fn io_uring_connection_main(
     backpressure: BackpressureThresholds,
     mut control_receiver: TokioUnboundedReceiver<IoUringConnectionControl>,
     worker_event_sender: Sender<IoUringWorkerEvent>,
+    worker_pending_requests: Arc<AtomicUsize>,
 ) {
     let stream = match io_uring_stream_from_connection_socket(&connection.socket) {
         Ok(stream) => stream,
@@ -2289,63 +2375,123 @@ async fn io_uring_connection_main(
     };
 
     loop {
-        match control_receiver.try_recv() {
-            Ok(IoUringConnectionControl::Migrate { response }) => {
-                let _ = response.send(Ok(connection));
-                return;
-            }
-            Ok(IoUringConnectionControl::Shutdown) => {
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                break;
-            }
-        }
-
-        if !connection.draining {
-            let read_input = std::mem::take(&mut connection.read_buffer);
-            let (read_result, read_output) = stream.read(read_input).await;
-            connection.read_buffer = read_output;
-            match read_result {
-                Ok(0) => {
-                    connection.draining = true;
+        let mut should_shutdown = false;
+        loop {
+            match control_receiver.try_recv() {
+                Ok(IoUringConnectionControl::Migrate { response }) => {
+                    if can_migrate_io_uring_connection(&connection) {
+                        let _ = response.send(Ok(connection));
+                        return;
+                    }
+                    let _ = response.send(Err("connection state does not allow migration".to_owned()));
                 }
-                Ok(read_len) => {
-                    connection
-                        .logical
-                        .parser
-                        .feed_bytes(&connection.read_buffer[..read_len]);
-                    io_uring_drain_parsed_commands(
-                        &stream,
-                        &app_executor,
-                        &mut connection,
-                        backpressure,
-                    )
-                    .await;
+                Ok(IoUringConnectionControl::Shutdown) => {
+                    should_shutdown = true;
+                    break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::task::yield_now().await;
-                }
-                Err(_) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    should_shutdown = true;
                     break;
                 }
             }
         }
-
-        if !connection.write_buffer.is_empty()
-            && io_uring_flush_write_buffer(&stream, &mut connection.write_buffer)
-                .await
-                .is_err()
-        {
+        if should_shutdown {
             break;
         }
 
-        if connection.draining {
+        let mut made_progress = false;
+        if io_uring_drain_pending_runtime_replies(
+            &app_executor,
+            &mut connection,
+            backpressure,
+            &worker_pending_requests,
+        ) {
+            made_progress = true;
+        }
+
+        let pending_for_worker = worker_pending_requests.load(Ordering::Acquire);
+        connection.update_command_backpressure_state(
+            pending_for_worker,
+            backpressure.max_pending_per_connection,
+            backpressure.max_pending_per_worker,
+        );
+
+        if connection.can_read() {
+            let mut read_budget = WORKER_READ_BUDGET_PER_EVENT;
+            while read_budget > 0 && connection.can_read() {
+                read_budget = read_budget.saturating_sub(1);
+                let read_input = std::mem::take(&mut connection.read_buffer);
+                let (read_result, read_output) = stream.read(read_input).await;
+                connection.read_buffer = read_output;
+                match read_result {
+                    Ok(0) => {
+                        connection.draining = true;
+                        made_progress = true;
+                        break;
+                    }
+                    Ok(read_len) => {
+                        if read_len == 0 {
+                            break;
+                        }
+                        made_progress = true;
+                        connection
+                            .logical
+                            .parser
+                            .feed_bytes(&connection.read_buffer[..read_len]);
+                        io_uring_drain_parsed_commands(
+                            &app_executor,
+                            &mut connection,
+                            backpressure,
+                            &worker_pending_requests,
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        connection.draining = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !connection.write_buffer.is_empty() {
+            match io_uring_flush_write_buffer_budget(
+                &stream,
+                &mut connection.write_buffer,
+                WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
+            )
+            .await
+            {
+                Ok(written) => {
+                    if written > 0 {
+                        made_progress = true;
+                    }
+                    connection.update_backpressure_state(backpressure.high, backpressure.low);
+                }
+                Err(_) => {
+                    connection.draining = true;
+                }
+            }
+        }
+
+        if connection.should_close_now() {
             break;
+        }
+        if !made_progress {
+            tokio::task::yield_now().await;
         }
     }
 
+    if !connection.pending_runtime_requests.is_empty() {
+        io_uring_reap_pending_runtime_replies(
+            &app_executor,
+            &mut connection,
+            backpressure,
+            &worker_pending_requests,
+        )
+        .await;
+    }
     app_executor.disconnect_connection(&mut connection.logical);
     let _ = worker_event_sender.send(IoUringWorkerEvent::ConnectionClosed {
         connection_id: connection.connection_id,
@@ -2353,33 +2499,60 @@ async fn io_uring_connection_main(
 }
 
 #[cfg(target_os = "linux")]
-async fn io_uring_drain_parsed_commands(
-    stream: &IoUringTcpStream,
+fn io_uring_drain_parsed_commands(
     app_executor: &AppExecutor,
     connection: &mut IoUringMigratedConnection,
     backpressure: BackpressureThresholds,
+    worker_pending_requests: &Arc<AtomicUsize>,
 ) {
-    loop {
+    let mut remaining_budget = WORKER_PARSE_BUDGET_PER_READ;
+    while remaining_budget > 0 {
+        remaining_budget = remaining_budget.saturating_sub(1);
+        let pending_for_worker = worker_pending_requests.load(Ordering::Acquire);
+        connection.update_command_backpressure_state(
+            pending_for_worker,
+            backpressure.max_pending_per_connection,
+            backpressure.max_pending_per_worker,
+        );
+        if !connection.can_read() {
+            break;
+        }
         match connection.logical.parser.try_pop_command() {
-            Ok(Some(parsed)) => match app_executor
-                .execute_parsed_command_deferred(&mut connection.logical, parsed)
-            {
-                ParsedCommandExecution::Immediate(reply) => {
-                    if let Some(reply) = reply {
-                        connection.write_buffer.extend_from_slice(&reply);
+            Ok(Some(parsed)) => {
+                let request_id = connection.next_request_id;
+                connection.next_request_id = connection.next_request_id.saturating_add(1);
+                io_uring_mark_request_submitted(connection, worker_pending_requests);
+                match app_executor.execute_parsed_command_deferred(&mut connection.logical, parsed) {
+                    ParsedCommandExecution::Immediate(reply) => {
+                        io_uring_record_completed_request(
+                            connection,
+                            request_id,
+                            reply,
+                            backpressure,
+                            worker_pending_requests,
+                        );
+                    }
+                    ParsedCommandExecution::Deferred(ticket) => {
+                        connection
+                            .pending_runtime_requests
+                            .push(PendingRuntimeRequest { request_id, ticket });
                     }
                 }
-                ParsedCommandExecution::Deferred(mut ticket) => {
-                    let reply = io_uring_wait_runtime_reply(app_executor, &mut ticket).await;
-                    connection.write_buffer.extend_from_slice(&reply);
-                }
-            },
+            }
             Ok(None) => break,
             Err(error) => {
+                let request_id = connection.next_request_id;
+                connection.next_request_id = connection.next_request_id.saturating_add(1);
+                io_uring_mark_request_submitted(connection, worker_pending_requests);
                 let protocol = connection.logical.context.protocol;
-                connection
-                    .write_buffer
-                    .extend_from_slice(&protocol_parse_error_reply(protocol, &error));
+                let reply = protocol_parse_error_reply(protocol, &error);
+                io_uring_record_completed_request(
+                    connection,
+                    request_id,
+                    Some(reply),
+                    backpressure,
+                    worker_pending_requests,
+                );
                 if protocol == ClientProtocol::Resp {
                     connection.draining = true;
                     break;
@@ -2389,56 +2562,199 @@ async fn io_uring_drain_parsed_commands(
                 }
             }
         }
-
-        if connection.write_buffer.len() >= backpressure.high {
-            if io_uring_flush_write_buffer(stream, &mut connection.write_buffer)
-                .await
-                .is_err()
-            {
-                connection.draining = true;
-            }
-            if connection.write_buffer.len() > backpressure.low {
-                break;
-            }
-        }
     }
 }
 
 #[cfg(target_os = "linux")]
-async fn io_uring_wait_runtime_reply(
+fn io_uring_drain_pending_runtime_replies(
     app_executor: &AppExecutor,
-    ticket: &mut RuntimeReplyTicket,
-) -> Vec<u8> {
-    loop {
-        match app_executor.runtime_reply_ticket_ready(ticket) {
-            Ok(true) => {
-                return match app_executor.take_runtime_reply_ticket(ticket) {
-                    Ok(reply) => reply,
-                    Err(error) => runtime_dispatch_error_reply(ticket.protocol, &error),
-                };
+    connection: &mut IoUringMigratedConnection,
+    backpressure: BackpressureThresholds,
+    worker_pending_requests: &Arc<AtomicUsize>,
+) -> bool {
+    if connection.pending_runtime_requests.is_empty() {
+        return false;
+    }
+    let processed_snapshot = match app_executor.runtime_processed_sequences_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            while let Some(pending) = connection.pending_runtime_requests.pop() {
+                let reply = runtime_dispatch_error_reply(pending.ticket.protocol, &error);
+                io_uring_record_completed_request(
+                    connection,
+                    pending.request_id,
+                    Some(reply),
+                    backpressure,
+                    worker_pending_requests,
+                );
             }
-            Ok(false) => {
-                tokio::task::yield_now().await;
-            }
+            return true;
+        }
+    };
+    let mut progressed = false;
+    let mut index = 0_usize;
+    while index < connection.pending_runtime_requests.len() {
+        let ready_result = {
+            let pending = &mut connection.pending_runtime_requests[index];
+            app_executor.runtime_reply_ticket_ready_with_snapshot(&mut pending.ticket, &processed_snapshot)
+        };
+        let ready = match ready_result {
+            Ok(ready) => ready,
             Err(error) => {
-                return runtime_dispatch_error_reply(ticket.protocol, &error);
+                let pending = connection.pending_runtime_requests.swap_remove(index);
+                let reply = runtime_dispatch_error_reply(pending.ticket.protocol, &error);
+                io_uring_record_completed_request(
+                    connection,
+                    pending.request_id,
+                    Some(reply),
+                    backpressure,
+                    worker_pending_requests,
+                );
+                progressed = true;
+                continue;
             }
+        };
+        if !ready {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let mut pending = connection.pending_runtime_requests.swap_remove(index);
+        let reply = match app_executor.take_runtime_reply_ticket_ready(&mut pending.ticket) {
+            Ok(reply) => Some(reply),
+            Err(error) => Some(runtime_dispatch_error_reply(pending.ticket.protocol, &error)),
+        };
+        io_uring_record_completed_request(
+            connection,
+            pending.request_id,
+            reply,
+            backpressure,
+            worker_pending_requests,
+        );
+        progressed = true;
+    }
+    progressed
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_reap_pending_runtime_replies(
+    app_executor: &AppExecutor,
+    connection: &mut IoUringMigratedConnection,
+    backpressure: BackpressureThresholds,
+    worker_pending_requests: &Arc<AtomicUsize>,
+) {
+    while !connection.pending_runtime_requests.is_empty() {
+        let progressed = io_uring_drain_pending_runtime_replies(
+            app_executor,
+            connection,
+            backpressure,
+            worker_pending_requests,
+        );
+        if !progressed {
+            tokio::task::yield_now().await;
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-async fn io_uring_flush_write_buffer(
+fn io_uring_mark_request_submitted(
+    connection: &mut IoUringMigratedConnection,
+    worker_pending_requests: &Arc<AtomicUsize>,
+) {
+    connection.pending_request_count = connection.pending_request_count.saturating_add(1);
+    let _ = worker_pending_requests.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_complete_request(
+    connection: &mut IoUringMigratedConnection,
+    worker_pending_requests: &Arc<AtomicUsize>,
+) {
+    if connection.pending_request_count > 0 {
+        connection.pending_request_count = connection.pending_request_count.saturating_sub(1);
+    }
+    let _ = worker_pending_requests.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_record_completed_request(
+    connection: &mut IoUringMigratedConnection,
+    request_id: u64,
+    reply: Option<Vec<u8>>,
+    backpressure: BackpressureThresholds,
+    worker_pending_requests: &Arc<AtomicUsize>,
+) {
+    let _ = connection.reply_order.completed.insert(request_id, reply);
+    loop {
+        let Some(reply) = connection
+            .reply_order
+            .completed
+            .remove(&connection.reply_order.next_request_id)
+        else {
+            break;
+        };
+        connection.reply_order.next_request_id =
+            connection.reply_order.next_request_id.saturating_add(1);
+        if let Some(reply) = reply {
+            connection.write_buffer.extend_from_slice(&reply);
+        }
+        io_uring_complete_request(connection, worker_pending_requests);
+    }
+    connection.update_backpressure_state(backpressure.high, backpressure.low);
+    let pending_for_worker = worker_pending_requests.load(Ordering::Acquire);
+    connection.update_command_backpressure_state(
+        pending_for_worker,
+        backpressure.max_pending_per_connection,
+        backpressure.max_pending_per_worker,
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_flush_write_buffer_budget(
     stream: &IoUringTcpStream,
     write_buffer: &mut Vec<u8>,
-) -> Result<(), std::io::Error> {
+    write_budget_bytes: usize,
+) -> Result<usize, std::io::Error> {
     if write_buffer.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let payload = std::mem::take(write_buffer);
-    let (result, remaining) = stream.write_all(payload).await;
-    *write_buffer = remaining;
-    result
+    let mut remaining_budget = write_budget_bytes.max(1);
+    let mut written_total = 0_usize;
+    while !write_buffer.is_empty() && remaining_budget > 0 {
+        let chunk_len = remaining_budget.min(write_buffer.len());
+        let payload = write_buffer[..chunk_len].to_vec();
+        let (result, remaining) = stream.write_all(payload).await;
+        let written = chunk_len.saturating_sub(remaining.len());
+        if written > 0 {
+            let _ = write_buffer.drain(..written);
+            written_total = written_total.saturating_add(written);
+            remaining_budget = remaining_budget.saturating_sub(written);
+        }
+        match result {
+            Ok(()) => {
+                if written == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "io_uring write returned zero bytes",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(written_total)
+}
+
+#[cfg(target_os = "linux")]
+fn can_migrate_io_uring_connection(connection: &IoUringMigratedConnection) -> bool {
+    !connection.draining
+        && connection.pending_request_count == 0
+        && connection.pending_runtime_requests.is_empty()
+        && connection.logical.parser.pending_bytes() == 0
+        && connection.reply_order.completed.is_empty()
+        && connection.write_buffer.is_empty()
 }
 
 impl Drop for ThreadedServerReactor {
@@ -3322,6 +3638,8 @@ mod tests {
         ConnectionLifecycle, ReactorConnection, ServerReactor, ServerReactorConfig,
         ThreadedServerReactor,
     };
+    #[cfg(target_os = "linux")]
+    use super::IoUringBackend;
     use crate::app::{AppExecutor, ParsedCommandExecution, ServerApp};
     use dfly_common::config::RuntimeConfig;
     use dfly_core::command::CommandFrame;
@@ -3655,6 +3973,401 @@ mod tests {
             &app_executor,
         );
         assert_that!(bind_result.is_ok(), eq(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn io_uring_listener_addr(backend: &IoUringBackend, protocol: ClientProtocol) -> SocketAddr {
+        backend
+            .listeners
+            .iter()
+            .find_map(|listener| {
+                if listener.protocol == protocol {
+                    listener.socket.local_addr().ok()
+                } else {
+                    None
+                }
+            })
+            .expect("listener address should be available")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn io_uring_wait_connection_id(backend: &mut IoUringBackend) -> u64 {
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            if let Some(connection_id) = backend.connection_owner_by_id.keys().next().copied() {
+                return connection_id;
+            }
+        }
+        panic!("expected accepted io_uring connection id");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_resp_roundtrip() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig {
+                io_worker_count: 2,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
+        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .expect("ping write should succeed");
+
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        let mut reply = Vec::new();
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 64];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => {
+                    reply.extend_from_slice(&chunk[..read_len]);
+                    if reply.ends_with(b"+PONG\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("resp read failed: {error}"),
+            }
+        }
+        assert_that!(&reply, eq(&b"+PONG\r\n".to_vec()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_memcache_roundtrip() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ServerReactorConfig {
+                io_worker_count: 2,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let memcache_addr = io_uring_listener_addr(&backend, ClientProtocol::Memcache);
+        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+        client
+            .write_all(b"set mk 0 0 2\r\nok\r\nget mk\r\n")
+            .expect("memcache roundtrip write should succeed");
+
+        let deadline = Instant::now() + Duration::from_millis(1400);
+        let mut reply = Vec::new();
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 256];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => {
+                    reply.extend_from_slice(&chunk[..read_len]);
+                    if reply.ends_with(b"END\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("memcache read failed: {error}"),
+            }
+        }
+        assert_that!(
+            &reply,
+            eq(&b"STORED\r\nVALUE mk 0 2\r\nok\r\nEND\r\n".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_migration_preserves_order() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig {
+                io_worker_count: 2,
+                io_worker_dispatch_count: 2,
+                enable_connection_migration: true,
+                max_pending_requests_per_connection: 1,
+                max_pending_requests_per_worker: 8,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
+        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+
+        let connection_id = io_uring_wait_connection_id(&mut backend);
+        let owner = backend
+            .connection_owner_by_id
+            .get(&connection_id)
+            .copied()
+            .expect("connection owner should exist");
+        let target_worker = (owner + 1) % 2;
+
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .expect("deferred pipeline write should succeed");
+        let _ = backend
+            .poll_once(Some(Duration::from_millis(5)))
+            .expect("io_uring backend poll should succeed");
+
+        let migration_error = backend
+            .migrate_connection(connection_id, target_worker)
+            .expect_err("migration should fail while request is in-flight");
+        assert_that!(
+            format!("{migration_error}").contains("state does not allow migration"),
+            eq(true)
+        );
+        assert_that!(
+            backend.connection_owner_by_id.get(&connection_id).copied(),
+            eq(Some(owner))
+        );
+
+        let mut first_reply = Vec::new();
+        let first_deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < first_deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 128];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => {
+                    first_reply.extend_from_slice(&chunk[..read_len]);
+                    if first_reply.len() >= b"$-1\r\n$-1\r\n".len() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("deferred reply read failed: {error}"),
+            }
+        }
+        assert_that!(&first_reply, eq(&b"$-1\r\n$-1\r\n".to_vec()));
+
+        backend
+            .migrate_connection(connection_id, target_worker)
+            .expect("migration should succeed after pending requests are drained");
+
+        let second_migration = backend.migrate_connection(connection_id, owner);
+        assert_that!(second_migration.is_err(), eq(true));
+
+        let mut request = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..24 {
+            let key = format!("mk{index}");
+            let value = format!("mv{index}");
+            request.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.len(),
+                    key,
+                    value.len(),
+                    value
+                )
+                .as_bytes(),
+            );
+            request.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
+            );
+            expected.extend_from_slice(b"+OK\r\n");
+            expected.extend_from_slice(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
+        }
+        client
+            .write_all(&request)
+            .expect("ordered pipeline write should succeed");
+
+        let mut response = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 4096];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => response.extend_from_slice(&chunk[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("ordered pipeline read failed: {error}"),
+            }
+            if response.len() >= expected.len() {
+                break;
+            }
+        }
+        assert_that!(&response, eq(&expected));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_backpressure_pauses_read() {
+        const DEFERRED_GETS: usize = 64;
+
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig {
+                io_worker_count: 1,
+                io_worker_dispatch_count: 1,
+                max_pending_requests_per_connection: 1,
+                max_pending_requests_per_worker: 1,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
+        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+        let _ = io_uring_wait_connection_id(&mut backend);
+
+        let mut payload = Vec::new();
+        for _ in 0..DEFERRED_GETS {
+            payload.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+        }
+        payload.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        client
+            .write_all(&payload)
+            .expect("pipeline write should succeed");
+
+        let mut early_reply = Vec::new();
+        for _ in 0..6 {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 1024];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => early_reply.extend_from_slice(&chunk[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("early read failed: {error}"),
+            }
+        }
+        assert_that!(
+            String::from_utf8_lossy(&early_reply).contains("+PONG"),
+            eq(false)
+        );
+
+        let mut full_reply = early_reply;
+        let expected_len = DEFERRED_GETS
+            .saturating_mul(b"$-1\r\n".len())
+            .saturating_add(b"+PONG\r\n".len());
+        let deadline = Instant::now() + Duration::from_millis(3500);
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            let mut chunk = [0_u8; 2048];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => full_reply.extend_from_slice(&chunk[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("full read failed: {error}"),
+            }
+            if full_reply.len() >= expected_len {
+                break;
+            }
+        }
+        assert_that!(full_reply.ends_with(b"+PONG\r\n"), eq(true));
+        assert_that!(full_reply.len() >= expected_len, eq(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_peer_close_reap_state() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig {
+                io_worker_count: 2,
+                io_worker_dispatch_count: 2,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
+        let client = TcpStream::connect(resp_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+        let connection_id = io_uring_wait_connection_id(&mut backend);
+
+        let _ = client.shutdown(Shutdown::Both);
+        drop(client);
+
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            let _ = backend
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("io_uring backend poll should succeed");
+            if !backend.connection_owner_by_id.contains_key(&connection_id) {
+                break;
+            }
+        }
+        assert_that!(
+            backend.connection_owner_by_id.contains_key(&connection_id),
+            eq(false)
+        );
+        assert_that!(backend.migrated_connections.contains(&connection_id), eq(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn io_uring_add_connection_ack_avoids_dirty_owner_on_worker_failure() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let mut backend = IoUringBackend::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig {
+                io_worker_count: 1,
+                io_worker_dispatch_count: 1,
+                ..ServerReactorConfig::default()
+            },
+            &app_executor,
+        )
+        .expect("io_uring backend bind should succeed");
+        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
+
+        backend.workers[0]
+            .sender
+            .send(super::IoUringWorkerCommand::Shutdown)
+            .expect("shutdown command should send");
+        if let Some(join) = backend.workers[0].join.take() {
+            let _ = join.join();
+        }
+
+        let _client = TcpStream::connect(resp_addr).expect("connect should succeed");
+        let poll_result = backend.poll_once(Some(Duration::from_millis(5)));
+        assert_that!(poll_result.is_err(), eq(true));
+        assert_that!(backend.connection_owner_by_id.is_empty(), eq(true));
     }
 
     #[rstest]
