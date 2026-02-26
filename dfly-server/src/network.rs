@@ -49,6 +49,7 @@ const DEFAULT_WRITE_HIGH_WATERMARK_BYTES: usize = 256 * 1024;
 const DEFAULT_WRITE_LOW_WATERMARK_BYTES: usize = 128 * 1024;
 const DEFAULT_MAX_PENDING_REQUESTS_PER_CONNECTION: usize = 256;
 const DEFAULT_MAX_PENDING_REQUESTS_PER_WORKER: usize = 8192;
+const DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS: usize = 64;
 const WORKER_READ_BUDGET_PER_EVENT: usize = 8;
 const WORKER_PARSE_BUDGET_PER_READ: usize = 32;
 const WORKER_WRITE_BUDGET_BYTES_PER_EVENT: usize = 64 * 1024;
@@ -977,6 +978,9 @@ pub struct ThreadedServerReactor {
     next_rr_offset: usize,
     use_peer_hash_dispatch: bool,
     migration_enabled: bool,
+    rebalance_scan_ticks: usize,
+    rebalance_scan_interval_ticks: usize,
+    rebalance_dirty: bool,
     next_connection_id: u64,
     connection_owner_by_id: HashMap<u64, usize>,
     migrated_connections: HashSet<u64>,
@@ -1002,6 +1006,7 @@ impl ThreadedServerReactor {
     /// # Errors
     ///
     /// Returns `DflyError::InvalidState` if listener bind/registration or worker spawn fails.
+    #[allow(clippy::too_many_lines)]
     pub fn bind_with_memcache(
         resp_addr: SocketAddr,
         memcache_addr: Option<SocketAddr>,
@@ -1108,6 +1113,9 @@ impl ThreadedServerReactor {
             next_rr_offset: 0,
             use_peer_hash_dispatch: config.use_peer_hash_dispatch,
             migration_enabled: config.enable_connection_migration,
+            rebalance_scan_ticks: 0,
+            rebalance_scan_interval_ticks: DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS,
+            rebalance_dirty: false,
             next_connection_id: 1,
             connection_owner_by_id: HashMap::new(),
             migrated_connections: HashSet::new(),
@@ -1136,7 +1144,7 @@ impl ThreadedServerReactor {
             }
         }
         self.drain_worker_events();
-        self.maybe_rebalance_connections();
+        self.maybe_rebalance_connections_if_needed();
         Ok(snapshots.len().saturating_add(accepted))
     }
 
@@ -1230,6 +1238,7 @@ impl ThreadedServerReactor {
                         },
                     )?;
                     let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
+                    self.mark_rebalance_dirty();
                     accepted = accepted.saturating_add(1);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1284,9 +1293,29 @@ impl ThreadedServerReactor {
         while let Ok(WorkerEvent::ConnectionClosed { connection_id }) =
             self.worker_events.try_recv()
         {
-            let _ = self.connection_owner_by_id.remove(&connection_id);
+            if self.connection_owner_by_id.remove(&connection_id).is_some() {
+                self.mark_rebalance_dirty();
+            }
             let _ = self.migrated_connections.remove(&connection_id);
         }
+    }
+
+    fn mark_rebalance_dirty(&mut self) {
+        self.rebalance_dirty = true;
+        // Start with an immediate scan after topology changes, then fall back to throttled scans.
+        self.rebalance_scan_ticks = self.rebalance_scan_interval_ticks;
+    }
+
+    fn maybe_rebalance_connections_if_needed(&mut self) {
+        if !self.rebalance_dirty || !self.migration_enabled {
+            return;
+        }
+        self.rebalance_scan_ticks = self.rebalance_scan_ticks.saturating_add(1);
+        if self.rebalance_scan_ticks < self.rebalance_scan_interval_ticks {
+            return;
+        }
+        self.rebalance_scan_ticks = 0;
+        self.rebalance_dirty = self.maybe_rebalance_connections().unwrap_or(true);
     }
 
     fn dispatch_adopt_for_migration(
@@ -1347,12 +1376,12 @@ impl ThreadedServerReactor {
         }
     }
 
-    fn maybe_rebalance_connections(&mut self) {
+    fn maybe_rebalance_connections(&mut self) -> Result<bool, ()> {
         if !self.migration_enabled
             || self.workers.len() < 2
             || self.connection_owner_by_id.len() < 2
         {
-            return;
+            return Ok(false);
         }
         let mut counts = vec![0_usize; self.workers.len()];
         for owner in self.connection_owner_by_id.values().copied() {
@@ -1366,7 +1395,7 @@ impl ThreadedServerReactor {
             .max_by_key(|(_, count)| **count)
             .map(|(index, count)| (index, *count))
         else {
-            return;
+            return Ok(false);
         };
         let Some((target_worker, target_count)) = counts
             .iter()
@@ -1374,10 +1403,10 @@ impl ThreadedServerReactor {
             .min_by_key(|(_, count)| **count)
             .map(|(index, count)| (index, *count))
         else {
-            return;
+            return Ok(false);
         };
         if source_count <= target_count.saturating_add(1) {
-            return;
+            return Ok(false);
         }
 
         let Some(connection_id) =
@@ -1392,9 +1421,11 @@ impl ThreadedServerReactor {
                     }
                 })
         else {
-            return;
+            return Ok(false);
         };
-        let _ = self.migrate_connection(connection_id, target_worker);
+        self.migrate_connection(connection_id, target_worker)
+            .map(|()| true)
+            .map_err(|_| ())
     }
 
     /// Migrates one live connection to a target worker using constrained Dragonfly-style rules.
@@ -1476,6 +1507,7 @@ impl ThreadedServerReactor {
             .connection_owner_by_id
             .insert(connection_id, target_worker);
         let _ = self.migrated_connections.insert(connection_id);
+        self.mark_rebalance_dirty();
         Ok(())
     }
 }
@@ -1611,6 +1643,9 @@ pub struct IoUringBackend {
     next_rr_offset: usize,
     use_peer_hash_dispatch: bool,
     migration_enabled: bool,
+    rebalance_scan_ticks: usize,
+    rebalance_scan_interval_ticks: usize,
+    rebalance_dirty: bool,
     next_connection_id: u64,
     connection_owner_by_id: HashMap<u64, usize>,
     migrated_connections: HashSet<u64>,
@@ -1723,6 +1758,9 @@ impl IoUringBackend {
             next_rr_offset: 0,
             use_peer_hash_dispatch: config.use_peer_hash_dispatch,
             migration_enabled: config.enable_connection_migration,
+            rebalance_scan_ticks: 0,
+            rebalance_scan_interval_ticks: DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS,
+            rebalance_dirty: false,
             next_connection_id: 1,
             connection_owner_by_id: HashMap::new(),
             migrated_connections: HashSet::new(),
@@ -1750,7 +1788,7 @@ impl IoUringBackend {
             }
         }
         self.drain_worker_events();
-        self.maybe_rebalance_connections();
+        self.maybe_rebalance_connections_if_needed();
         Ok(snapshots.len().saturating_add(accepted))
     }
 
@@ -1807,6 +1845,7 @@ impl IoUringBackend {
                         },
                     )?;
                     let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
+                    self.mark_rebalance_dirty();
                     accepted = accepted.saturating_add(1);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1868,9 +1907,29 @@ impl IoUringBackend {
         while let Ok(IoUringWorkerEvent::ConnectionClosed { connection_id }) =
             self.worker_events.try_recv()
         {
-            let _ = self.connection_owner_by_id.remove(&connection_id);
+            if self.connection_owner_by_id.remove(&connection_id).is_some() {
+                self.mark_rebalance_dirty();
+            }
             let _ = self.migrated_connections.remove(&connection_id);
         }
+    }
+
+    fn mark_rebalance_dirty(&mut self) {
+        self.rebalance_dirty = true;
+        // Start with an immediate scan after topology changes, then fall back to throttled scans.
+        self.rebalance_scan_ticks = self.rebalance_scan_interval_ticks;
+    }
+
+    fn maybe_rebalance_connections_if_needed(&mut self) {
+        if !self.rebalance_dirty || !self.migration_enabled {
+            return;
+        }
+        self.rebalance_scan_ticks = self.rebalance_scan_ticks.saturating_add(1);
+        if self.rebalance_scan_ticks < self.rebalance_scan_interval_ticks {
+            return;
+        }
+        self.rebalance_scan_ticks = 0;
+        self.rebalance_dirty = self.maybe_rebalance_connections().unwrap_or(true);
     }
 
     fn dispatch_adopt_for_migration(
@@ -1932,12 +1991,12 @@ impl IoUringBackend {
         }
     }
 
-    fn maybe_rebalance_connections(&mut self) {
+    fn maybe_rebalance_connections(&mut self) -> Result<bool, ()> {
         if !self.migration_enabled
             || self.workers.len() < 2
             || self.connection_owner_by_id.len() < 2
         {
-            return;
+            return Ok(false);
         }
         let mut counts = vec![0_usize; self.workers.len()];
         for owner in self.connection_owner_by_id.values().copied() {
@@ -1951,7 +2010,7 @@ impl IoUringBackend {
             .max_by_key(|(_, count)| **count)
             .map(|(index, count)| (index, *count))
         else {
-            return;
+            return Ok(false);
         };
         let Some((target_worker, target_count)) = counts
             .iter()
@@ -1959,10 +2018,10 @@ impl IoUringBackend {
             .min_by_key(|(_, count)| **count)
             .map(|(index, count)| (index, *count))
         else {
-            return;
+            return Ok(false);
         };
         if source_count <= target_count.saturating_add(1) {
-            return;
+            return Ok(false);
         }
 
         let Some(connection_id) =
@@ -1977,9 +2036,11 @@ impl IoUringBackend {
                     }
                 })
         else {
-            return;
+            return Ok(false);
         };
-        let _ = self.migrate_connection(connection_id, target_worker);
+        self.migrate_connection(connection_id, target_worker)
+            .map(|()| true)
+            .map_err(|_| ())
     }
 
     /// Migrates one live connection to a target worker using constrained Dragonfly-style rules.
@@ -2063,6 +2124,7 @@ impl IoUringBackend {
             .connection_owner_by_id
             .insert(connection_id, target_worker);
         let _ = self.migrated_connections.insert(connection_id);
+        self.mark_rebalance_dirty();
         Ok(())
     }
 }
@@ -3260,12 +3322,11 @@ mod tests {
         ConnectionLifecycle, ReactorConnection, ServerReactor, ServerReactorConfig,
         ThreadedServerReactor,
     };
-    use crate::app::{AppExecutor, ServerApp};
+    use crate::app::{AppExecutor, ParsedCommandExecution, ServerApp};
     use dfly_common::config::RuntimeConfig;
     use dfly_core::command::CommandFrame;
-    use dfly_core::runtime::RuntimeEnvelope;
     use dfly_facade::net_proactor::{MultiplexApi, MultiplexSelection, select_multiplex_backend};
-    use dfly_facade::protocol::ClientProtocol;
+    use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
     use googletest::prelude::*;
     use mio::{Poll, Token};
     use rstest::rstest;
@@ -4586,17 +4647,23 @@ mod tests {
     fn disconnected_worker_connection_reaps_detached_deferred_replies() {
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let frame = CommandFrame::new("GET", vec![b"leak-check".to_vec()]);
-        let shard = app_executor.with_app(|app| app.core.resolve_target_shard(&frame));
-        let sequence = app_executor.with_app(|app| {
-            app.runtime
-                .submit_with_sequence(RuntimeEnvelope {
-                    target_shard: shard,
-                    db: 0,
-                    execute_on_worker: true,
-                    command: frame.clone(),
-                })
-                .expect("runtime submit should succeed")
-        });
+        let mut command_connection = ServerApp::new_connection(ClientProtocol::Resp);
+        let execution = app_executor.execute_parsed_command_deferred(
+            &mut command_connection,
+            ParsedCommand {
+                name: frame.name.clone(),
+                args: frame.args.clone(),
+            },
+        );
+        let ParsedCommandExecution::Deferred(ticket) = execution else {
+            panic!("GET should dispatch via deferred runtime path");
+        };
+        let _shard = ticket
+            .barriers
+            .first()
+            .map(|barrier| barrier.shard)
+            .expect("deferred ticket should have one shard barrier");
+        let mut probe_ticket = ticket.clone();
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("listener bind should succeed");
@@ -4619,14 +4686,7 @@ mod tests {
             .pending_runtime_requests
             .push(super::PendingRuntimeRequest {
                 request_id: 1,
-                ticket: crate::app::RuntimeReplyTicket {
-                    db: 0,
-                    txid: None,
-                    protocol: ClientProtocol::Resp,
-                    frame: frame.clone(),
-                    barriers: vec![crate::app::RuntimeSequenceBarrier { shard, sequence }],
-                    aggregation: crate::app::RuntimeReplyAggregation::Worker { shard, sequence },
-                },
+                ticket,
             });
 
         let poll = Poll::new().expect("poll creation should succeed");
@@ -4641,29 +4701,23 @@ mod tests {
             &event_sender,
         );
         assert_that!(io_state.detached_runtime_tickets.len(), eq(1_usize));
-
-        app_executor.with_app(|app| {
-            app.runtime
-                .wait_until_processed_sequence(shard, sequence)
-                .expect("runtime should process deferred request");
-        });
-        assert_that!(
-            app_executor.with_app(|app| app
-                .runtime
-                .pending_reply_count(shard)
-                .expect("pending reply count should be available"))
-                >= 1,
-            eq(true)
-        );
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        let mut reply_ready = false;
+        while std::time::Instant::now() < deadline {
+            if app_executor
+                .runtime_reply_ticket_ready(&mut probe_ticket)
+                .expect("runtime readiness probe should succeed")
+            {
+                reply_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_that!(reply_ready, eq(true));
 
         super::reap_detached_runtime_replies(&app_executor, &mut io_state);
         assert_that!(io_state.detached_runtime_tickets.is_empty(), eq(true));
-        assert_that!(
-            app_executor.with_app(|app| app
-                .runtime
-                .pending_reply_count(shard)
-                .expect("pending reply count should be available")),
-            eq(0_usize)
-        );
+        let missing_after_reap = app_executor.take_runtime_reply_ticket_ready(&mut probe_ticket);
+        assert_that!(missing_after_reap.is_err(), eq(true));
     }
 }

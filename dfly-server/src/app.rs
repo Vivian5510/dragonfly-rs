@@ -6,7 +6,6 @@ use crate::network::{NetworkProactorPool, ServerReactorConfig};
 use dfly_cluster::ClusterModule;
 use dfly_cluster::slot::key_slot;
 use dfly_common::config::{ClusterMode, RuntimeConfig};
-use dfly_common::error::DflyError;
 use dfly_common::error::DflyResult;
 use dfly_common::ids::TxId;
 use dfly_core::CommandRouting;
@@ -18,7 +17,7 @@ use dfly_facade::FacadeModule;
 use dfly_facade::connection::ConnectionContext;
 use dfly_facade::connection::ConnectionState;
 use dfly_facade::net_proactor::{NetworkProactorConfig, select_multiplex_backend};
-use dfly_facade::protocol::{ClientProtocol, ParseStatus, ParsedCommand, parse_next_command};
+use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
 use dfly_replication::state::{FlowSyncType, SyncSessionError};
@@ -298,11 +297,6 @@ impl AppExecutor {
     pub fn startup_summary(&self) -> String {
         self.app.startup_summary()
     }
-
-    /// Runs one read-only closure against the underlying app under synchronization.
-    pub fn with_app<R>(&self, f: impl FnOnce(&ServerApp) -> R) -> R {
-        f(&self.app)
-    }
 }
 
 impl ServerApp {
@@ -313,8 +307,9 @@ impl ServerApp {
         let core = SharedCore::new(config.shard_count);
         let runtime_core = core.clone();
         let maintenance_core = core.clone();
-        let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance(
+        let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance_and_queue_limit(
             config.shard_count,
+            config.runtime_queue_soft_limit,
             move |envelope| {
                 runtime_core.execute_on_shard_in_db(
                     envelope.target_shard,
@@ -395,71 +390,11 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         )
     }
 
-    /// Builds serialized snapshot bytes from current in-memory core state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when snapshot payload encoding fails.
-    pub fn create_snapshot_bytes(&self) -> DflyResult<Vec<u8>> {
-        let snapshot = self.core.export_snapshot();
-        self.storage.serialize_snapshot(&snapshot)
-    }
-
-    /// Replaces current in-memory state by decoding and importing snapshot bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when payload cannot be decoded or contains invalid shard ids.
-    pub fn load_snapshot_bytes(&self, payload: &[u8]) -> DflyResult<()> {
-        let snapshot = self.storage.deserialize_snapshot(payload)?;
-        self.install_snapshot(&snapshot)
-    }
-
     fn install_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
         self.core.import_snapshot(snapshot)?;
         self.replication_guard_with_latest_journal()
             .reset_after_snapshot_load();
         Ok(())
-    }
-
-    /// Replays currently buffered replication journal entries into the in-memory core state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when a journal payload is not a valid single RESP command
-    /// or when command execution returns an error reply.
-    pub fn recover_from_replication_journal(&self) -> DflyResult<usize> {
-        let entries = self
-            .replication_guard_with_latest_journal()
-            .journal_entries();
-        self.replay_journal_entries(&entries)
-    }
-
-    /// Replays journal entries from one specific starting LSN (inclusive).
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::Protocol` when starting LSN is stale (already evicted from backlog),
-    /// when payload parsing fails, or when replayed command execution fails.
-    pub fn recover_from_replication_journal_from_lsn(&self, start_lsn: u64) -> DflyResult<usize> {
-        let replication = self.replication_guard_with_latest_journal();
-        let current_lsn = replication.journal_lsn();
-        if start_lsn == current_lsn {
-            return Ok(0);
-        }
-        if !replication.journal_contains_lsn(start_lsn) {
-            return Err(DflyError::Protocol(format!(
-                "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
-            )));
-        }
-
-        let Some(entries) = replication.journal_entries_from_lsn(start_lsn) else {
-            return Err(DflyError::Protocol(format!(
-                "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
-            )));
-        };
-        drop(replication);
-        self.replay_journal_entries(&entries)
     }
 
     /// Creates a new logical client connection state.
@@ -2099,26 +2034,6 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             })
     }
 
-    fn replay_journal_entries(&self, entries: &[JournalEntry]) -> DflyResult<usize> {
-        let mut applied = 0_usize;
-        for entry in entries {
-            if matches!(entry.op, JournalOp::Ping | JournalOp::Lsn) {
-                continue;
-            }
-
-            let frame = parse_journal_command_frame(&entry.payload)?;
-            let reply = self.execute_replay_command_without_journal(entry.db, &frame);
-            if let CommandReply::Error(message) = reply {
-                return Err(DflyError::Protocol(format!(
-                    "journal replay failed for txid {}: {message}",
-                    entry.txid
-                )));
-            }
-            applied = applied.saturating_add(1);
-        }
-        Ok(applied)
-    }
-
     fn allocate_txid(&self) -> TxId {
         self.next_txid.fetch_add(1, Ordering::AcqRel)
     }
@@ -2503,22 +2418,6 @@ fn append_resp_bulk(output: &mut Vec<u8>, payload: &[u8]) {
     output.extend_from_slice(b"\r\n");
 }
 
-fn parse_journal_command_frame(payload: &[u8]) -> DflyResult<CommandFrame> {
-    let parsed = parse_next_command(ClientProtocol::Resp, payload)?;
-    let ParseStatus::Complete { command, consumed } = parsed else {
-        return Err(DflyError::Protocol(
-            "journal payload does not contain one complete RESP command".to_owned(),
-        ));
-    };
-    if consumed != payload.len() {
-        return Err(DflyError::Protocol(
-            "journal payload must contain exactly one command".to_owned(),
-        ));
-    }
-
-    Ok(CommandFrame::new(command.name, command.args))
-}
-
 fn split_endpoint_host_port(endpoint: &str) -> (String, i64) {
     let Some((host, port_text)) = endpoint.rsplit_once(':') else {
         return (endpoint.to_owned(), 0);
@@ -2588,16 +2487,6 @@ pub fn run() -> DflyResult<()> {
         .memcached_port
         .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
     let app = AppExecutor::new(ServerApp::new(config.clone()));
-
-    // Keep subsystem initialization paths exercised in regular server startup.
-    app.with_app(|server| -> DflyResult<()> {
-        let snapshot = server.create_snapshot_bytes()?;
-        server.load_snapshot_bytes(&snapshot)?;
-        let _ = server.recover_from_replication_journal()?;
-        let current_lsn = server.replication_guard_with_latest_journal().journal_lsn();
-        let _ = server.recover_from_replication_journal_from_lsn(current_lsn)?;
-        Ok(())
-    })?;
 
     let worker_count = net_config
         .io_threads

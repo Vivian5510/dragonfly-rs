@@ -1,5 +1,6 @@
 //! Runtime envelopes for coordinator-to-shard dispatch.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -37,7 +38,8 @@ struct QueuedEnvelope {
 
 #[derive(Debug, Default)]
 struct ShardExecutionInner {
-    processed: Vec<RuntimeEnvelope>,
+    processed: VecDeque<RuntimeEnvelope>,
+    processed_total: usize,
     processed_sequence: u64,
     replies_by_sequence: std::collections::HashMap<u64, CommandReply>,
 }
@@ -94,7 +96,8 @@ type RuntimeExecutor = dyn Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync;
 type RuntimeMaintenance = dyn Fn(ShardId) + Send + Sync;
 const SHARD_WORKER_YIELD_INTERVAL: usize = 64;
 const SHARD_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
-const DEFAULT_QUEUE_SOFT_LIMIT: usize = usize::MAX;
+const DEFAULT_QUEUE_SOFT_LIMIT: usize = 8192;
+const PROCESSED_LOG_CAPACITY: usize = 1024;
 
 fn update_peak_pending(peak: &AtomicUsize, candidate: usize) {
     let mut observed = peak.load(Ordering::Acquire);
@@ -196,16 +199,38 @@ impl InMemoryShardRuntime {
         F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
         M: Fn(ShardId) + Send + Sync + 'static,
     {
-        Self::new_with_executor_and_maintenance_interval(
+        Self::new_with_executor_and_maintenance_and_queue_limit(
             shard_count,
+            DEFAULT_QUEUE_SOFT_LIMIT,
+            executor,
+            maintenance,
+        )
+    }
+
+    /// Creates one runtime with custom worker executor, maintenance callback and queue pressure limit.
+    #[must_use]
+    pub fn new_with_executor_and_maintenance_and_queue_limit<F, M>(
+        shard_count: ShardCount,
+        queue_soft_limit: usize,
+        executor: F,
+        maintenance: M,
+    ) -> Self
+    where
+        F: Fn(&RuntimeEnvelope) -> CommandReply + Send + Sync + 'static,
+        M: Fn(ShardId) + Send + Sync + 'static,
+    {
+        Self::new_with_executor_and_maintenance_interval_and_queue_limit(
+            shard_count,
+            queue_soft_limit,
             executor,
             maintenance,
             SHARD_MAINTENANCE_INTERVAL,
         )
     }
 
-    fn new_with_executor_and_maintenance_interval<F, M>(
+    fn new_with_executor_and_maintenance_interval_and_queue_limit<F, M>(
         shard_count: ShardCount,
+        queue_soft_limit: usize,
         executor: F,
         maintenance: M,
         maintenance_interval: Duration,
@@ -221,7 +246,7 @@ impl InMemoryShardRuntime {
             &executor,
             Some(&maintenance),
             maintenance_interval,
-            DEFAULT_QUEUE_SOFT_LIMIT,
+            queue_soft_limit.max(1),
         )
     }
 
@@ -275,7 +300,7 @@ impl InMemoryShardRuntime {
 
         Self {
             shard_count,
-            queue_soft_limit,
+            queue_soft_limit: queue_soft_limit.max(1),
             senders,
             execution_per_shard,
             queue_metrics_per_shard,
@@ -299,7 +324,7 @@ impl InMemoryShardRuntime {
             .inner
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(std::mem::take(&mut guard.processed))
+        Ok(guard.processed.drain(..).collect())
     }
 
     /// Returns current number of processed envelopes for one shard.
@@ -317,7 +342,7 @@ impl InMemoryShardRuntime {
             .inner
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(guard.processed.len())
+        Ok(guard.processed_total)
     }
 
     /// Returns current number of unconsumed worker replies buffered for one shard.
@@ -423,9 +448,9 @@ impl InMemoryShardRuntime {
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
         let (guard, _) = state
             .changed
-            .wait_timeout_while(guard, timeout, |inner| inner.processed.len() < minimum)
+            .wait_timeout_while(guard, timeout, |inner| inner.processed_total < minimum)
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(guard.processed.len() >= minimum)
+        Ok(guard.processed_total >= minimum)
     }
 
     /// Submits one envelope and returns per-shard submission sequence.
@@ -455,9 +480,7 @@ impl InMemoryShardRuntime {
 
         let queue_soft_limit = self.queue_soft_limit;
         let mut blocked_submitter_marked = false;
-        while queue_soft_limit != usize::MAX
-            && queue_metrics.pending.load(Ordering::Acquire) >= queue_soft_limit
-        {
+        while queue_metrics.pending.load(Ordering::Acquire) >= queue_soft_limit {
             if !blocked_submitter_marked {
                 let _ = queue_metrics
                     .blocked_submitters
@@ -745,7 +768,11 @@ async fn shard_execution_fiber(
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.processed.push(envelope);
+            if guard.processed.len() >= PROCESSED_LOG_CAPACITY {
+                let _ = guard.processed.pop_front();
+            }
+            guard.processed.push_back(envelope);
+            guard.processed_total = guard.processed_total.saturating_add(1);
             guard.processed_sequence = queued.sequence;
             if let Some(reply) = reply {
                 let _ = guard.replies_by_sequence.insert(queued.sequence, reply);
@@ -801,7 +828,10 @@ async fn execute_envelope_in_worker_fiber(
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryShardRuntime, RuntimeEnvelope, SHARD_WORKER_YIELD_INTERVAL, ShardRuntime};
+    use super::{
+        DEFAULT_QUEUE_SOFT_LIMIT, InMemoryShardRuntime, RuntimeEnvelope,
+        SHARD_WORKER_YIELD_INTERVAL, ShardRuntime,
+    };
     use crate::command::{CommandFrame, CommandReply};
     use dfly_common::ids::ShardCount;
     use googletest::prelude::*;
@@ -1312,16 +1342,18 @@ mod tests {
                 .collect::<Vec<AtomicUsize>>(),
         );
         let counters_for_maintenance = Arc::clone(&counters);
-        let runtime = InMemoryShardRuntime::new_with_executor_and_maintenance_interval(
-            ShardCount::new(2).expect("count should be valid"),
-            |_envelope| CommandReply::SimpleString("QUEUED".to_owned()),
-            move |shard| {
-                if let Some(counter) = counters_for_maintenance.get(usize::from(shard)) {
-                    let _ = counter.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-            Duration::from_millis(5),
-        );
+        let runtime =
+            InMemoryShardRuntime::new_with_executor_and_maintenance_interval_and_queue_limit(
+                ShardCount::new(2).expect("count should be valid"),
+                DEFAULT_QUEUE_SOFT_LIMIT,
+                |_envelope| CommandReply::SimpleString("QUEUED".to_owned()),
+                move |shard| {
+                    if let Some(counter) = counters_for_maintenance.get(usize::from(shard)) {
+                        let _ = counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                Duration::from_millis(5),
+            );
 
         let mut observed = false;
         for _ in 0..40 {

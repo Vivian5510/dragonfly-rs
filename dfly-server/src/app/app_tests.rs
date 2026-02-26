@@ -5,7 +5,7 @@ use dfly_common::config::{ClusterMode, RuntimeConfig};
 use dfly_common::error::DflyError;
 use dfly_core::command::{CommandFrame, CommandReply};
 use dfly_facade::protocol::ClientProtocol;
-use dfly_replication::journal::{InMemoryJournal, JournalEntry, JournalOp};
+use dfly_replication::journal::{InMemoryJournal, JournalOp};
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use googletest::prelude::*;
@@ -6603,6 +6603,9 @@ fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
 
 #[rstest]
 fn server_snapshot_roundtrip_restores_data_across_databases() {
+    let path = unique_test_snapshot_path("snapshot-roundtrip-cross-db");
+    let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+
     let mut source = ServerApp::new(RuntimeConfig::default());
     let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
 
@@ -6625,16 +6628,24 @@ fn server_snapshot_roundtrip_restores_data_across_databases() {
     )
     .expect("db2 SET should succeed");
 
-    let snapshot_bytes = source
-        .create_snapshot_bytes()
-        .expect("snapshot export should succeed");
+    let save_reply = ingress_connection_bytes(
+        &mut source,
+        &mut source_connection,
+        &resp_command(&[b"DFLY", b"SAVE", &path_bytes]),
+    )
+    .expect("DFLY SAVE should succeed");
+    assert_that!(&save_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
     let mut restored = ServerApp::new(RuntimeConfig::default());
-    restored
-        .load_snapshot_bytes(&snapshot_bytes)
-        .expect("snapshot import should succeed");
-
     let mut restored_connection = ServerApp::new_connection(ClientProtocol::Resp);
+    let load_reply = ingress_connection_bytes(
+        &mut restored,
+        &mut restored_connection,
+        &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+    )
+    .expect("DFLY LOAD should succeed");
+    assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
+
     let db0_get = ingress_connection_bytes(
         &mut restored,
         &mut restored_connection,
@@ -6656,19 +6667,29 @@ fn server_snapshot_roundtrip_restores_data_across_databases() {
     )
     .expect("db2 GET should succeed");
     assert_that!(&db2_get, eq(&vec![b"$3\r\ndb2\r\n".to_vec()]));
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[rstest]
 fn server_snapshot_load_rejects_malformed_payload() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    let error = app
-        .load_snapshot_bytes(b"not-a-snapshot")
-        .expect_err("invalid bytes should fail");
+    let path = unique_test_snapshot_path("snapshot-malformed");
+    std::fs::write(&path, b"not-a-snapshot").expect("write malformed payload should succeed");
+    let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
-    let DflyError::Protocol(message) = error else {
-        panic!("expected protocol error");
-    };
-    assert_that!(message.contains("snapshot payload error"), eq(true));
+    let reply = ingress_connection_bytes(
+        &mut app,
+        &mut connection,
+        &resp_command(&[b"DFLY", b"LOAD", &path_bytes]),
+    )
+    .expect("DFLY LOAD should parse");
+    assert_that!(reply.len(), eq(1_usize));
+    let payload = std::str::from_utf8(&reply[0]).expect("reply should be valid UTF-8");
+    assert_that!(payload.contains("snapshot payload error"), eq(true));
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[rstest]
@@ -7408,391 +7429,6 @@ fn resp_dfly_load_resets_replication_state() {
     );
 
     let _ = std::fs::remove_file(path);
-}
-
-#[rstest]
-fn journal_replay_restores_state_in_fresh_server() {
-    let mut source = ServerApp::new(RuntimeConfig::default());
-    let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
-
-    let _ = ingress_connection_bytes(
-        &mut source,
-        &mut source_connection,
-        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-    )
-    .expect("SET should succeed");
-    let _ = ingress_connection_bytes(
-        &mut source,
-        &mut source_connection,
-        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
-    )
-    .expect("SELECT should succeed");
-    let _ = ingress_connection_bytes(
-        &mut source,
-        &mut source_connection,
-        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
-    )
-    .expect("SET should succeed");
-
-    let entries = source
-        .replication_guard_with_latest_journal()
-        .journal_entries();
-
-    let mut restored = ServerApp::new(RuntimeConfig::default());
-    for entry in entries {
-        restored
-            .replication_guard_with_latest_journal()
-            .append_journal(entry);
-    }
-    let applied = restored
-        .recover_from_replication_journal()
-        .expect("journal replay should succeed");
-    assert_that!(applied, eq(2_usize));
-
-    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let db0 = ingress_connection_bytes(
-        &mut restored,
-        &mut connection,
-        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
-    )
-    .expect("GET in db0 should succeed");
-    assert_that!(&db0, eq(&vec![b"$3\r\nbar\r\n".to_vec()]));
-
-    let _ = ingress_connection_bytes(
-        &mut restored,
-        &mut connection,
-        b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
-    )
-    .expect("SELECT should succeed");
-    let db1 = ingress_connection_bytes(
-        &mut restored,
-        &mut connection,
-        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
-    )
-    .expect("GET in db1 should succeed");
-    assert_that!(&db1, eq(&vec![b"$3\r\nbaz\r\n".to_vec()]));
-}
-
-#[rstest]
-fn journal_replay_from_lsn_applies_only_suffix() {
-    let mut source = ServerApp::new(RuntimeConfig::default());
-    let mut source_connection = ServerApp::new_connection(ClientProtocol::Resp);
-
-    let _ = ingress_connection_bytes(
-        &mut source,
-        &mut source_connection,
-        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
-    )
-    .expect("first SET should succeed");
-    let start_lsn = source.replication_guard_with_latest_journal().journal_lsn();
-    let _ = ingress_connection_bytes(
-        &mut source,
-        &mut source_connection,
-        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n",
-    )
-    .expect("second SET should succeed");
-
-    let entries = source
-        .replication_guard_with_latest_journal()
-        .journal_entries();
-    let mut restored = ServerApp::new(RuntimeConfig::default());
-    for entry in entries {
-        restored
-            .replication_guard_with_latest_journal()
-            .append_journal(entry);
-    }
-
-    let applied = restored
-        .recover_from_replication_journal_from_lsn(start_lsn)
-        .expect("journal suffix replay should succeed");
-    assert_that!(applied, eq(1_usize));
-
-    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
-    let get_reply = ingress_connection_bytes(
-        &mut restored,
-        &mut connection,
-        b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
-    )
-    .expect("GET should succeed");
-    assert_that!(&get_reply, eq(&vec![b"$3\r\nnew\r\n".to_vec()]));
-}
-
-#[rstest]
-fn journal_replay_from_lsn_rejects_stale_cursor() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard_with_latest_journal().journal = InMemoryJournal::with_backlog(1);
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload: resp_command(&[b"SET", b"a", b"1"]),
-        });
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 2,
-            db: 0,
-            op: JournalOp::Command,
-            payload: resp_command(&[b"SET", b"a", b"2"]),
-        });
-
-    let error = app
-        .recover_from_replication_journal_from_lsn(1)
-        .expect_err("stale backlog cursor must fail");
-    let DflyError::Protocol(message) = error else {
-        panic!("expected protocol error");
-    };
-    assert_that!(message.contains("not available"), eq(true));
-}
-
-#[rstest]
-fn journal_replay_dispatches_runtime_for_single_key_command() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    let key = b"journal:rt:set".to_vec();
-    let shard = app.core.resolve_shard_for_key(&key);
-    let payload = resp_command(&[b"SET", &key, b"value"]);
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload,
-        });
-    assert_that!(
-        app.replication_guard_with_latest_journal()
-            .journal_entries()
-            .len(),
-        eq(1_usize)
-    );
-
-    let applied = app
-        .recover_from_replication_journal()
-        .expect("journal replay should succeed");
-    assert_that!(applied, eq(1_usize));
-    assert_that!(
-        app.replication_guard_with_latest_journal()
-            .journal_entries()
-            .len(),
-        eq(1_usize)
-    );
-    assert_that!(
-        app.runtime
-            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
-            .expect("wait should succeed"),
-        eq(true)
-    );
-    let runtime = app
-        .runtime
-        .drain_processed_for_shard(shard)
-        .expect("drain should succeed");
-    assert_that!(runtime.len(), eq(1_usize));
-    assert_that!(&runtime[0].command.name, eq(&"SET".to_owned()));
-    assert_that!(runtime[0].execute_on_worker, eq(true));
-}
-
-#[rstest]
-fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    let first_key = b"journal:rt:mset:1".to_vec();
-    let first_shard = app.core.resolve_shard_for_key(&first_key);
-    let mut second_key = b"journal:rt:mset:2".to_vec();
-    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
-    let mut suffix = 0_u32;
-    while second_shard == first_shard {
-        suffix = suffix.saturating_add(1);
-        second_key = format!("journal:rt:mset:2:{suffix}").into_bytes();
-        second_shard = app.core.resolve_shard_for_key(&second_key);
-    }
-
-    let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload,
-        });
-
-    let applied = app
-        .recover_from_replication_journal()
-        .expect("journal replay should succeed");
-    assert_that!(applied, eq(1_usize));
-    assert_that!(
-        app.runtime
-            .wait_for_processed_count(first_shard, 1, Duration::from_millis(200))
-            .expect("wait should succeed"),
-        eq(true)
-    );
-    assert_that!(
-        app.runtime
-            .wait_for_processed_count(second_shard, 1, Duration::from_millis(200))
-            .expect("wait should succeed"),
-        eq(true)
-    );
-    let first_runtime = app
-        .runtime
-        .drain_processed_for_shard(first_shard)
-        .expect("drain should succeed");
-    let second_runtime = app
-        .runtime
-        .drain_processed_for_shard(second_shard)
-        .expect("drain should succeed");
-    assert_that!(first_runtime.len(), eq(1_usize));
-    assert_that!(second_runtime.len(), eq(1_usize));
-    assert_that!(&first_runtime[0].command.name, eq(&"MSET".to_owned()));
-    assert_that!(&second_runtime[0].command.name, eq(&"MSET".to_owned()));
-    assert_that!(
-        &first_runtime[0].command.args,
-        eq(&vec![first_key.clone(), b"a".to_vec()])
-    );
-    assert_that!(
-        &second_runtime[0].command.args,
-        eq(&vec![second_key.clone(), b"b".to_vec()])
-    );
-    assert_that!(first_runtime[0].execute_on_worker, eq(true));
-    assert_that!(second_runtime[0].execute_on_worker, eq(true));
-}
-
-#[rstest]
-fn journal_replay_executes_same_shard_multikey_command_on_worker() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    let first_key = b"journal:rt:mset:same:1".to_vec();
-    let shard = app.core.resolve_shard_for_key(&first_key);
-    let mut second_key = b"journal:rt:mset:same:2".to_vec();
-    let mut second_shard = app.core.resolve_shard_for_key(&second_key);
-    let mut suffix = 0_u32;
-    while second_shard != shard {
-        suffix = suffix.saturating_add(1);
-        second_key = format!("journal:rt:mset:same:2:{suffix}").into_bytes();
-        second_shard = app.core.resolve_shard_for_key(&second_key);
-    }
-
-    let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload,
-        });
-
-    let applied = app
-        .recover_from_replication_journal()
-        .expect("journal replay should succeed");
-    assert_that!(applied, eq(1_usize));
-    assert_that!(
-        app.runtime
-            .wait_for_processed_count(shard, 1, Duration::from_millis(200))
-            .expect("wait should succeed"),
-        eq(true)
-    );
-    let runtime = app
-        .runtime
-        .drain_processed_for_shard(shard)
-        .expect("drain should succeed");
-    assert_that!(runtime.len(), eq(1_usize));
-    assert_that!(&runtime[0].command.name, eq(&"MSET".to_owned()));
-    assert_that!(runtime[0].execute_on_worker, eq(true));
-
-    let first_value = app
-        .core
-        .execute_in_db(0, &CommandFrame::new("GET", vec![first_key.clone()]));
-    let second_value = app
-        .core
-        .execute_in_db(0, &CommandFrame::new("GET", vec![second_key.clone()]));
-    assert_that!(&first_value, eq(&CommandReply::BulkString(b"a".to_vec())));
-    assert_that!(&second_value, eq(&CommandReply::BulkString(b"b".to_vec())));
-}
-
-#[rstest]
-fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    let key = b"journal:recovery:barrier".to_vec();
-    let shard = app.core.resolve_shard_for_key(&key);
-    let blocking_plan = TransactionPlan {
-        txid: 900,
-        mode: TransactionMode::LockAhead,
-        hops: vec![TransactionHop {
-            per_shard: vec![(
-                shard,
-                CommandFrame::new("SET", vec![key.clone(), b"pending".to_vec()]),
-            )],
-        }],
-        touched_shards: vec![shard],
-    };
-    assert_that!(
-        app.transaction.scheduler.schedule(&blocking_plan).is_ok(),
-        eq(true)
-    );
-
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload: resp_command(&[b"SET", &key, b"replayed"]),
-        });
-
-    let applied = app
-        .recover_from_replication_journal()
-        .expect("recovery replay should bypass scheduler barrier");
-    assert_that!(applied, eq(1_usize));
-    let value = app
-        .core
-        .execute_in_db(0, &CommandFrame::new("GET", vec![key.clone()]));
-    assert_that!(&value, eq(&CommandReply::BulkString(b"replayed".to_vec())));
-
-    assert_that!(
-        app.transaction
-            .scheduler
-            .conclude(blocking_plan.txid)
-            .is_ok(),
-        eq(true)
-    );
-}
-
-#[rstest]
-fn journal_replay_rejects_malformed_payload() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Command,
-            payload: b"not-resp".to_vec(),
-        });
-
-    let error = app
-        .recover_from_replication_journal()
-        .expect_err("invalid journal payload must fail");
-    let DflyError::Protocol(message) = error else {
-        panic!("expected protocol error");
-    };
-    assert_that!(message.contains("RESP"), eq(true));
-}
-
-#[rstest]
-fn journal_replay_skips_ping_and_lsn_entries() {
-    let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 1,
-            db: 0,
-            op: JournalOp::Ping,
-            payload: Vec::new(),
-        });
-    app.replication_guard_with_latest_journal()
-        .append_journal(JournalEntry {
-            txid: 2,
-            db: 0,
-            op: JournalOp::Lsn,
-            payload: Vec::new(),
-        });
-
-    let applied = app
-        .recover_from_replication_journal()
-        .expect("non-command entries should be skipped");
-    assert_that!(applied, eq(0_usize));
 }
 
 fn resp_command(parts: &[&[u8]]) -> Vec<u8> {

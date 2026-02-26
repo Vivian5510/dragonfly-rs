@@ -1734,69 +1734,12 @@ impl ServerApp {
         self.execute_runtime_command_on_worker_shard(db, frame, shard, enforce_scheduler_barrier)
     }
 
-    fn replay_same_shard_runtime_target(&self, frame: &CommandFrame) -> Option<u16> {
-        self.same_shard_multikey_count_target_shard(frame)
-            .or_else(|| self.same_shard_multikey_string_target_shard(frame))
-    }
-
-    pub(super) fn execute_replay_command_without_journal(
-        &self,
-        db: u16,
-        frame: &CommandFrame,
-    ) -> CommandReply {
-        if matches!(
-            self.core.command_routing(frame),
-            CommandRouting::SingleKey { .. }
-        ) {
-            return self.execute_single_shard_command_via_runtime_internal(db, frame, false);
-        }
-        if let Some(reply) = self.execute_copy_rename_via_runtime(db, frame, false) {
-            return reply;
-        }
-        if let Some(shard) = self.replay_same_shard_runtime_target(frame) {
-            return self.execute_runtime_command_on_worker_shard(db, frame, shard, false);
-        }
-        if let Some(reply) =
-            self.execute_multikey_string_commands_via_runtime_internal(db, frame, false)
-        {
-            return reply;
-        }
-        if let Some(reply) =
-            self.execute_multi_key_counting_command_via_runtime_internal(db, frame, false)
-        {
-            return reply;
-        }
-
-        let runtime_reply = match self.dispatch_replay_command_runtime(db, frame) {
-            Ok(reply) => reply,
-            Err(error) => {
-                return CommandReply::Error(format!("runtime dispatch failed: {error}"));
-            }
-        };
-        if let Some(reply) = runtime_reply {
-            return reply;
-        }
-
-        self.execute_command_without_side_effects(db, frame)
-    }
-
     pub(super) fn dispatch_direct_command_runtime(
         &self,
         db: u16,
         frame: &CommandFrame,
     ) -> DflyResult<Option<CommandReply>> {
         self.dispatch_runtime_for_command(db, frame, true)
-    }
-
-    pub(super) fn dispatch_replay_command_runtime(
-        &self,
-        db: u16,
-        frame: &CommandFrame,
-    ) -> DflyResult<Option<CommandReply>> {
-        // Recovery replay must stay independent from live transaction queue ownership checks.
-        // During restore we rebuild state from persisted journal entries and should not depend
-        // on transient in-memory scheduler leases.
-        self.dispatch_runtime_for_command(db, frame, false)
     }
 
     fn dispatch_runtime_for_command_deferred(

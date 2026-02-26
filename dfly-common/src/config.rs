@@ -38,6 +38,8 @@ pub struct RuntimeConfig {
     pub conn_use_peer_hash_affinity: bool,
     /// Whether controlled connection migration is enabled.
     pub migrate_connections: bool,
+    /// Per-shard runtime queue soft limit before submitters start to block.
+    pub runtime_queue_soft_limit: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -53,6 +55,7 @@ impl Default for RuntimeConfig {
             conn_io_thread_start: 0,
             conn_use_peer_hash_affinity: false,
             migrate_connections: false,
+            runtime_queue_soft_limit: 8192,
         }
     }
 }
