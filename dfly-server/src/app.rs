@@ -1,8 +1,9 @@
 //! Process composition root for `dfly-server`.
 
 mod runtime_exec;
+mod bootstrap;
+mod protocol_reply;
 
-use crate::network::{NetworkProactorPool, ServerReactorConfig};
 use dfly_cluster::ClusterModule;
 use dfly_cluster::slot::key_slot;
 use dfly_common::config::{ClusterMode, RuntimeConfig};
@@ -16,7 +17,6 @@ use dfly_core::runtime::InMemoryShardRuntime;
 use dfly_facade::FacadeModule;
 use dfly_facade::connection::ConnectionContext;
 use dfly_facade::connection::ConnectionState;
-use dfly_facade::net_proactor::{NetworkProactorConfig, select_multiplex_backend};
 use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
 use dfly_replication::ReplicationModule;
 use dfly_replication::journal::{JournalEntry, JournalOp};
@@ -34,6 +34,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use protocol_reply::{encode_reply_for_protocol, serialize_command_frame, split_endpoint_host_port};
 
 const ACTIVE_EXPIRE_KEYS_PER_TICK: usize = 64;
 const JOURNAL_APPEND_BATCH_SIZE: usize = 256;
@@ -706,30 +708,37 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn validate_non_core_queued_command(frame: &CommandFrame) -> Result<(), String> {
-        match frame.name.as_str() {
-            "INFO" => Ok(()),
-            "KEYS" => (frame.args.len() == 1)
+        match app_command_kind(frame.name.as_str()) {
+            AppCommandKind::Info => Ok(()),
+            AppCommandKind::Keys => (frame.args.len() == 1)
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message("KEYS")),
-            "TIME" | "ROLE" | "READONLY" | "READWRITE" | "DBSIZE" | "RANDOMKEY" => frame
+            AppCommandKind::Time
+            | AppCommandKind::Role
+            | AppCommandKind::ReadOnly
+            | AppCommandKind::ReadWrite
+            | AppCommandKind::DbSize
+            | AppCommandKind::RandomKey => frame
                 .args
                 .is_empty()
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
-            "PSYNC" | "WAIT" => (frame.args.len() == 2)
+            AppCommandKind::Psync | AppCommandKind::Wait => (frame.args.len() == 2)
                 .then_some(())
                 .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
-            "CLUSTER" | "DFLY" | "MGET" => (!frame.args.is_empty())
+            AppCommandKind::Cluster | AppCommandKind::Dfly | AppCommandKind::Mget => {
+                (!frame.args.is_empty())
                 .then_some(())
-                .ok_or_else(|| wrong_arity_message(frame.name.as_str())),
-            "MSET" | "MSETNX" => {
+                .ok_or_else(|| wrong_arity_message(frame.name.as_str()))
+            }
+            AppCommandKind::Mset | AppCommandKind::MsetNx => {
                 if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
                     Err(wrong_arity_message(frame.name.as_str()))
                 } else {
                     Ok(())
                 }
             }
-            "REPLCONF" => {
+            AppCommandKind::ReplConf => {
                 if frame.args.is_empty() || !frame.args.len().is_multiple_of(2) {
                     Err("syntax error".to_owned())
                 } else {
@@ -888,35 +897,32 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     }
 
     fn execute_command_without_side_effects(&self, db: u16, frame: &CommandFrame) -> CommandReply {
-        match frame.name.as_str() {
-            "INFO" => self.execute_info(frame),
-            "TIME" => Self::execute_time(frame),
-            "ROLE" => self.execute_role(frame),
-            "READONLY" => Self::execute_readonly(frame),
-            "READWRITE" => self.execute_readwrite(frame),
-            "DBSIZE" => self.execute_dbsize(db, frame),
-            "KEYS" => self.execute_keys(db, frame),
-            "RANDOMKEY" => self.execute_randomkey(db, frame),
-            "FLUSHDB" => self.execute_flushdb(db, frame),
-            "FLUSHALL" => self.execute_flushall(frame),
-            "PSYNC" => self.execute_psync(frame),
-            "WAIT" => self.execute_wait(frame),
-            "CLUSTER" => self.execute_cluster(db, frame),
-            "DFLY" => self.execute_dfly_admin(frame),
-            "DEL" => self.execute_del(db, frame),
-            "UNLINK" => self.execute_unlink(db, frame),
-            "EXISTS" => self.execute_exists(db, frame),
-            "TOUCH" => self.execute_touch(db, frame),
-            "MGET" => self.execute_mget(db, frame),
-            "MSET" => self.execute_mset(db, frame),
-            "MSETNX" => self.execute_msetnx(db, frame),
-            "COPY" => self.execute_copy(db, frame),
-            "RENAME" | "RENAMENX" => self.execute_rename(db, frame),
-            "GET" | "SET" | "TYPE" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "APPEND"
-            | "STRLEN" | "MOVE" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
-            | "PEXPIREAT" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR"
-            | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => self.execute_key_command(db, frame),
-            _ => self.core.execute_in_db(db, frame),
+        match app_command_kind(frame.name.as_str()) {
+            AppCommandKind::Info => self.execute_info(frame),
+            AppCommandKind::Time => Self::execute_time(frame),
+            AppCommandKind::Role => self.execute_role(frame),
+            AppCommandKind::ReadOnly => Self::execute_readonly(frame),
+            AppCommandKind::ReadWrite => self.execute_readwrite(frame),
+            AppCommandKind::DbSize => self.execute_dbsize(db, frame),
+            AppCommandKind::Keys => self.execute_keys(db, frame),
+            AppCommandKind::RandomKey => self.execute_randomkey(db, frame),
+            AppCommandKind::FlushDb => self.execute_flushdb(db, frame),
+            AppCommandKind::FlushAll => self.execute_flushall(frame),
+            AppCommandKind::Psync => self.execute_psync(frame),
+            AppCommandKind::Wait => self.execute_wait(frame),
+            AppCommandKind::Cluster => self.execute_cluster(db, frame),
+            AppCommandKind::Dfly => self.execute_dfly_admin(frame),
+            AppCommandKind::Del => self.execute_del(db, frame),
+            AppCommandKind::Unlink => self.execute_unlink(db, frame),
+            AppCommandKind::Exists => self.execute_exists(db, frame),
+            AppCommandKind::Touch => self.execute_touch(db, frame),
+            AppCommandKind::Mget => self.execute_mget(db, frame),
+            AppCommandKind::Mset => self.execute_mset(db, frame),
+            AppCommandKind::MsetNx => self.execute_msetnx(db, frame),
+            AppCommandKind::Copy => self.execute_copy(db, frame),
+            AppCommandKind::Rename => self.execute_rename(db, frame),
+            AppCommandKind::KeyCommand => self.execute_key_command(db, frame),
+            AppCommandKind::Unknown | AppCommandKind::ReplConf => self.core.execute_in_db(db, frame),
         }
     }
 
@@ -2209,6 +2215,70 @@ fn wrong_arity_message(command_name: &str) -> String {
     format!("wrong number of arguments for '{command_name}' command")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommandKind {
+    Info,
+    Time,
+    Role,
+    ReadOnly,
+    ReadWrite,
+    DbSize,
+    Keys,
+    RandomKey,
+    FlushDb,
+    FlushAll,
+    Psync,
+    Wait,
+    Cluster,
+    Dfly,
+    ReplConf,
+    Del,
+    Unlink,
+    Exists,
+    Touch,
+    Mget,
+    Mset,
+    MsetNx,
+    Copy,
+    Rename,
+    KeyCommand,
+    Unknown,
+}
+
+fn app_command_kind(name: &str) -> AppCommandKind {
+    match name {
+        "INFO" => AppCommandKind::Info,
+        "TIME" => AppCommandKind::Time,
+        "ROLE" => AppCommandKind::Role,
+        "READONLY" => AppCommandKind::ReadOnly,
+        "READWRITE" => AppCommandKind::ReadWrite,
+        "DBSIZE" => AppCommandKind::DbSize,
+        "KEYS" => AppCommandKind::Keys,
+        "RANDOMKEY" => AppCommandKind::RandomKey,
+        "FLUSHDB" => AppCommandKind::FlushDb,
+        "FLUSHALL" => AppCommandKind::FlushAll,
+        "PSYNC" => AppCommandKind::Psync,
+        "WAIT" => AppCommandKind::Wait,
+        "CLUSTER" => AppCommandKind::Cluster,
+        "DFLY" => AppCommandKind::Dfly,
+        "REPLCONF" => AppCommandKind::ReplConf,
+        "DEL" => AppCommandKind::Del,
+        "UNLINK" => AppCommandKind::Unlink,
+        "EXISTS" => AppCommandKind::Exists,
+        "TOUCH" => AppCommandKind::Touch,
+        "MGET" => AppCommandKind::Mget,
+        "MSET" => AppCommandKind::Mset,
+        "MSETNX" => AppCommandKind::MsetNx,
+        "COPY" => AppCommandKind::Copy,
+        "RENAME" | "RENAMENX" => AppCommandKind::Rename,
+        "GET" | "SET" | "TYPE" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "APPEND"
+        | "STRLEN" | "MOVE" | "GETRANGE" | "SETRANGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+        | "PEXPIREAT" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "PERSIST" | "INCR"
+        | "DECR" | "INCRBY" | "DECRBY" | "SETNX" => AppCommandKind::KeyCommand,
+        _ => AppCommandKind::Unknown,
+    }
+}
+
 fn is_runtime_dispatch_error(reply: &CommandReply) -> bool {
     matches!(
         reply,
@@ -2259,56 +2329,84 @@ fn parse_flow_lsn_vector_for_flow(
 
 /// Returns journal op kind when the command mutated keyspace state.
 fn journal_op_for_command(frame: &CommandFrame, reply: &CommandReply) -> Option<JournalOp> {
-    match (frame.name.as_str(), reply) {
-        ("SET", _) if set_command_mutated(frame, reply) => Some(JournalOp::Command),
-        ("SETEX" | "PSETEX", CommandReply::SimpleString(ok)) if ok == "OK" => {
+    match (app_command_kind(frame.name.as_str()), reply) {
+        (AppCommandKind::KeyCommand, _) if frame.name == "SET" && set_command_mutated(frame, reply) => {
             Some(JournalOp::Command)
         }
-        ("RENAME", CommandReply::SimpleString(ok))
-            if ok == "OK" && frame.args.first() != frame.args.get(1) =>
+        (AppCommandKind::KeyCommand, CommandReply::SimpleString(ok))
+            if ok == "OK" && matches!(frame.name.as_str(), "SETEX" | "PSETEX") =>
         {
             Some(JournalOp::Command)
         }
-        ("SETNX" | "MSETNX" | "MOVE" | "RENAMENX" | "COPY", CommandReply::Integer(1))
-        | ("GETSET", CommandReply::Null | CommandReply::BulkString(_))
-        | ("GETDEL", CommandReply::BulkString(_))
-        | ("APPEND", CommandReply::Integer(_)) => Some(JournalOp::Command),
-        ("SETRANGE", CommandReply::Integer(_))
-            if frame.args.get(2).is_some_and(|arg| !arg.is_empty()) =>
+        (AppCommandKind::Rename, CommandReply::SimpleString(ok))
+            if frame.name == "RENAME" && ok == "OK" && frame.args.first() != frame.args.get(1) =>
         {
             Some(JournalOp::Command)
         }
-        ("EXPIREAT", CommandReply::Integer(1)) => {
+        (AppCommandKind::KeyCommand, CommandReply::Integer(1))
+            if matches!(frame.name.as_str(), "SETNX" | "MOVE") =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::MsetNx | AppCommandKind::Copy | AppCommandKind::Rename, CommandReply::Integer(1))
+            if matches!(frame.name.as_str(), "MSETNX" | "COPY" | "RENAMENX") =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::Null | CommandReply::BulkString(_))
+            if frame.name == "GETSET" =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::BulkString(_)) if frame.name == "GETDEL" => {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::Integer(_)) if frame.name == "APPEND" => {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::Integer(_))
+            if frame.name == "SETRANGE" && frame.args.get(2).is_some_and(|arg| !arg.is_empty()) =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::Integer(1)) if frame.name == "EXPIREAT" => {
             if expireat_is_delete(frame) {
                 Some(JournalOp::Expired)
             } else {
                 Some(JournalOp::Command)
             }
         }
-        ("PEXPIREAT", CommandReply::Integer(1)) => {
+        (AppCommandKind::KeyCommand, CommandReply::Integer(1)) if frame.name == "PEXPIREAT" => {
             if pexpireat_is_delete(frame) {
                 Some(JournalOp::Expired)
             } else {
                 Some(JournalOp::Command)
             }
         }
-        ("PEXPIRE", CommandReply::Integer(1)) => {
+        (AppCommandKind::KeyCommand, CommandReply::Integer(1)) if frame.name == "PEXPIRE" => {
             if pexpire_is_delete(frame) {
                 Some(JournalOp::Expired)
             } else {
                 Some(JournalOp::Command)
             }
         }
-        ("MSET", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("DEL" | "UNLINK", CommandReply::Integer(count)) if *count > 0 => Some(JournalOp::Command),
-        ("PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY", CommandReply::Integer(count))
+        (AppCommandKind::Mset, CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
+        (AppCommandKind::Del | AppCommandKind::Unlink, CommandReply::Integer(count))
             if *count > 0 =>
         {
             Some(JournalOp::Command)
         }
-        ("FLUSHDB", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("FLUSHALL", CommandReply::SimpleString(ok)) if ok == "OK" => Some(JournalOp::Command),
-        ("EXPIRE", CommandReply::Integer(1)) => {
+        (AppCommandKind::KeyCommand, CommandReply::Integer(count))
+            if *count > 0 && matches!(frame.name.as_str(), "PERSIST" | "INCR" | "DECR" | "INCRBY" | "DECRBY") =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::FlushDb | AppCommandKind::FlushAll, CommandReply::SimpleString(ok))
+            if ok == "OK" =>
+        {
+            Some(JournalOp::Command)
+        }
+        (AppCommandKind::KeyCommand, CommandReply::Integer(1)) if frame.name == "EXPIRE" => {
             if expire_is_delete(frame) {
                 Some(JournalOp::Expired)
             } else {
@@ -2402,127 +2500,13 @@ fn parse_db_index_arg(arg: &[u8]) -> Result<u16, String> {
     Ok(db_index)
 }
 
-/// Serializes one command frame as RESP array payload for journal replay.
-fn serialize_command_frame(frame: &CommandFrame) -> Vec<u8> {
-    let mut output = format!("*{}\r\n", frame.args.len() + 1).into_bytes();
-    append_resp_bulk(&mut output, frame.name.as_bytes());
-    for arg in &frame.args {
-        append_resp_bulk(&mut output, arg);
-    }
-    output
-}
-
-fn append_resp_bulk(output: &mut Vec<u8>, payload: &[u8]) {
-    output.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
-    output.extend_from_slice(payload);
-    output.extend_from_slice(b"\r\n");
-}
-
-fn split_endpoint_host_port(endpoint: &str) -> (String, i64) {
-    let Some((host, port_text)) = endpoint.rsplit_once(':') else {
-        return (endpoint.to_owned(), 0);
-    };
-    let port = port_text.parse::<i64>().unwrap_or(0);
-    (host.to_owned(), port)
-}
-
-/// Encodes a canonical reply according to the target client protocol.
-fn encode_reply_for_protocol(
-    protocol: ClientProtocol,
-    frame: &CommandFrame,
-    reply: CommandReply,
-) -> Vec<u8> {
-    match protocol {
-        ClientProtocol::Resp => reply.to_resp_bytes(),
-        ClientProtocol::Memcache => encode_memcache_reply(frame, reply),
-    }
-}
-
-/// Encodes replies in memcache text protocol style for supported command subset.
-fn encode_memcache_reply(frame: &CommandFrame, reply: CommandReply) -> Vec<u8> {
-    match (frame.name.as_str(), reply) {
-        ("SET", CommandReply::SimpleString(ok)) if ok == "OK" => b"STORED\r\n".to_vec(),
-        ("GET", CommandReply::BulkString(payload)) => {
-            if let Some(key) = frame.args.first() {
-                let key_text = String::from_utf8_lossy(key);
-                let mut output = format!("VALUE {key_text} 0 {}\r\n", payload.len()).into_bytes();
-                output.extend_from_slice(&payload);
-                output.extend_from_slice(b"\r\nEND\r\n");
-                return output;
-            }
-
-            // Defensive fallback for malformed frame shape: still return the payload.
-            let mut output = payload;
-            output.extend_from_slice(b"\r\n");
-            output
-        }
-        (_, CommandReply::SimpleString(message)) => format!("{message}\r\n").into_bytes(),
-        (_, CommandReply::Integer(value)) => format!("{value}\r\n").into_bytes(),
-        (_, CommandReply::BulkString(payload)) => {
-            let mut output = payload;
-            output.extend_from_slice(b"\r\n");
-            output
-        }
-        (_, CommandReply::Array(_)) => b"ERROR unsupported array reply\r\n".to_vec(),
-        (_, CommandReply::NullArray) => b"ERROR unsupported null array reply\r\n".to_vec(),
-        (_, CommandReply::Moved { slot, endpoint }) => {
-            format!("ERROR MOVED {slot} {endpoint}\r\n").into_bytes()
-        }
-        (_, CommandReply::Null) => b"END\r\n".to_vec(),
-        (_, CommandReply::Error(message)) => format!("ERROR {message}\r\n").into_bytes(),
-    }
-}
-
 /// Starts `dfly-server` process bootstrap.
 ///
 /// # Errors
 ///
 /// Returns `DflyError::Io` when listener bootstrap or reactor polling fails.
 pub fn run() -> DflyResult<()> {
-    let config = RuntimeConfig::default();
-    let backend_selection = select_multiplex_backend(&config);
-    let net_config = NetworkProactorConfig::from_runtime_config(&config);
-    let redis_bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.redis_port));
-    let memcache_bind_addr = config
-        .memcached_port
-        .map(|port| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
-    let app = AppExecutor::new(ServerApp::new(config.clone()));
-
-    let worker_count = net_config
-        .io_threads
-        .saturating_add(net_config.io_thread_start)
-        .max(1);
-    let reactor_config = ServerReactorConfig {
-        io_worker_count: worker_count,
-        io_worker_dispatch_start: net_config.io_thread_start,
-        io_worker_dispatch_count: net_config.io_threads,
-        use_peer_hash_dispatch: net_config.use_peer_hash_affinity,
-        enable_connection_migration: net_config.migrate_connections,
-        ..ServerReactorConfig::default()
-    };
-    let mut pool = NetworkProactorPool::bind_with_memcache(
-        redis_bind_addr,
-        memcache_bind_addr,
-        reactor_config,
-        backend_selection,
-        &app,
-    )?;
-    println!("{}", app.startup_summary());
-    if !cfg!(target_os = "linux") {
-        eprintln!(
-            "linux-first runtime: non-Linux host is development-only; use Linux/WSL2/container for production parity"
-        );
-    }
-    let selection = pool.selection();
-    if let Some(reason) = selection.fallback_reason.as_deref() {
-        println!(
-            "network backend: multiplex_api={}, fallback_reason={reason}",
-            selection.api_label()
-        );
-    } else {
-        println!("network backend: multiplex_api={}", selection.api_label());
-    }
-    pool.run()
+    bootstrap::run_server()
 }
 
 #[cfg(test)]
