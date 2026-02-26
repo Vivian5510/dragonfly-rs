@@ -1819,7 +1819,9 @@ fn resp_exec_with_empty_queue_returns_empty_array() {
         .expect("EXEC should succeed");
     assert_that!(&exec, eq(&vec![b"*0\r\n".to_vec()]));
     assert_that!(
-        app.replication_guard().journal_entries().is_empty(),
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .is_empty(),
         eq(true)
     );
 }
@@ -3719,7 +3721,12 @@ fn resp_exec_read_only_queue_uses_non_mutating_path() {
         &resp_command(&[b"SET", b"k", b"v"]),
     )
     .expect("seed SET should succeed");
-    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .len(),
+        eq(1_usize)
+    );
 
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"MULTI"]))
         .expect("MULTI should succeed");
@@ -3734,7 +3741,12 @@ fn resp_exec_read_only_queue_uses_non_mutating_path() {
     assert_that!(&exec, eq(&expected));
 
     // Read-only transaction must not create new journal records.
-    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .len(),
+        eq(1_usize)
+    );
 }
 
 #[rstest]
@@ -4145,9 +4157,16 @@ fn journal_records_only_successful_write_commands() {
     )
     .expect("GET should succeed");
 
-    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
     assert_that!(
-        app.replication_guard().journal_entries()[0].op,
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .len(),
+        eq(1_usize)
+    );
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()[0]
+            .op,
         eq(JournalOp::Command),
     );
 }
@@ -4194,7 +4213,9 @@ fn journal_records_set_only_when_mutation_happens_with_conditions_and_get() {
     )
     .expect("SET GET should execute");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SET"),
@@ -4228,7 +4249,9 @@ fn journal_records_setex_only_for_successful_updates() {
     )
     .expect("SETEX should parse");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4255,7 +4278,9 @@ fn journal_records_psetex_only_for_successful_updates() {
     )
     .expect("PSETEX should parse");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4294,7 +4319,9 @@ fn journal_records_pexpire_as_command_or_expired_by_argument() {
     )
     .expect("PEXPIRE with zero timeout should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(4_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[3].op, eq(JournalOp::Expired));
@@ -4336,7 +4363,9 @@ fn journal_records_expire_options_only_when_update_is_applied() {
     )
     .expect("EXPIRE LT delete should execute");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[2].op, eq(JournalOp::Expired));
@@ -4379,7 +4408,9 @@ fn journal_records_pexpireat_as_command_or_expired_by_timestamp() {
     )
     .expect("PEXPIREAT past should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(4_usize));
     assert_that!(entries[1].op, eq(JournalOp::Command));
     assert_that!(entries[3].op, eq(JournalOp::Expired));
@@ -4394,7 +4425,9 @@ fn journal_records_mset_as_single_write_command() {
     let _ =
         ingress_connection_bytes(&mut app, &mut connection, &mset).expect("MSET should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(
@@ -4421,7 +4454,9 @@ fn journal_records_msetnx_only_on_successful_insert_batch() {
     )
     .expect("second MSETNX should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("MSETNX"),
@@ -4459,7 +4494,9 @@ fn journal_records_rename_family_only_for_effective_mutations() {
     )
     .expect("RENAME same key should execute");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(entries[0].op, eq(JournalOp::Command));
     assert_that!(entries[1].op, eq(JournalOp::Command));
@@ -4505,7 +4542,9 @@ fn journal_records_copy_only_when_destination_is_written() {
     )
     .expect("COPY REPLACE should execute");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("COPY"),
@@ -4537,7 +4576,9 @@ fn journal_records_del_only_when_keyspace_changes() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"DEL", b"k"]))
         .expect("DEL existing should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("DEL"),
@@ -4565,7 +4606,9 @@ fn journal_records_unlink_only_when_keyspace_changes() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"UNLINK", b"k"]))
         .expect("UNLINK existing should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("UNLINK"),
@@ -4597,7 +4640,9 @@ fn journal_records_move_only_when_transfer_happens() {
     )
     .expect("MOVE existing should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("MOVE"),
@@ -4635,7 +4680,9 @@ fn journal_records_persist_only_when_it_changes_expiry() {
     )
     .expect("PERSIST should clear expiry");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[2].payload).contains("PERSIST"),
@@ -4669,7 +4716,9 @@ fn journal_records_incr_family_only_on_success() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"INCR", b"bad"]))
         .expect("INCR bad should parse");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("INCR"),
@@ -4699,7 +4748,9 @@ fn journal_records_setnx_only_when_insert_happens() {
     )
     .expect("second SETNX should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SETNX"),
@@ -4729,7 +4780,9 @@ fn journal_records_getset_and_getdel_only_when_key_is_deleted() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"GETDEL", b"k"]))
         .expect("GETDEL missing key should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("GETSET"),
@@ -4763,7 +4816,9 @@ fn journal_records_append_writes() {
     )
     .expect("second APPEND should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("APPEND"),
@@ -4793,7 +4848,9 @@ fn journal_records_setrange_only_when_payload_is_non_empty() {
     )
     .expect("SETRANGE with payload should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(1_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[0].payload).contains("SETRANGE"),
@@ -4817,7 +4874,9 @@ fn journal_records_flush_commands() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, &resp_command(&[b"FLUSHALL"]))
         .expect("FLUSHALL should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(3_usize));
     assert_that!(
         String::from_utf8_lossy(&entries[1].payload).contains("FLUSHDB"),
@@ -4851,7 +4910,9 @@ fn journal_uses_same_txid_for_exec_batch_entries() {
     let _ = ingress_connection_bytes(&mut app, &mut connection, b"*1\r\n$4\r\nEXEC\r\n")
         .expect("EXEC should succeed");
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(2_usize));
     assert_that!(entries[0].txid, eq(entries[1].txid));
     assert_that!(entries[1].op, eq(JournalOp::Expired));
@@ -4870,7 +4931,9 @@ fn journal_append_lane_preserves_txid_order() {
             .expect("SET should succeed");
     }
 
-    let entries = app.replication_guard().journal_entries();
+    let entries = app
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     assert_that!(entries.len(), eq(64_usize));
     for pair in entries.windows(2) {
         assert_that!(pair[0].txid <= pair[1].txid, eq(true));
@@ -5277,7 +5340,10 @@ fn resp_replconf_ack_is_silent_and_tracks_ack_lsn() {
     )
     .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
-    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal().last_acked_lsn(),
+        eq(1_u64)
+    );
 
     let info = ingress_connection_bytes(
         &mut app,
@@ -5308,7 +5374,10 @@ fn resp_replconf_ack_without_registered_endpoint_is_tracked_via_implicit_endpoin
     )
     .expect("REPLCONF ACK should parse");
     assert_that!(&ack_reply, eq(&Vec::<Vec<u8>>::new()));
-    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal().last_acked_lsn(),
+        eq(1_u64)
+    );
 
     let info = ingress_connection_bytes(
         &mut app,
@@ -5860,7 +5929,11 @@ fn resp_dfly_flow_returns_partial_when_lsn_is_available() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5883,7 +5956,7 @@ fn resp_dfly_flow_returns_partial_when_lsn_is_available() {
 #[rstest]
 fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard_with_latest_journal().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let handshake = ingress_connection_bytes(
@@ -5893,7 +5966,11 @@ fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5921,7 +5998,7 @@ fn resp_dfly_flow_returns_full_when_partial_cursor_is_stale() {
 #[rstest]
 fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard_with_latest_journal().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let handshake = ingress_connection_bytes(
@@ -5932,7 +6009,11 @@ fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id_text = extract_sync_id_from_capa_reply(&handshake[0]);
     let sync_id = sync_id_text.as_bytes().to_vec();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -5957,7 +6038,7 @@ fn resp_dfly_flow_full_mode_does_not_store_partial_start_offset() {
     assert_that!(sync_type.as_str(), eq("FULL"));
 
     let flow_start_offset_is_none = {
-        let replication = app.replication_guard();
+        let replication = app.replication_guard_with_latest_journal();
         replication
             .state
             .sync_flow(&sync_id_text, 0)
@@ -5987,7 +6068,11 @@ fn resp_dfly_sync_and_startstable_update_replica_role_state() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
         let flow_reply = ingress_connection_bytes(
@@ -6042,7 +6127,11 @@ fn resp_dfly_sync_requires_all_flows_registered() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     let flow_reply = ingress_connection_bytes(
         &mut app,
@@ -6086,7 +6175,11 @@ fn resp_dfly_replicaoffset_reports_offsets_for_all_shards() {
         &resp_command(&[b"DFLY", b"REPLICAOFFSET"]),
     )
     .expect("DFLY REPLICAOFFSET should execute");
-    let expected_entry = format!(":{}\r\n", app.replication_guard().replication_offset());
+    let expected_entry = format!(
+        ":{}\r\n",
+        app.replication_guard_with_latest_journal()
+            .replication_offset()
+    );
     let expected = format!(
         "*{}\r\n{}",
         app.config.shard_count.get(),
@@ -6108,7 +6201,11 @@ fn resp_dfly_flow_rejects_after_session_leaves_preparation() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     for flow_id in 0..usize::from(app.config.shard_count.get()) {
         let flow_id_text = flow_id.to_string().into_bytes();
@@ -6147,7 +6244,11 @@ fn resp_dfly_flow_accepts_master_lsn_vector_argument() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -6189,7 +6290,11 @@ fn resp_dfly_flow_rejects_invalid_lastmaster_marker() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
     let lsn_vec = vec!["0"; usize::from(app.config.shard_count.get())]
         .join("-")
         .into_bytes();
@@ -6223,7 +6328,11 @@ fn resp_dfly_flow_rejects_duplicate_flow_registration() {
     )
     .expect("REPLCONF CAPA dragonfly should succeed");
     let sync_id = extract_sync_id_from_capa_reply(&handshake[0]).into_bytes();
-    let master_id = app.replication_guard().master_replid().as_bytes().to_vec();
+    let master_id = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
     let first = ingress_connection_bytes(
         &mut app,
         &mut connection,
@@ -6330,7 +6439,10 @@ fn resp_replconf_endpoint_identity_update_replaces_stale_endpoint_row() {
         &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
     )
     .expect("replica ACK should parse");
-    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal().last_acked_lsn(),
+        eq(1_u64)
+    );
 
     let _ = ingress_connection_bytes(
         &mut app,
@@ -6383,7 +6495,10 @@ fn disconnect_connection_unregisters_replica_endpoint_and_ack_progress() {
         &resp_command(&[b"REPLCONF", b"ACK", b"1"]),
     )
     .expect("replica ACK should parse");
-    assert_that!(app.replication_guard().last_acked_lsn(), eq(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal().last_acked_lsn(),
+        eq(1_u64)
+    );
 
     app.disconnect_connection(&mut replica);
 
@@ -6416,7 +6531,7 @@ fn resp_psync_with_unknown_replid_returns_full_resync_header() {
     .expect("PSYNC should succeed");
     let expected = format!(
         "+FULLRESYNC {} 0\r\n",
-        app.replication_guard().master_replid()
+        app.replication_guard_with_latest_journal().master_replid()
     )
     .into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
@@ -6434,7 +6549,11 @@ fn resp_psync_returns_continue_when_offset_is_available() {
     )
     .expect("SET should succeed");
 
-    let replid = app.replication_guard().master_replid().as_bytes().to_vec();
+    let replid = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
     let reply = ingress_connection_bytes(
         &mut app,
         &mut connection,
@@ -6447,7 +6566,7 @@ fn resp_psync_returns_continue_when_offset_is_available() {
 #[rstest]
 fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     let mut app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard_with_latest_journal().journal = InMemoryJournal::with_backlog(1);
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
 
     let _ = ingress_connection_bytes(
@@ -6463,7 +6582,11 @@ fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     )
     .expect("second SET should succeed");
 
-    let replid = app.replication_guard().master_replid().as_bytes().to_vec();
+    let replid = app
+        .replication_guard_with_latest_journal()
+        .master_replid()
+        .as_bytes()
+        .to_vec();
     let reply = ingress_connection_bytes(
         &mut app,
         &mut connection,
@@ -6472,7 +6595,7 @@ fn resp_psync_falls_back_to_full_resync_when_backlog_is_stale() {
     .expect("PSYNC should succeed");
     let expected = format!(
         "+FULLRESYNC {} 2\r\n",
-        app.replication_guard().master_replid()
+        app.replication_guard_with_latest_journal().master_replid()
     )
     .into_bytes();
     assert_that!(&reply, eq(&vec![expected]));
@@ -7231,7 +7354,11 @@ fn resp_dfly_load_resets_replication_state() {
         &resp_command(&[b"SET", b"load:reset:key", b"initial"]),
     )
     .expect("initial SET should succeed");
-    assert_that!(app.replication_guard().replication_offset(), gt(0_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .replication_offset(),
+        gt(0_u64)
+    );
 
     let path = unique_test_snapshot_path("dfly-load-reset");
     let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7250,7 +7377,11 @@ fn resp_dfly_load_resets_replication_state() {
         &resp_command(&[b"SET", b"load:reset:key", b"new"]),
     )
     .expect("second SET should succeed");
-    assert_that!(app.replication_guard().replication_offset(), gt(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .replication_offset(),
+        gt(1_u64)
+    );
 
     let load_reply = ingress_connection_bytes(
         &mut app,
@@ -7260,12 +7391,21 @@ fn resp_dfly_load_resets_replication_state() {
     .expect("DFLY LOAD should execute");
     assert_that!(&load_reply, eq(&vec![b"+OK\r\n".to_vec()]));
 
-    assert_that!(app.replication_guard().replication_offset(), eq(0_u64));
     assert_that!(
-        app.replication_guard().journal_entries().is_empty(),
+        app.replication_guard_with_latest_journal()
+            .replication_offset(),
+        eq(0_u64)
+    );
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .is_empty(),
         eq(true)
     );
-    assert_that!(app.replication_guard().journal_lsn(), eq(1_u64));
+    assert_that!(
+        app.replication_guard_with_latest_journal().journal_lsn(),
+        eq(1_u64)
+    );
 
     let _ = std::fs::remove_file(path);
 }
@@ -7294,11 +7434,15 @@ fn journal_replay_restores_state_in_fresh_server() {
     )
     .expect("SET should succeed");
 
-    let entries = source.replication_guard().journal_entries();
+    let entries = source
+        .replication_guard_with_latest_journal()
+        .journal_entries();
 
     let mut restored = ServerApp::new(RuntimeConfig::default());
     for entry in entries {
-        restored.replication_guard().append_journal(entry);
+        restored
+            .replication_guard_with_latest_journal()
+            .append_journal(entry);
     }
     let applied = restored
         .recover_from_replication_journal()
@@ -7340,7 +7484,7 @@ fn journal_replay_from_lsn_applies_only_suffix() {
         b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nold\r\n",
     )
     .expect("first SET should succeed");
-    let start_lsn = source.replication_guard().journal_lsn();
+    let start_lsn = source.replication_guard_with_latest_journal().journal_lsn();
     let _ = ingress_connection_bytes(
         &mut source,
         &mut source_connection,
@@ -7348,10 +7492,14 @@ fn journal_replay_from_lsn_applies_only_suffix() {
     )
     .expect("second SET should succeed");
 
-    let entries = source.replication_guard().journal_entries();
+    let entries = source
+        .replication_guard_with_latest_journal()
+        .journal_entries();
     let mut restored = ServerApp::new(RuntimeConfig::default());
     for entry in entries {
-        restored.replication_guard().append_journal(entry);
+        restored
+            .replication_guard_with_latest_journal()
+            .append_journal(entry);
     }
 
     let applied = restored
@@ -7372,19 +7520,21 @@ fn journal_replay_from_lsn_applies_only_suffix() {
 #[rstest]
 fn journal_replay_from_lsn_rejects_stale_cursor() {
     let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().journal = InMemoryJournal::with_backlog(1);
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload: resp_command(&[b"SET", b"a", b"1"]),
-    });
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 2,
-        db: 0,
-        op: JournalOp::Command,
-        payload: resp_command(&[b"SET", b"a", b"2"]),
-    });
+    app.replication_guard_with_latest_journal().journal = InMemoryJournal::with_backlog(1);
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", b"a", b"1"]),
+        });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", b"a", b"2"]),
+        });
 
     let error = app
         .recover_from_replication_journal_from_lsn(1)
@@ -7401,19 +7551,30 @@ fn journal_replay_dispatches_runtime_for_single_key_command() {
     let key = b"journal:rt:set".to_vec();
     let shard = app.core.resolve_shard_for_key(&key);
     let payload = resp_command(&[b"SET", &key, b"value"]);
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload,
-    });
-    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload,
+        });
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .len(),
+        eq(1_usize)
+    );
 
     let applied = app
         .recover_from_replication_journal()
         .expect("journal replay should succeed");
     assert_that!(applied, eq(1_usize));
-    assert_that!(app.replication_guard().journal_entries().len(), eq(1_usize));
+    assert_that!(
+        app.replication_guard_with_latest_journal()
+            .journal_entries()
+            .len(),
+        eq(1_usize)
+    );
     assert_that!(
         app.runtime
             .wait_for_processed_count(shard, 1, Duration::from_millis(200))
@@ -7444,12 +7605,13 @@ fn journal_replay_dispatches_runtime_to_all_touched_shards_for_multikey_command(
     }
 
     let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload,
-    });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload,
+        });
 
     let applied = app
         .recover_from_replication_journal()
@@ -7506,12 +7668,13 @@ fn journal_replay_executes_same_shard_multikey_command_on_worker() {
     }
 
     let payload = resp_command(&[b"MSET", &first_key, b"a", &second_key, b"b"]);
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload,
-    });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload,
+        });
 
     let applied = app
         .recover_from_replication_journal()
@@ -7562,12 +7725,13 @@ fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
         eq(true)
     );
 
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload: resp_command(&[b"SET", &key, b"replayed"]),
-    });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: resp_command(&[b"SET", &key, b"replayed"]),
+        });
 
     let applied = app
         .recover_from_replication_journal()
@@ -7590,12 +7754,13 @@ fn journal_replay_bypasses_scheduler_barrier_for_recovery() {
 #[rstest]
 fn journal_replay_rejects_malformed_payload() {
     let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Command,
-        payload: b"not-resp".to_vec(),
-    });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Command,
+            payload: b"not-resp".to_vec(),
+        });
 
     let error = app
         .recover_from_replication_journal()
@@ -7609,18 +7774,20 @@ fn journal_replay_rejects_malformed_payload() {
 #[rstest]
 fn journal_replay_skips_ping_and_lsn_entries() {
     let app = ServerApp::new(RuntimeConfig::default());
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 1,
-        db: 0,
-        op: JournalOp::Ping,
-        payload: Vec::new(),
-    });
-    app.replication_guard().append_journal(JournalEntry {
-        txid: 2,
-        db: 0,
-        op: JournalOp::Lsn,
-        payload: Vec::new(),
-    });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 1,
+            db: 0,
+            op: JournalOp::Ping,
+            payload: Vec::new(),
+        });
+    app.replication_guard_with_latest_journal()
+        .append_journal(JournalEntry {
+            txid: 2,
+            db: 0,
+            op: JournalOp::Lsn,
+            payload: Vec::new(),
+        });
 
     let applied = app
         .recover_from_replication_journal()
