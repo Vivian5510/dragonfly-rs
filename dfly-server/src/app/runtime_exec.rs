@@ -944,30 +944,33 @@ impl ServerApp {
         Ok(true)
     }
 
+    pub(crate) fn runtime_processed_sequences_snapshot(&self) -> DflyResult<Vec<u64>> {
+        self.runtime.snapshot_processed_sequences()
+    }
+
+    pub(crate) fn runtime_reply_ticket_ready_with_snapshot(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
+        if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. }) {
+            return self.try_advance_msetnx_ticket(ticket, processed_snapshot);
+        }
+        Self::runtime_sequences_ready_from_snapshot(&ticket.barriers, processed_snapshot)
+    }
+
     pub(crate) fn runtime_reply_ticket_ready(
         &self,
         ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<bool> {
-        let processed_snapshot = self.runtime.snapshot_processed_sequences()?;
-        if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. }) {
-            return self.try_advance_msetnx_ticket(ticket, &processed_snapshot);
-        }
-        Self::runtime_sequences_ready_from_snapshot(&ticket.barriers, &processed_snapshot)
+        let processed_snapshot = self.runtime_processed_sequences_snapshot()?;
+        self.runtime_reply_ticket_ready_with_snapshot(ticket, &processed_snapshot)
     }
 
-    pub(crate) fn take_runtime_reply_ticket(
+    pub(crate) fn take_runtime_reply_ticket_ready(
         &self,
         ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<Vec<u8>> {
-        let processed_snapshot = self.runtime.snapshot_processed_sequences()?;
-        if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. })
-            && !self.try_advance_msetnx_ticket(ticket, &processed_snapshot)?
-        {
-            return Err(DflyError::InvalidState(
-                "runtime deferred reply is not ready",
-            ));
-        }
-
         let reply = match &ticket.aggregation {
             RuntimeReplyAggregation::Worker { shard, sequence } => self
                 .take_runtime_reply_from_sequence(RuntimeSequenceBarrier {
@@ -1002,6 +1005,19 @@ impl ServerApp {
             &ticket.frame,
             reply,
         ))
+    }
+
+    pub(crate) fn take_runtime_reply_ticket(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+    ) -> DflyResult<Vec<u8>> {
+        let processed_snapshot = self.runtime_processed_sequences_snapshot()?;
+        if !self.runtime_reply_ticket_ready_with_snapshot(ticket, &processed_snapshot)? {
+            return Err(DflyError::InvalidState(
+                "runtime deferred reply is not ready",
+            ));
+        }
+        self.take_runtime_reply_ticket_ready(ticket)
     }
 
     fn execute_runtime_command_on_worker_shard(

@@ -1347,11 +1347,32 @@ fn drain_connection_pending_runtime_replies(
     io_state: &mut WorkerIoState,
     backpressure: BackpressureThresholds,
 ) {
+    if connection.pending_runtime_requests.is_empty() {
+        return;
+    }
+    let processed_snapshot = match app_executor.runtime_processed_sequences_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            while let Some(pending) = connection.pending_runtime_requests.pop() {
+                let reply = runtime_dispatch_error_reply(pending.ticket.protocol, &error);
+                record_completed_worker_request(
+                    connection,
+                    pending.request_id,
+                    Some(reply),
+                    io_state,
+                    backpressure,
+                );
+            }
+            return;
+        }
+    };
+
     let mut index = 0_usize;
     while index < connection.pending_runtime_requests.len() {
         let ready_result = {
             let pending = &mut connection.pending_runtime_requests[index];
-            app_executor.runtime_reply_ticket_ready(&mut pending.ticket)
+            app_executor
+                .runtime_reply_ticket_ready_with_snapshot(&mut pending.ticket, &processed_snapshot)
         };
         let ready = match ready_result {
             Ok(ready) => ready,
@@ -1374,7 +1395,7 @@ fn drain_connection_pending_runtime_replies(
         }
 
         let mut pending = connection.pending_runtime_requests.swap_remove(index);
-        let reply = match app_executor.take_runtime_reply_ticket(&mut pending.ticket) {
+        let reply = match app_executor.take_runtime_reply_ticket_ready(&mut pending.ticket) {
             Ok(reply) => Some(reply),
             Err(error) => Some(runtime_dispatch_error_reply(
                 pending.ticket.protocol,
@@ -1497,20 +1518,32 @@ fn runtime_dispatch_error_reply(protocol: ClientProtocol, error: &DflyError) -> 
 }
 
 fn reap_detached_runtime_replies(app_executor: &AppExecutor, io_state: &mut WorkerIoState) {
+    if io_state.detached_runtime_tickets.is_empty() {
+        return;
+    }
+    let processed_snapshot = app_executor.runtime_processed_sequences_snapshot().ok();
     let mut index = 0_usize;
     while index < io_state.detached_runtime_tickets.len() {
         let ready = {
             let ticket = &mut io_state.detached_runtime_tickets[index];
-            app_executor
-                .runtime_reply_ticket_ready(ticket)
-                .unwrap_or(true)
+            match &processed_snapshot {
+                Some(snapshot) => app_executor
+                    .runtime_reply_ticket_ready_with_snapshot(ticket, snapshot)
+                    .unwrap_or(true),
+                None => app_executor
+                    .runtime_reply_ticket_ready(ticket)
+                    .unwrap_or(true),
+            }
         };
         if !ready {
             index = index.saturating_add(1);
             continue;
         }
         let mut ticket = io_state.detached_runtime_tickets.swap_remove(index);
-        let _ = app_executor.take_runtime_reply_ticket(&mut ticket);
+        let _ = match &processed_snapshot {
+            Some(_) => app_executor.take_runtime_reply_ticket_ready(&mut ticket),
+            None => app_executor.take_runtime_reply_ticket(&mut ticket),
+        };
     }
 }
 

@@ -256,6 +256,29 @@ impl AppExecutor {
         self.app.runtime_reply_ticket_ready(ticket)
     }
 
+    /// Returns one point-in-time snapshot of processed runtime sequences for all shards.
+    pub fn runtime_processed_sequences_snapshot(&self) -> DflyResult<Vec<u64>> {
+        self.app.runtime_processed_sequences_snapshot()
+    }
+
+    /// Checks whether one deferred runtime reply is ready using a caller-provided shard snapshot.
+    pub fn runtime_reply_ticket_ready_with_snapshot(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
+        self.app
+            .runtime_reply_ticket_ready_with_snapshot(ticket, processed_snapshot)
+    }
+
+    /// Takes one already-ready deferred runtime reply and encodes it for client protocol.
+    pub fn take_runtime_reply_ticket_ready(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+    ) -> DflyResult<Vec<u8>> {
+        self.app.take_runtime_reply_ticket_ready(ticket)
+    }
+
     /// Takes one deferred runtime reply and encodes it for client protocol.
     pub fn take_runtime_reply_ticket(
         &self,
@@ -333,10 +356,16 @@ impl ServerApp {
     }
 
     fn replication_guard(&self) -> std::sync::MutexGuard<'_, ReplicationModule> {
-        self.flush_journal_append_lane();
         self.replication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn replication_guard_with_latest_journal(
+        &self,
+    ) -> std::sync::MutexGuard<'_, ReplicationModule> {
+        self.flush_journal_append_lane();
+        self.replication_guard()
     }
 
     fn cluster_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ClusterModule> {
@@ -387,7 +416,8 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
 
     fn install_snapshot(&self, snapshot: &CoreSnapshot) -> DflyResult<()> {
         self.core.import_snapshot(snapshot)?;
-        self.replication_guard().reset_after_snapshot_load();
+        self.replication_guard_with_latest_journal()
+            .reset_after_snapshot_load();
         Ok(())
     }
 
@@ -398,7 +428,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Returns `DflyError::Protocol` when a journal payload is not a valid single RESP command
     /// or when command execution returns an error reply.
     pub fn recover_from_replication_journal(&self) -> DflyResult<usize> {
-        let entries = self.replication_guard().journal_entries();
+        let entries = self
+            .replication_guard_with_latest_journal()
+            .journal_entries();
         self.replay_journal_entries(&entries)
     }
 
@@ -409,21 +441,23 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
     /// Returns `DflyError::Protocol` when starting LSN is stale (already evicted from backlog),
     /// when payload parsing fails, or when replayed command execution fails.
     pub fn recover_from_replication_journal_from_lsn(&self, start_lsn: u64) -> DflyResult<usize> {
-        let current_lsn = self.replication_guard().journal_lsn();
+        let replication = self.replication_guard_with_latest_journal();
+        let current_lsn = replication.journal_lsn();
         if start_lsn == current_lsn {
             return Ok(0);
         }
-        if !self.replication_guard().journal_contains_lsn(start_lsn) {
+        if !replication.journal_contains_lsn(start_lsn) {
             return Err(DflyError::Protocol(format!(
                 "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
             )));
         }
 
-        let Some(entries) = self.replication_guard().journal_entries_from_lsn(start_lsn) else {
+        let Some(entries) = replication.journal_entries_from_lsn(start_lsn) else {
             return Err(DflyError::Protocol(format!(
                 "journal LSN {start_lsn} is not available in in-memory backlog (current lsn {current_lsn})"
             )));
         };
+        drop(replication);
         self.replay_journal_entries(&entries)
     }
 
@@ -983,7 +1017,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
                 last_acked_lsn,
                 replica_rows,
             ) = {
-                let replication = self.replication_guard();
+                let replication = self.replication_guard_with_latest_journal();
                 (
                     replication.connected_replicas(),
                     replication.master_replid().to_owned(),
@@ -1300,11 +1334,13 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
         self.ensure_replica_endpoint_for_ack(connection);
         if let Some(endpoint) = connection.replica_endpoint.as_ref() {
-            let _ = self.replication_guard().record_replica_ack_for_endpoint(
-                &endpoint.address,
-                endpoint.listening_port,
-                ack_lsn,
-            );
+            let _ = self
+                .replication_guard_with_latest_journal()
+                .record_replica_ack_for_endpoint(
+                    &endpoint.address,
+                    endpoint.listening_port,
+                    ack_lsn,
+                );
         }
         Ok(())
     }
@@ -1397,7 +1433,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
         };
 
         let requested_offset_u64 = u64::try_from(requested_offset).ok();
-        let mut replication = self.replication_guard();
+        let mut replication = self.replication_guard_with_latest_journal();
         let master_replid = replication.master_replid().to_owned();
         let master_offset = replication.replication_offset();
         if requested_replid == master_replid
@@ -1430,6 +1466,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             return CommandReply::Error("value is not an integer or out of range".to_owned());
         };
 
+        self.flush_journal_append_lane();
         // WAIT returns the number of replicas that acknowledged the master offset captured at
         // WAIT entry time. We block on ACK progress with a cloneable watcher so the blocking wait
         // does not hold the outer replication mutex and starve ACK updates.
@@ -1529,7 +1566,7 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             None
         };
 
-        let mut replication = self.replication_guard();
+        let mut replication = self.replication_guard_with_latest_journal();
         if master_id != replication.master_replid() {
             return CommandReply::Error("bad master id".to_owned());
         }
@@ -1625,7 +1662,9 @@ core_mod={:?}, tx_mod={:?}, storage_mod={:?}, repl_enabled={}, cluster_mode={:?}
             );
         }
 
-        let offset = self.replication_guard().replication_offset();
+        let offset = self
+            .replication_guard_with_latest_journal()
+            .replication_offset();
         let offsets = (0..usize::from(self.config.shard_count.get()))
             .map(|_| CommandReply::Integer(i64::try_from(offset).unwrap_or(i64::MAX)))
             .collect::<Vec<_>>();
@@ -2552,7 +2591,7 @@ pub fn run() -> DflyResult<()> {
         let snapshot = server.create_snapshot_bytes()?;
         server.load_snapshot_bytes(&snapshot)?;
         let _ = server.recover_from_replication_journal()?;
-        let current_lsn = server.replication_guard().journal_lsn();
+        let current_lsn = server.replication_guard_with_latest_journal().journal_lsn();
         let _ = server.recover_from_replication_journal_from_lsn(current_lsn)?;
         Ok(())
     })?;
