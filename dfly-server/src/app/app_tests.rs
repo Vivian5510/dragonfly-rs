@@ -4858,6 +4858,26 @@ fn journal_uses_same_txid_for_exec_batch_entries() {
 }
 
 #[rstest]
+fn journal_append_lane_preserves_txid_order() {
+    let mut app = ServerApp::new(RuntimeConfig::default());
+    let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
+
+    for index in 0..64_u16 {
+        let key = format!("lane:key:{index}").into_bytes();
+        let value = format!("v{index}").into_bytes();
+        let command = resp_command(&[b"SET", &key, &value]);
+        let _ = ingress_connection_bytes(&mut app, &mut connection, &command)
+            .expect("SET should succeed");
+    }
+
+    let entries = app.replication_guard().journal_entries();
+    assert_that!(entries.len(), eq(64_usize));
+    for pair in entries.windows(2) {
+        assert_that!(pair[0].txid <= pair[1].txid, eq(true));
+    }
+}
+
+#[rstest]
 fn resp_select_switches_logical_db_namespace() {
     let mut app = ServerApp::new(RuntimeConfig::default());
     let mut connection = ServerApp::new_connection(ClientProtocol::Resp);
