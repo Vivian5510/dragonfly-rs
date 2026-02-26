@@ -327,7 +327,7 @@ impl InMemoryShardRuntime {
         Ok(guard.processed.drain(..).collect())
     }
 
-    /// Returns current number of processed envelopes for one shard.
+    /// Returns current number of buffered processed envelopes for one shard.
     ///
     /// # Errors
     ///
@@ -342,7 +342,7 @@ impl InMemoryShardRuntime {
             .inner
             .lock()
             .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
-        Ok(guard.processed_total)
+        Ok(guard.processed.len())
     }
 
     /// Returns current number of unconsumed worker replies buffered for one shard.
@@ -426,7 +426,7 @@ impl InMemoryShardRuntime {
         Ok(metrics.blocked_submitters.load(Ordering::Acquire))
     }
 
-    /// Waits until one shard has processed at least `minimum` envelopes.
+    /// Waits until one shard has processed at least `minimum` envelopes since runtime startup.
     ///
     /// # Errors
     ///
@@ -948,6 +948,14 @@ mod tests {
         assert_that!(
             runtime.processed_count(0).expect("count should succeed"),
             eq(2)
+        );
+        let drained = runtime
+            .drain_processed_for_shard(0)
+            .expect("drain should succeed");
+        assert_that!(drained.len(), eq(2_usize));
+        assert_that!(
+            runtime.processed_count(0).expect("count should succeed"),
+            eq(0_usize)
         );
     }
 
