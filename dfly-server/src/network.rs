@@ -5,8 +5,8 @@
 //! per-protocol listeners + per-connection state machine driven by `mio::Poll`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{
@@ -21,6 +21,17 @@ use dfly_facade::net_proactor::{MultiplexApi, MultiplexSelection};
 use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
+#[cfg(target_os = "linux")]
+use std::net::TcpStream as StdTcpStream;
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use tokio::sync::mpsc::{
+    UnboundedReceiver as TokioUnboundedReceiver, UnboundedSender as TokioUnboundedSender,
+    unbounded_channel as tokio_unbounded_channel,
+};
+#[cfg(target_os = "linux")]
+use tokio_uring::net::TcpStream as IoUringTcpStream;
 
 use crate::app::{
     AppExecutor, ParsedCommandExecution, RuntimeReplyTicket, ServerApp, ServerConnection,
@@ -48,6 +59,8 @@ pub struct NetEngine {
 
 enum NetEngineBackend {
     Epoll(EpollBackend),
+    #[cfg(target_os = "linux")]
+    IoUring(IoUringBackend),
 }
 
 impl NetEngine {
@@ -64,12 +77,23 @@ impl NetEngine {
         app_executor: &AppExecutor,
     ) -> DflyResult<Self> {
         let backend = match selection.api {
-            MultiplexApi::Epoll => NetEngineBackend::Epoll(
-                EpollBackend::bind_with_memcache(resp_addr, memcache_addr, config, app_executor)?,
-            ),
+            MultiplexApi::Epoll => NetEngineBackend::Epoll(EpollBackend::bind_with_memcache(
+                resp_addr,
+                memcache_addr,
+                config,
+                app_executor,
+            )?),
+            #[cfg(target_os = "linux")]
+            MultiplexApi::IoUring => NetEngineBackend::IoUring(IoUringBackend::bind_with_memcache(
+                resp_addr,
+                memcache_addr,
+                config,
+                app_executor,
+            )?),
+            #[cfg(not(target_os = "linux"))]
             MultiplexApi::IoUring => {
                 return Err(DflyError::InvalidConfig(
-                    "io_uring backend selected but not implemented; select epoll backend",
+                    "io_uring backend is Linux-only; select epoll backend",
                 ));
             }
         };
@@ -84,6 +108,8 @@ impl NetEngine {
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
         match &mut self.backend {
             NetEngineBackend::Epoll(backend) => backend.poll_once(timeout),
+            #[cfg(target_os = "linux")]
+            NetEngineBackend::IoUring(backend) => backend.poll_once(timeout),
         }
     }
 
@@ -93,8 +119,12 @@ impl NetEngine {
     ///
     /// Returns `DflyError::Io` when backend polling fails.
     pub fn run(&mut self) -> DflyResult<()> {
-        loop {
-            let _ = self.poll_once(Some(Duration::from_millis(10)))?;
+        match &mut self.backend {
+            NetEngineBackend::Epoll(_) => loop {
+                let _ = self.poll_once(Some(Duration::from_millis(10)))?;
+            },
+            #[cfg(target_os = "linux")]
+            NetEngineBackend::IoUring(backend) => backend.run(),
         }
     }
 
@@ -1128,7 +1158,10 @@ impl ThreadedServerReactor {
 
     #[cfg(test)]
     fn active_connection_ids(&self) -> Vec<u64> {
-        self.connection_owner_by_id.keys().copied().collect::<Vec<_>>()
+        self.connection_owner_by_id
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
     }
 
     #[cfg(test)]
@@ -1258,8 +1291,7 @@ impl ThreadedServerReactor {
         &self,
         worker_id: usize,
         migrated: MigratedWorkerConnection,
-    ) -> Result<MigrationAdoptReceiver, MigrationDispatchFailure>
-    {
+    ) -> Result<MigrationAdoptReceiver, MigrationDispatchFailure> {
         let Some(worker) = self.workers.get(worker_id) else {
             return Err(MigrationDispatchFailure {
                 error: DflyError::InvalidState("io worker index is out of range"),
@@ -1314,7 +1346,9 @@ impl ThreadedServerReactor {
     }
 
     fn maybe_rebalance_connections(&mut self) {
-        if !self.migration_enabled || self.workers.len() < 2 || self.connection_owner_by_id.len() < 2
+        if !self.migration_enabled
+            || self.workers.len() < 2
+            || self.connection_owner_by_id.len() < 2
         {
             return;
         }
@@ -1344,16 +1378,17 @@ impl ThreadedServerReactor {
             return;
         }
 
-        let Some(connection_id) = self
-            .connection_owner_by_id
-            .iter()
-            .find_map(|(connection_id, owner)| {
-                if *owner == source_worker && !self.migrated_connections.contains(connection_id) {
-                    Some(*connection_id)
-                } else {
-                    None
-                }
-            })
+        let Some(connection_id) =
+            self.connection_owner_by_id
+                .iter()
+                .find_map(|(connection_id, owner)| {
+                    if *owner == source_worker && !self.migrated_connections.contains(connection_id)
+                    {
+                        Some(*connection_id)
+                    } else {
+                        None
+                    }
+                })
         else {
             return;
         };
@@ -1382,13 +1417,17 @@ impl ThreadedServerReactor {
             ));
         }
         let Some(source_worker) = self.connection_owner_by_id.get(&connection_id).copied() else {
-            return Err(DflyError::InvalidState("connection is not tracked by acceptor"));
+            return Err(DflyError::InvalidState(
+                "connection is not tracked by acceptor",
+            ));
         };
         if source_worker == target_worker {
             return Ok(());
         }
         if target_worker >= self.workers.len() {
-            return Err(DflyError::InvalidState("target worker index is out of range"));
+            return Err(DflyError::InvalidState(
+                "target worker index is out of range",
+            ));
         }
 
         let (reply_sender, reply_receiver) =
@@ -1406,7 +1445,9 @@ impl ThreadedServerReactor {
                 DflyError::InvalidState("migration source worker timed out while detaching")
             })?
             .map_err(|message| {
-                DflyError::Io(format!("migration source worker rejected handoff: {message}"))
+                DflyError::Io(format!(
+                    "migration source worker rejected handoff: {message}"
+                ))
             })?;
         let adopt_receiver = match self.dispatch_adopt_for_migration(target_worker, migrated) {
             Ok(receiver) => receiver,
@@ -1429,7 +1470,9 @@ impl ThreadedServerReactor {
                 ));
             }
         }
-        let _ = self.connection_owner_by_id.insert(connection_id, target_worker);
+        let _ = self
+            .connection_owner_by_id
+            .insert(connection_id, target_worker);
         let _ = self.migrated_connections.insert(connection_id);
         Ok(())
     }
@@ -1470,6 +1513,447 @@ impl EpollBackend {
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
         self.reactor.poll_once(timeout)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum IoUringWorkerCommand {
+    AddConnection {
+        protocol: ClientProtocol,
+        socket: StdTcpStream,
+    },
+    Shutdown,
+}
+
+#[cfg(target_os = "linux")]
+struct IoUringWorkerHandle {
+    sender: TokioUnboundedSender<IoUringWorkerCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+/// Linux `io_uring` backend implementation.
+///
+/// The acceptor remains readiness-driven (`mio`), while each worker runs one
+/// `tokio-uring` runtime and owns socket read/write/completion loops.
+pub struct IoUringBackend {
+    acceptor_poll: Poll,
+    acceptor_events: Events,
+    listeners: Vec<ReactorListener>,
+    workers: Vec<IoUringWorkerHandle>,
+    dispatch_window: WorkerDispatchWindow,
+    next_rr_offset: usize,
+    use_peer_hash_dispatch: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringBackend {
+    /// Binds listeners/workers for the io_uring backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidConfig` or `DflyError::Io` when setup fails.
+    pub fn bind_with_memcache(
+        resp_addr: SocketAddr,
+        memcache_addr: Option<SocketAddr>,
+        config: ServerReactorConfig,
+        app_executor: &AppExecutor,
+    ) -> DflyResult<Self> {
+        if config.enable_connection_migration {
+            return Err(DflyError::InvalidConfig(
+                "io_uring backend currently does not support connection migration",
+            ));
+        }
+
+        let acceptor_poll =
+            Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
+        let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
+        let (write_high_watermark, write_low_watermark) =
+            config.normalized_backpressure_watermarks()?;
+        let (max_pending_per_connection, max_pending_per_worker) =
+            config.normalized_pending_request_limits();
+        let worker_count = config.normalized_io_worker_count();
+        let dispatch_window = WorkerDispatchWindow {
+            start: config.normalized_dispatch_start(worker_count),
+            count: config.normalized_dispatch_count(worker_count),
+        };
+        let max_events = config.normalized_max_events();
+
+        let mut resp_listener = TcpListener::bind(resp_addr)
+            .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
+        acceptor_poll
+            .registry()
+            .register(&mut resp_listener, RESP_LISTENER_TOKEN, Interest::READABLE)
+            .map_err(|error| {
+                DflyError::Io(format!("register RESP listener in poll failed: {error}"))
+            })?;
+        listeners.push(ReactorListener {
+            token: RESP_LISTENER_TOKEN,
+            protocol: ClientProtocol::Resp,
+            socket: resp_listener,
+        });
+
+        if let Some(addr) = memcache_addr {
+            let mut memcache_listener = TcpListener::bind(addr).map_err(|error| {
+                DflyError::Io(format!("bind Memcache listener failed: {error}"))
+            })?;
+            acceptor_poll
+                .registry()
+                .register(
+                    &mut memcache_listener,
+                    MEMCACHE_LISTENER_TOKEN,
+                    Interest::READABLE,
+                )
+                .map_err(|error| {
+                    DflyError::Io(format!(
+                        "register Memcache listener in poll failed: {error}"
+                    ))
+                })?;
+            listeners.push(ReactorListener {
+                token: MEMCACHE_LISTENER_TOKEN,
+                protocol: ClientProtocol::Memcache,
+                socket: memcache_listener,
+            });
+        }
+
+        let backpressure = BackpressureThresholds {
+            high: write_high_watermark,
+            low: write_low_watermark,
+            max_pending_per_connection: max_pending_per_connection.max(1),
+            max_pending_per_worker: max_pending_per_worker.max(1),
+        };
+
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let (sender, receiver) = tokio_unbounded_channel::<IoUringWorkerCommand>();
+            let worker_app = app_executor.clone();
+            let worker_backpressure = backpressure;
+            let join = thread::Builder::new()
+                .name(format!("dfly-io-uring-worker-{worker_id}"))
+                .spawn(move || {
+                    io_uring_worker_thread_main(receiver, worker_app, worker_backpressure);
+                })
+                .map_err(|error| {
+                    DflyError::Io(format!("spawn io_uring worker {worker_id} failed: {error}"))
+                })?;
+            workers.push(IoUringWorkerHandle {
+                sender,
+                join: Some(join),
+            });
+        }
+
+        Ok(Self {
+            acceptor_poll,
+            acceptor_events: Events::with_capacity(max_events),
+            listeners,
+            workers,
+            dispatch_window,
+            next_rr_offset: 0,
+            use_peer_hash_dispatch: config.use_peer_hash_dispatch,
+        })
+    }
+
+    /// Runs one cycle. `io_uring` workers are long-running, so single-step polling
+    /// is intentionally unsupported in this backend.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `DflyError::InvalidState`.
+    pub fn poll_once(&mut self, _timeout: Option<Duration>) -> DflyResult<usize> {
+        Err(DflyError::InvalidState(
+            "io_uring backend does not support poll_once; use run()",
+        ))
+    }
+
+    /// Runs accept loop and dispatches accepted sockets to `io_uring` workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when acceptor poll/accept/dispatch fails.
+    pub fn run(&mut self) -> DflyResult<()> {
+        loop {
+            self.acceptor_poll
+                .poll(&mut self.acceptor_events, Some(Duration::from_millis(10)))
+                .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
+            let snapshots = self
+                .acceptor_events
+                .iter()
+                .map(EventSnapshot::from_mio_event)
+                .collect::<Vec<_>>();
+            for snapshot in &snapshots {
+                if let Some(listener_index) = self.listener_index(snapshot.token) {
+                    self.accept_new_connections(listener_index)?;
+                }
+            }
+        }
+    }
+
+    fn listener_index(&self, token: Token) -> Option<usize> {
+        self.listeners
+            .iter()
+            .position(|listener| listener.token == token)
+    }
+
+    fn accept_new_connections(&mut self, listener_index: usize) -> DflyResult<()> {
+        let protocol = self
+            .listeners
+            .get(listener_index)
+            .map(|listener| listener.protocol)
+            .ok_or(DflyError::InvalidState(
+                "io_uring listener index is out of range",
+            ))?;
+
+        loop {
+            let accept_result = {
+                let listener =
+                    self.listeners
+                        .get_mut(listener_index)
+                        .ok_or(DflyError::InvalidState(
+                            "io_uring listener index is out of range",
+                        ))?;
+                listener.socket.accept()
+            };
+
+            match accept_result {
+                Ok((socket, _peer)) => {
+                    let _ = socket.set_nodelay(true);
+                    let worker_id = self.allocate_worker_index(&socket);
+                    let socket = mio_stream_into_std(socket);
+                    self.dispatch_to_worker(
+                        worker_id,
+                        IoUringWorkerCommand::AddConnection { protocol, socket },
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => {
+                    return Err(DflyError::Io(format!("accept connection failed: {error}")));
+                }
+            }
+        }
+    }
+
+    fn dispatch_to_worker(
+        &self,
+        worker_id: usize,
+        command: IoUringWorkerCommand,
+    ) -> DflyResult<()> {
+        let Some(worker) = self.workers.get(worker_id) else {
+            return Err(DflyError::InvalidState(
+                "io_uring worker index is out of range",
+            ));
+        };
+        worker.sender.send(command).map_err(|_| {
+            DflyError::Io(format!(
+                "send command to io_uring worker {worker_id} failed because worker is unavailable"
+            ))
+        })
+    }
+
+    fn allocate_worker_index(&mut self, socket: &TcpStream) -> usize {
+        if self.use_peer_hash_dispatch
+            && let Some(worker_id) = self.select_worker_by_peer_hash(socket)
+        {
+            return worker_id;
+        }
+        let offset = self.next_rr_offset % self.dispatch_window.count.max(1);
+        self.next_rr_offset = (self.next_rr_offset + 1) % self.dispatch_window.count.max(1);
+        (self.dispatch_window.start + offset) % self.workers.len().max(1)
+    }
+
+    fn select_worker_by_peer_hash(&self, socket: &TcpStream) -> Option<usize> {
+        let peer = socket.peer_addr().ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        peer.hash(&mut hasher);
+        let span = self.dispatch_window.count.max(1);
+        let span_u64 = u64::try_from(span).ok()?;
+        let bucket_u64 = hasher.finish() % span_u64;
+        let bucket = usize::try_from(bucket_u64).ok()?;
+        Some((self.dispatch_window.start + bucket) % self.workers.len().max(1))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IoUringBackend {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.sender.send(IoUringWorkerCommand::Shutdown);
+        }
+        for worker in &mut self.workers {
+            if let Some(join) = worker.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mio_stream_into_std(stream: TcpStream) -> StdTcpStream {
+    let owned: OwnedFd = stream.into();
+    owned.into()
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_worker_thread_main(
+    mut receiver: TokioUnboundedReceiver<IoUringWorkerCommand>,
+    app_executor: AppExecutor,
+    backpressure: BackpressureThresholds,
+) {
+    tokio_uring::start(async move {
+        while let Some(command) = receiver.recv().await {
+            match command {
+                IoUringWorkerCommand::AddConnection { protocol, socket } => {
+                    let app_executor = app_executor.clone();
+                    tokio_uring::spawn(async move {
+                        let stream = IoUringTcpStream::from_std(socket);
+                        let _ = stream.set_nodelay(true);
+                        io_uring_connection_main(stream, protocol, app_executor, backpressure)
+                            .await;
+                    });
+                }
+                IoUringWorkerCommand::Shutdown => break,
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_connection_main(
+    stream: IoUringTcpStream,
+    protocol: ClientProtocol,
+    app_executor: AppExecutor,
+    backpressure: BackpressureThresholds,
+) {
+    let mut logical = ServerApp::new_connection(protocol);
+    let mut read_buffer = vec![0_u8; READ_CHUNK_BYTES];
+    let mut write_buffer = Vec::<u8>::new();
+    let mut draining = false;
+
+    loop {
+        if !draining {
+            let (read_result, next_buffer) = stream.read(read_buffer).await;
+            read_buffer = next_buffer;
+            match read_result {
+                Ok(0) => {
+                    draining = true;
+                }
+                Ok(read_len) => {
+                    logical.parser.feed_bytes(&read_buffer[..read_len]);
+                    io_uring_drain_parsed_commands(
+                        &stream,
+                        &app_executor,
+                        &mut logical,
+                        &mut write_buffer,
+                        &mut draining,
+                        backpressure,
+                    )
+                    .await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !write_buffer.is_empty()
+            && io_uring_flush_write_buffer(&stream, &mut write_buffer)
+                .await
+                .is_err()
+        {
+            break;
+        }
+
+        if draining {
+            break;
+        }
+    }
+
+    app_executor.disconnect_connection(&mut logical);
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_drain_parsed_commands(
+    stream: &IoUringTcpStream,
+    app_executor: &AppExecutor,
+    logical: &mut ServerConnection,
+    write_buffer: &mut Vec<u8>,
+    draining: &mut bool,
+    backpressure: BackpressureThresholds,
+) {
+    loop {
+        match logical.parser.try_pop_command() {
+            Ok(Some(parsed)) => match app_executor.execute_parsed_command_deferred(logical, parsed)
+            {
+                ParsedCommandExecution::Immediate(reply) => {
+                    if let Some(reply) = reply {
+                        write_buffer.extend_from_slice(&reply);
+                    }
+                }
+                ParsedCommandExecution::Deferred(mut ticket) => {
+                    let reply = io_uring_wait_runtime_reply(app_executor, &mut ticket).await;
+                    write_buffer.extend_from_slice(&reply);
+                }
+            },
+            Ok(None) => break,
+            Err(error) => {
+                let protocol = logical.context.protocol;
+                write_buffer.extend_from_slice(&protocol_parse_error_reply(protocol, &error));
+                if protocol == ClientProtocol::Resp {
+                    *draining = true;
+                    break;
+                }
+                if !logical.parser.recover_after_protocol_error() {
+                    break;
+                }
+            }
+        }
+
+        if write_buffer.len() >= backpressure.high {
+            if io_uring_flush_write_buffer(stream, write_buffer)
+                .await
+                .is_err()
+            {
+                *draining = true;
+            }
+            if write_buffer.len() > backpressure.low {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_wait_runtime_reply(
+    app_executor: &AppExecutor,
+    ticket: &mut RuntimeReplyTicket,
+) -> Vec<u8> {
+    loop {
+        match app_executor.runtime_reply_ticket_ready(ticket) {
+            Ok(true) => {
+                return match app_executor.take_runtime_reply_ticket(ticket) {
+                    Ok(reply) => reply,
+                    Err(error) => runtime_dispatch_error_reply(ticket.protocol, &error),
+                };
+            }
+            Ok(false) => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                return runtime_dispatch_error_reply(ticket.protocol, &error);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_flush_write_buffer(
+    stream: &IoUringTcpStream,
+    write_buffer: &mut Vec<u8>,
+) -> Result<(), std::io::Error> {
+    if write_buffer.is_empty() {
+        return Ok(());
+    }
+    let payload = std::mem::take(write_buffer);
+    let (result, remaining) = stream.write_all(payload).await;
+    *write_buffer = remaining;
+    result
 }
 
 impl Drop for ThreadedServerReactor {
@@ -1589,11 +2073,7 @@ fn drain_worker_commands(
                 connection_id,
                 response,
             }) => {
-                let migration = take_worker_connection_for_migration(
-                    poll,
-                    connection_id,
-                    io_state,
-                );
+                let migration = take_worker_connection_for_migration(poll, connection_id, io_state);
                 let _ = response.send(migration);
             }
             Ok(WorkerCommand::AdoptMigratedConnection {
@@ -1660,7 +2140,12 @@ fn progress_worker_parse_backlog(
             should_requeue_parse = true;
         }
 
-        drain_connection_pending_runtime_replies(&mut connection, app_executor, io_state, backpressure);
+        drain_connection_pending_runtime_replies(
+            &mut connection,
+            app_executor,
+            io_state,
+            backpressure,
+        );
         if connection.should_try_flush() {
             flush_worker_connection_writes(
                 &mut connection,
@@ -2648,8 +3133,9 @@ mod tests {
         assert_that!(selection.fallback_reason.is_some(), eq(true));
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[rstest]
-    fn net_engine_rejects_unimplemented_io_uring_backend() {
+    fn net_engine_rejects_io_uring_backend_on_non_linux() {
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let selection = MultiplexSelection {
             api: MultiplexApi::IoUring,
@@ -2663,13 +3149,28 @@ mod tests {
             &app_executor,
         );
         let error_text = match bind_result {
-            Ok(_) => panic!("io_uring backend should not bind without implementation"),
+            Ok(_) => panic!("io_uring backend should not bind on non-linux"),
             Err(error) => format!("{error}"),
         };
-        assert_that!(
-            error_text.contains("not implemented"),
-            eq(true)
+        assert_that!(error_text.contains("Linux-only"), eq(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    fn net_engine_binds_io_uring_backend_on_linux() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let selection = MultiplexSelection {
+            api: MultiplexApi::IoUring,
+            fallback_reason: None,
+        };
+        let bind_result = super::NetEngine::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig::default(),
+            selection,
+            &app_executor,
         );
+        assert_that!(bind_result.is_ok(), eq(true));
     }
 
     #[rstest]
@@ -2933,7 +3434,10 @@ mod tests {
         reactor
             .migrate_connection(connection_id, target_worker)
             .expect("migration should succeed");
-        assert_that!(reactor.migrated_connections.contains(&connection_id), eq(true));
+        assert_that!(
+            reactor.migrated_connections.contains(&connection_id),
+            eq(true)
+        );
 
         let _ = client.shutdown(Shutdown::Both);
         drop(client);
@@ -2949,7 +3453,10 @@ mod tests {
         }
 
         assert_that!(reactor.connection_owner(connection_id).is_none(), eq(true));
-        assert_that!(reactor.migrated_connections.contains(&connection_id), eq(false));
+        assert_that!(
+            reactor.migrated_connections.contains(&connection_id),
+            eq(false)
+        );
     }
 
     #[rstest]

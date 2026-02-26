@@ -15,6 +15,10 @@ dfly-tiering = { path = "../dfly-tiering" }
 dfly-transaction = { path = "../dfly-transaction" }
 mio = { version = "1.0", features = ["os-poll", "net"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true }
+tokio-uring = "0.5.0"
+
 [dev-dependencies]
 googletest = { workspace = true }
 rstest = { workspace = true }

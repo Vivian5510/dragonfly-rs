@@ -87,10 +87,8 @@ pub fn select_multiplex_backend(config: &RuntimeConfig) -> MultiplexSelection {
 
     match probe_io_uring_support() {
         Ok(()) => MultiplexSelection {
-            api: MultiplexApi::Epoll,
-            fallback_reason: Some(
-                "io_uring probe passed but backend is not implemented yet; using epoll".to_owned(),
-            ),
+            api: MultiplexApi::IoUring,
+            fallback_reason: None,
         },
         Err(reason) => MultiplexSelection {
             api: MultiplexApi::Epoll,
@@ -138,8 +136,19 @@ mod tests {
     }
 
     #[rstest]
-    fn backend_selection_remains_epoll_until_io_uring_backend_exists() {
+    fn backend_selection_default_returns_supported_backend() {
         let selection = select_multiplex_backend(&RuntimeConfig::default());
-        assert_that!(selection.api, eq(MultiplexApi::Epoll));
+        if cfg!(target_os = "linux") {
+            assert_that!(
+                selection.api == MultiplexApi::IoUring || selection.api == MultiplexApi::Epoll,
+                eq(true)
+            );
+            if selection.api == MultiplexApi::IoUring {
+                assert_that!(selection.fallback_reason.is_none(), eq(true));
+            }
+        } else {
+            assert_that!(selection.api, eq(MultiplexApi::Epoll));
+            assert_that!(selection.fallback_reason.is_some(), eq(true));
+        }
     }
 }
