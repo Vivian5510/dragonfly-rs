@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{
@@ -16,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use dfly_common::error::{DflyError, DflyResult};
+use dfly_facade::net_proactor::{MultiplexApi, MultiplexSelection};
 use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -38,12 +40,125 @@ const WORKER_READ_BUDGET_PER_EVENT: usize = 8;
 const WORKER_PARSE_BUDGET_PER_READ: usize = 32;
 const WORKER_WRITE_BUDGET_BYTES_PER_EVENT: usize = 64 * 1024;
 
+/// Top-level network engine over one selected multiplex backend.
+pub struct NetEngine {
+    selection: MultiplexSelection,
+    backend: NetEngineBackend,
+}
+
+enum NetEngineBackend {
+    Epoll(EpollBackend),
+}
+
+impl NetEngine {
+    /// Binds listeners and worker runtime for one selected backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when listener or worker startup fails.
+    pub fn bind_with_memcache(
+        resp_addr: SocketAddr,
+        memcache_addr: Option<SocketAddr>,
+        config: ServerReactorConfig,
+        selection: MultiplexSelection,
+        app_executor: &AppExecutor,
+    ) -> DflyResult<Self> {
+        let backend = match selection.api {
+            MultiplexApi::Epoll => NetEngineBackend::Epoll(
+                EpollBackend::bind_with_memcache(resp_addr, memcache_addr, config, app_executor)?,
+            ),
+            MultiplexApi::IoUring => {
+                return Err(DflyError::InvalidConfig(
+                    "io_uring backend selected but not implemented; select epoll backend",
+                ));
+            }
+        };
+        Ok(Self { selection, backend })
+    }
+
+    /// Runs one poll cycle on the selected backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when backend polling fails.
+    pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
+        match &mut self.backend {
+            NetEngineBackend::Epoll(backend) => backend.poll_once(timeout),
+        }
+    }
+
+    /// Runs the selected backend event loop forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when backend polling fails.
+    pub fn run(&mut self) -> DflyResult<()> {
+        loop {
+            let _ = self.poll_once(Some(Duration::from_millis(10)))?;
+        }
+    }
+
+    /// Returns selected multiplex backend metadata for startup logs.
+    #[must_use]
+    pub fn selection(&self) -> &MultiplexSelection {
+        &self.selection
+    }
+}
+
+/// Top-level pool runtime matching Dragonfly's listener/proactor composition.
+pub struct NetworkProactorPool {
+    engine: NetEngine,
+}
+
+impl NetworkProactorPool {
+    /// Binds one network pool from listener addresses, backend selection and runtime config.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when listener or worker startup fails.
+    pub fn bind_with_memcache(
+        resp_addr: SocketAddr,
+        memcache_addr: Option<SocketAddr>,
+        config: ServerReactorConfig,
+        selection: MultiplexSelection,
+        app_executor: &AppExecutor,
+    ) -> DflyResult<Self> {
+        let engine = NetEngine::bind_with_memcache(
+            resp_addr,
+            memcache_addr,
+            config,
+            selection,
+            app_executor,
+        )?;
+        Ok(Self { engine })
+    }
+
+    /// Returns selected backend metadata.
+    #[must_use]
+    pub fn selection(&self) -> &MultiplexSelection {
+        self.engine.selection()
+    }
+
+    /// Runs network pool until shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when backend polling fails.
+    pub fn run(&mut self) -> DflyResult<()> {
+        self.engine.run()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerReactorConfig {
     pub max_events: usize,
     pub write_high_watermark_bytes: usize,
     pub write_low_watermark_bytes: usize,
     pub io_worker_count: usize,
+    pub io_worker_dispatch_start: usize,
+    pub io_worker_dispatch_count: usize,
+    pub use_peer_hash_dispatch: bool,
+    pub enable_connection_migration: bool,
     pub max_pending_requests_per_connection: usize,
     pub max_pending_requests_per_worker: usize,
 }
@@ -57,6 +172,27 @@ impl ServerReactorConfig {
     #[must_use]
     pub fn normalized_io_worker_count(self) -> usize {
         self.io_worker_count.max(1)
+    }
+
+    #[must_use]
+    pub fn normalized_dispatch_start(self, worker_count: usize) -> usize {
+        if worker_count == 0 {
+            return 0;
+        }
+        self.io_worker_dispatch_start % worker_count
+    }
+
+    #[must_use]
+    pub fn normalized_dispatch_count(self, worker_count: usize) -> usize {
+        if worker_count == 0 {
+            return 1;
+        }
+        let requested = if self.io_worker_dispatch_count == 0 {
+            worker_count
+        } else {
+            self.io_worker_dispatch_count
+        };
+        requested.clamp(1, worker_count)
     }
 
     pub fn normalized_backpressure_watermarks(self) -> DflyResult<(usize, usize)> {
@@ -597,17 +733,47 @@ impl ServerReactor {
 
 const THREADED_IO_WORKER_POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
+type MigrationAdoptResult = Result<(), Box<MigratedWorkerConnection>>;
+type MigrationAdoptSender = Sender<MigrationAdoptResult>;
+type MigrationAdoptReceiver = Receiver<MigrationAdoptResult>;
+
+#[derive(Debug)]
+struct MigrationDispatchFailure {
+    error: DflyError,
+    connection: Box<MigratedWorkerConnection>,
+}
+
 #[derive(Debug)]
 enum WorkerCommand {
     AddConnection {
+        connection_id: u64,
         protocol: ClientProtocol,
         socket: TcpStream,
+    },
+    TakeConnectionForMigration {
+        connection_id: u64,
+        response: Sender<Result<MigratedWorkerConnection, String>>,
+    },
+    AdoptMigratedConnection {
+        connection: Box<MigratedWorkerConnection>,
+        response: MigrationAdoptSender,
     },
     Shutdown,
 }
 
 #[derive(Debug)]
+enum WorkerEvent {
+    ConnectionClosed { connection_id: u64 },
+}
+
+#[derive(Debug)]
+struct MigratedWorkerConnection {
+    connection: WorkerConnection,
+}
+
+#[derive(Debug)]
 struct WorkerConnection {
+    connection_id: u64,
     socket: TcpStream,
     logical: ServerConnection,
     write_buffer: Vec<u8>,
@@ -622,8 +788,9 @@ struct WorkerConnection {
 }
 
 impl WorkerConnection {
-    fn new(socket: TcpStream, protocol: ClientProtocol) -> Self {
+    fn new(connection_id: u64, socket: TcpStream, protocol: ClientProtocol) -> Self {
         Self {
+            connection_id,
             socket,
             logical: ServerApp::new_connection(protocol),
             write_buffer: Vec::new(),
@@ -697,6 +864,8 @@ impl WorkerConnection {
 struct WorkerIoState {
     connections: HashMap<Token, WorkerConnection>,
     pending_requests_for_worker: usize,
+    active_parse_tokens: VecDeque<Token>,
+    in_active_parse_set: HashSet<Token>,
     active_deferred_tokens: VecDeque<Token>,
     in_active_deferred_set: HashSet<Token>,
     detached_runtime_tickets: Vec<RuntimeReplyTicket>,
@@ -709,6 +878,8 @@ impl WorkerIoState {
         Self {
             connections: HashMap::new(),
             pending_requests_for_worker: 0,
+            active_parse_tokens: VecDeque::new(),
+            in_active_parse_set: HashSet::new(),
             active_deferred_tokens: VecDeque::new(),
             in_active_deferred_set: HashSet::new(),
             detached_runtime_tickets: Vec::new(),
@@ -752,6 +923,12 @@ struct WorkerHandle {
     join: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerDispatchWindow {
+    start: usize,
+    count: usize,
+}
+
 /// Acceptor + fixed I/O worker runtime.
 ///
 /// The acceptor thread only accepts/dispatches sockets and coordinates command execution against
@@ -761,9 +938,16 @@ pub struct ThreadedServerReactor {
     acceptor_events: Events,
     listeners: Vec<ReactorListener>,
     workers: Vec<WorkerHandle>,
+    worker_events: Receiver<WorkerEvent>,
     #[cfg(test)]
     worker_connection_counts: Vec<Arc<AtomicUsize>>,
-    next_worker: usize,
+    dispatch_window: WorkerDispatchWindow,
+    next_rr_offset: usize,
+    use_peer_hash_dispatch: bool,
+    migration_enabled: bool,
+    next_connection_id: u64,
+    connection_owner_by_id: HashMap<u64, usize>,
+    migrated_connections: HashSet<u64>,
 }
 
 impl ThreadedServerReactor {
@@ -772,6 +956,7 @@ impl ThreadedServerReactor {
     /// # Errors
     ///
     /// Returns `DflyError::InvalidState` if listener bind/registration or worker spawn fails.
+    #[cfg(test)]
     pub fn bind(
         addr: SocketAddr,
         config: ServerReactorConfig,
@@ -799,7 +984,12 @@ impl ThreadedServerReactor {
         let (max_pending_per_connection, max_pending_per_worker) =
             config.normalized_pending_request_limits();
         let worker_count = config.normalized_io_worker_count();
+        let dispatch_window = WorkerDispatchWindow {
+            start: config.normalized_dispatch_start(worker_count),
+            count: config.normalized_dispatch_count(worker_count),
+        };
         let max_events = config.normalized_max_events();
+        let (worker_event_sender, worker_event_receiver) = mpsc::channel::<WorkerEvent>();
 
         let mut resp_listener = TcpListener::bind(resp_addr)
             .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
@@ -845,6 +1035,7 @@ impl ThreadedServerReactor {
             let (command_sender, command_receiver) = mpsc::channel::<WorkerCommand>();
             let executor = app_executor.clone();
             let live_connection_count = Arc::new(AtomicUsize::new(0));
+            let event_sender = worker_event_sender.clone();
             #[cfg(test)]
             worker_connection_counts.push(Arc::clone(&live_connection_count));
             let join = thread::Builder::new()
@@ -861,6 +1052,7 @@ impl ThreadedServerReactor {
                         },
                         &executor,
                         live_connection_count,
+                        &event_sender,
                     );
                 })
                 .map_err(|error| {
@@ -877,9 +1069,16 @@ impl ThreadedServerReactor {
             acceptor_events: Events::with_capacity(max_events),
             listeners,
             workers,
+            worker_events: worker_event_receiver,
             #[cfg(test)]
             worker_connection_counts,
-            next_worker: 0,
+            dispatch_window,
+            next_rr_offset: 0,
+            use_peer_hash_dispatch: config.use_peer_hash_dispatch,
+            migration_enabled: config.enable_connection_migration,
+            next_connection_id: 1,
+            connection_owner_by_id: HashMap::new(),
+            migrated_connections: HashSet::new(),
         })
     }
 
@@ -904,6 +1103,8 @@ impl ThreadedServerReactor {
                 accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
             }
         }
+        self.drain_worker_events();
+        self.maybe_rebalance_connections();
         Ok(snapshots.len().saturating_add(accepted))
     }
 
@@ -923,6 +1124,16 @@ impl ThreadedServerReactor {
             .iter()
             .map(|count| count.load(Ordering::Acquire))
             .collect::<Vec<_>>()
+    }
+
+    #[cfg(test)]
+    fn active_connection_ids(&self) -> Vec<u64> {
+        self.connection_owner_by_id.keys().copied().collect::<Vec<_>>()
+    }
+
+    #[cfg(test)]
+    fn connection_owner(&self, connection_id: u64) -> Option<usize> {
+        self.connection_owner_by_id.get(&connection_id).copied()
     }
 
     fn listener_index(&self, token: Token) -> Option<usize> {
@@ -973,11 +1184,17 @@ impl ThreadedServerReactor {
             match accept_result {
                 Ok((socket, _peer)) => {
                     let _ = socket.set_nodelay(true);
-                    let worker_id = self.allocate_worker_index();
+                    let connection_id = self.allocate_connection_id();
+                    let worker_id = self.allocate_worker_index(&socket);
                     self.dispatch_to_worker(
                         worker_id,
-                        WorkerCommand::AddConnection { protocol, socket },
+                        WorkerCommand::AddConnection {
+                            connection_id,
+                            protocol,
+                            socket,
+                        },
                     )?;
+                    let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
                     accepted = accepted.saturating_add(1);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1000,11 +1217,258 @@ impl ThreadedServerReactor {
         })
     }
 
-    fn allocate_worker_index(&mut self) -> usize {
-        let worker_id = self.next_worker;
-        let worker_count = self.workers.len().max(1);
-        self.next_worker = (self.next_worker + 1) % worker_count;
-        worker_id
+    fn allocate_connection_id(&mut self) -> u64 {
+        let connection_id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.saturating_add(1);
+        connection_id
+    }
+
+    fn allocate_worker_index(&mut self, socket: &TcpStream) -> usize {
+        if self.use_peer_hash_dispatch
+            && let Some(worker_id) = self.select_worker_by_peer_hash(socket)
+        {
+            return worker_id;
+        }
+        let offset = self.next_rr_offset % self.dispatch_window.count.max(1);
+        self.next_rr_offset = (self.next_rr_offset + 1) % self.dispatch_window.count.max(1);
+        (self.dispatch_window.start + offset) % self.workers.len().max(1)
+    }
+
+    fn select_worker_by_peer_hash(&self, socket: &TcpStream) -> Option<usize> {
+        // Current "affinity" mode is stable peer-hash dispatch, not SO_INCOMING_CPU lookup.
+        // This keeps selection deterministic without unsafe platform-specific socket calls.
+        let peer = socket.peer_addr().ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        peer.hash(&mut hasher);
+        let bucket = usize::try_from(hasher.finish()).ok()?;
+        let offset = bucket % self.dispatch_window.count.max(1);
+        Some((self.dispatch_window.start + offset) % self.workers.len().max(1))
+    }
+
+    fn drain_worker_events(&mut self) {
+        while let Ok(WorkerEvent::ConnectionClosed { connection_id }) =
+            self.worker_events.try_recv()
+        {
+            let _ = self.connection_owner_by_id.remove(&connection_id);
+            let _ = self.migrated_connections.remove(&connection_id);
+        }
+    }
+
+    fn dispatch_adopt_for_migration(
+        &self,
+        worker_id: usize,
+        migrated: MigratedWorkerConnection,
+    ) -> Result<MigrationAdoptReceiver, MigrationDispatchFailure>
+    {
+        let Some(worker) = self.workers.get(worker_id) else {
+            return Err(MigrationDispatchFailure {
+                error: DflyError::InvalidState("io worker index is out of range"),
+                connection: Box::new(migrated),
+            });
+        };
+        let (response_sender, response_receiver) = mpsc::channel::<MigrationAdoptResult>();
+        let command = WorkerCommand::AdoptMigratedConnection {
+            connection: Box::new(migrated),
+            response: response_sender,
+        };
+        match worker.sender.send(command) {
+            Ok(()) => Ok(response_receiver),
+            Err(send_error) => {
+                let WorkerCommand::AdoptMigratedConnection { connection, .. } = send_error.0 else {
+                    unreachable!("send error must return the same command variant");
+                };
+                Err(MigrationDispatchFailure {
+                    error: DflyError::Io(format!(
+                        "send migration adopt command to io worker {worker_id} failed because worker is unavailable"
+                    )),
+                    connection,
+                })
+            }
+        }
+    }
+
+    fn rollback_migration_to_source(
+        &self,
+        source_worker: usize,
+        migrated: MigratedWorkerConnection,
+    ) -> DflyResult<()> {
+        let receiver = match self.dispatch_adopt_for_migration(source_worker, migrated) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                return Err(DflyError::Io(format!(
+                    "migration rollback failed before reaching source worker: {}",
+                    error.error
+                )));
+            }
+        };
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DflyError::Io(
+                "migration rollback failed because source worker rejected restored connection"
+                    .to_owned(),
+            )),
+            Err(_) => Err(DflyError::InvalidState(
+                "migration rollback timed out while restoring source worker",
+            )),
+        }
+    }
+
+    fn maybe_rebalance_connections(&mut self) {
+        if !self.migration_enabled || self.workers.len() < 2 || self.connection_owner_by_id.len() < 2
+        {
+            return;
+        }
+        let mut counts = vec![0_usize; self.workers.len()];
+        for owner in self.connection_owner_by_id.values().copied() {
+            if let Some(count) = counts.get_mut(owner) {
+                *count = count.saturating_add(1);
+            }
+        }
+        let Some((source_worker, source_count)) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| **count)
+            .map(|(index, count)| (index, *count))
+        else {
+            return;
+        };
+        let Some((target_worker, target_count)) = counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, count)| **count)
+            .map(|(index, count)| (index, *count))
+        else {
+            return;
+        };
+        if source_count <= target_count.saturating_add(1) {
+            return;
+        }
+
+        let Some(connection_id) = self
+            .connection_owner_by_id
+            .iter()
+            .find_map(|(connection_id, owner)| {
+                if *owner == source_worker && !self.migrated_connections.contains(connection_id) {
+                    Some(*connection_id)
+                } else {
+                    None
+                }
+            })
+        else {
+            return;
+        };
+        let _ = self.migrate_connection(connection_id, target_worker);
+    }
+
+    /// Migrates one live connection to a target worker using constrained Dragonfly-style rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when migration is disabled, the connection is unknown,
+    /// migration already happened for this connection, or source/target worker handoff fails.
+    pub fn migrate_connection(
+        &mut self,
+        connection_id: u64,
+        target_worker: usize,
+    ) -> DflyResult<()> {
+        if !self.migration_enabled {
+            return Err(DflyError::InvalidState(
+                "connection migration is disabled by config",
+            ));
+        }
+        if self.migrated_connections.contains(&connection_id) {
+            return Err(DflyError::InvalidState(
+                "connection has already been migrated once",
+            ));
+        }
+        let Some(source_worker) = self.connection_owner_by_id.get(&connection_id).copied() else {
+            return Err(DflyError::InvalidState("connection is not tracked by acceptor"));
+        };
+        if source_worker == target_worker {
+            return Ok(());
+        }
+        if target_worker >= self.workers.len() {
+            return Err(DflyError::InvalidState("target worker index is out of range"));
+        }
+
+        let (reply_sender, reply_receiver) =
+            mpsc::channel::<Result<MigratedWorkerConnection, String>>();
+        self.dispatch_to_worker(
+            source_worker,
+            WorkerCommand::TakeConnectionForMigration {
+                connection_id,
+                response: reply_sender,
+            },
+        )?;
+        let migrated = reply_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| {
+                DflyError::InvalidState("migration source worker timed out while detaching")
+            })?
+            .map_err(|message| {
+                DflyError::Io(format!("migration source worker rejected handoff: {message}"))
+            })?;
+        let adopt_receiver = match self.dispatch_adopt_for_migration(target_worker, migrated) {
+            Ok(receiver) => receiver,
+            Err(dispatch_error) => {
+                self.rollback_migration_to_source(source_worker, *dispatch_error.connection)?;
+                return Err(dispatch_error.error);
+            }
+        };
+        match adopt_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => {}
+            Ok(Err(rollback_connection)) => {
+                self.rollback_migration_to_source(source_worker, *rollback_connection)?;
+                return Err(DflyError::Io(
+                    "migration target worker rejected handoff".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(DflyError::InvalidState(
+                    "migration target worker timed out while adopting connection",
+                ));
+            }
+        }
+        let _ = self.connection_owner_by_id.insert(connection_id, target_worker);
+        let _ = self.migrated_connections.insert(connection_id);
+        Ok(())
+    }
+}
+
+/// `epoll` backend implementation for the top-level network engine.
+pub struct EpollBackend {
+    reactor: ThreadedServerReactor,
+}
+
+impl EpollBackend {
+    /// Binds listeners/workers for the epoll backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when listener or worker startup fails.
+    pub fn bind_with_memcache(
+        resp_addr: SocketAddr,
+        memcache_addr: Option<SocketAddr>,
+        config: ServerReactorConfig,
+        app_executor: &AppExecutor,
+    ) -> DflyResult<Self> {
+        Ok(Self {
+            reactor: ThreadedServerReactor::bind_with_memcache(
+                resp_addr,
+                memcache_addr,
+                config,
+                app_executor,
+            )?,
+        })
+    }
+
+    /// Runs one poll cycle of the epoll backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::Io` when polling fails.
+    pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
+        self.reactor.poll_once(timeout)
     }
 }
 
@@ -1027,6 +1491,7 @@ fn io_worker_thread_main(
     backpressure: BackpressureThresholds,
     app_executor: &AppExecutor,
     live_connection_count: Arc<AtomicUsize>,
+    worker_event_sender: &Sender<WorkerEvent>,
 ) {
     let Ok(mut poll) = Poll::new() else {
         return;
@@ -1038,7 +1503,20 @@ fn io_worker_thread_main(
         if !drain_worker_commands(&poll, command_receiver, &mut io_state) {
             return;
         }
-        progress_worker_runtime_replies(&poll, app_executor, &mut io_state, backpressure);
+        progress_worker_parse_backlog(
+            &poll,
+            app_executor,
+            &mut io_state,
+            backpressure,
+            worker_event_sender,
+        );
+        progress_worker_runtime_replies(
+            &poll,
+            app_executor,
+            &mut io_state,
+            backpressure,
+            worker_event_sender,
+        );
 
         if poll
             .poll(&mut events, Some(THREADED_IO_WORKER_POLL_TIMEOUT))
@@ -1057,9 +1535,23 @@ fn io_worker_thread_main(
                 app_executor,
                 &mut io_state,
                 backpressure,
+                worker_event_sender,
             );
         }
-        progress_worker_runtime_replies(&poll, app_executor, &mut io_state, backpressure);
+        progress_worker_parse_backlog(
+            &poll,
+            app_executor,
+            &mut io_state,
+            backpressure,
+            worker_event_sender,
+        );
+        progress_worker_runtime_replies(
+            &poll,
+            app_executor,
+            &mut io_state,
+            backpressure,
+            worker_event_sender,
+        );
         reap_detached_runtime_replies(app_executor, &mut io_state);
     }
 }
@@ -1072,6 +1564,7 @@ fn drain_worker_commands(
     loop {
         match command_receiver.try_recv() {
             Ok(WorkerCommand::AddConnection {
+                connection_id,
                 protocol,
                 mut socket,
             }) => {
@@ -1084,16 +1577,128 @@ fn drain_worker_commands(
                 {
                     continue;
                 }
-                let _ = io_state
-                    .connections
-                    .insert(token, WorkerConnection::new(socket, protocol));
+                let _ = io_state.connections.insert(
+                    token,
+                    WorkerConnection::new(connection_id, socket, protocol),
+                );
                 let _ = io_state
                     .live_connection_count
                     .fetch_add(1, Ordering::AcqRel);
             }
+            Ok(WorkerCommand::TakeConnectionForMigration {
+                connection_id,
+                response,
+            }) => {
+                let migration = take_worker_connection_for_migration(
+                    poll,
+                    connection_id,
+                    io_state,
+                );
+                let _ = response.send(migration);
+            }
+            Ok(WorkerCommand::AdoptMigratedConnection {
+                connection,
+                response,
+            }) => {
+                let adopted = adopt_migrated_worker_connection(poll, *connection, io_state);
+                let _ = response.send(adopted);
+            }
             Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => return false,
             Err(TryRecvError::Empty) => return true,
         }
+    }
+}
+
+fn progress_worker_parse_backlog(
+    poll: &Poll,
+    app_executor: &AppExecutor,
+    io_state: &mut WorkerIoState,
+    backpressure: BackpressureThresholds,
+    worker_event_sender: &Sender<WorkerEvent>,
+) {
+    let active_count = io_state.active_parse_tokens.len();
+    for _ in 0..active_count {
+        let Some(token) = io_state.active_parse_tokens.pop_front() else {
+            break;
+        };
+        let _ = io_state.in_active_parse_set.remove(&token);
+        let Some(mut connection) = io_state.connections.remove(&token) else {
+            continue;
+        };
+
+        let mut should_requeue_parse = false;
+        if connection.can_read() {
+            match drain_worker_parsed_commands(
+                token,
+                &mut connection,
+                app_executor,
+                io_state,
+                backpressure,
+                WORKER_PARSE_BUDGET_PER_READ,
+            ) {
+                ParseDrainAction::StopReadTurn => {
+                    should_requeue_parse = true;
+                }
+                ParseDrainAction::CloseConnection => {
+                    close_worker_connection(
+                        poll,
+                        token,
+                        connection,
+                        io_state,
+                        app_executor,
+                        worker_event_sender,
+                    );
+                    continue;
+                }
+                ParseDrainAction::ContinueParserDrain | ParseDrainAction::ContinueSocketRead => {}
+            }
+        } else if connection.read_paused_by_command_backpressure
+            && connection.logical.parser.pending_bytes() > 0
+        {
+            // Keep parse backlog active while command backpressure is armed so parser progress
+            // resumes as soon as pending request counters drop.
+            should_requeue_parse = true;
+        }
+
+        drain_connection_pending_runtime_replies(&mut connection, app_executor, io_state, backpressure);
+        if connection.should_try_flush() {
+            flush_worker_connection_writes(
+                &mut connection,
+                backpressure.high,
+                backpressure.low,
+                WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
+            );
+        }
+        if connection.should_close_now() {
+            close_worker_connection(
+                poll,
+                token,
+                connection,
+                io_state,
+                app_executor,
+                worker_event_sender,
+            );
+            continue;
+        }
+        if refresh_worker_interest(poll, token, &mut connection).is_err() {
+            close_worker_connection(
+                poll,
+                token,
+                connection,
+                io_state,
+                app_executor,
+                worker_event_sender,
+            );
+            continue;
+        }
+
+        if should_requeue_parse {
+            enqueue_active_parse_connection(io_state, token);
+        }
+        if !connection.pending_runtime_requests.is_empty() {
+            enqueue_active_deferred_connection(io_state, token);
+        }
+        let _ = io_state.connections.insert(token, connection);
     }
 }
 
@@ -1102,6 +1707,7 @@ fn progress_worker_runtime_replies(
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
     backpressure: BackpressureThresholds,
+    worker_event_sender: &Sender<WorkerEvent>,
 ) {
     let active_count = io_state.active_deferred_tokens.len();
     for _ in 0..active_count {
@@ -1128,11 +1734,25 @@ fn progress_worker_runtime_replies(
             );
         }
         if connection.should_close_now() {
-            close_worker_connection(poll, token, connection, io_state, app_executor);
+            close_worker_connection(
+                poll,
+                token,
+                connection,
+                io_state,
+                app_executor,
+                worker_event_sender,
+            );
             continue;
         }
         if refresh_worker_interest(poll, token, &mut connection).is_err() {
-            close_worker_connection(poll, token, connection, io_state, app_executor);
+            close_worker_connection(
+                poll,
+                token,
+                connection,
+                io_state,
+                app_executor,
+                worker_event_sender,
+            );
             continue;
         }
         if has_pending_runtime {
@@ -1148,6 +1768,7 @@ fn handle_worker_connection_event(
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
     backpressure: BackpressureThresholds,
+    worker_event_sender: &Sender<WorkerEvent>,
 ) {
     let Some(mut connection) = io_state.connections.remove(&snapshot.token) else {
         return;
@@ -1182,12 +1803,26 @@ fn handle_worker_connection_event(
     }
 
     if connection.should_close_now() {
-        close_worker_connection(poll, snapshot.token, connection, io_state, app_executor);
+        close_worker_connection(
+            poll,
+            snapshot.token,
+            connection,
+            io_state,
+            app_executor,
+            worker_event_sender,
+        );
         return;
     }
 
     if refresh_worker_interest(poll, snapshot.token, &mut connection).is_err() {
-        close_worker_connection(poll, snapshot.token, connection, io_state, app_executor);
+        close_worker_connection(
+            poll,
+            snapshot.token,
+            connection,
+            io_state,
+            app_executor,
+            worker_event_sender,
+        );
         return;
     }
 
@@ -1222,7 +1857,11 @@ fn read_worker_connection_bytes(
                 ) {
                     ParseDrainAction::ContinueParserDrain
                     | ParseDrainAction::ContinueSocketRead => {}
-                    ParseDrainAction::StopReadTurn | ParseDrainAction::CloseConnection => return,
+                    ParseDrainAction::StopReadTurn => {
+                        enqueue_active_parse_connection(io_state, token);
+                        return;
+                    }
+                    ParseDrainAction::CloseConnection => return,
                 }
                 if connection.read_paused_by_backpressure {
                     // Once backpressure is armed we must stop draining socket bytes in
@@ -1409,6 +2048,12 @@ fn drain_connection_pending_runtime_replies(
             io_state,
             backpressure,
         );
+    }
+}
+
+fn enqueue_active_parse_connection(io_state: &mut WorkerIoState, token: Token) {
+    if io_state.in_active_parse_set.insert(token) {
+        io_state.active_parse_tokens.push_back(token);
     }
 }
 
@@ -1605,7 +2250,9 @@ fn close_worker_connection(
     mut connection: WorkerConnection,
     io_state: &mut WorkerIoState,
     app_executor: &AppExecutor,
+    worker_event_sender: &Sender<WorkerEvent>,
 ) {
+    let _ = io_state.in_active_parse_set.remove(&token);
     let _ = io_state.in_active_deferred_set.remove(&token);
     if connection.pending_request_count > 0 {
         io_state.pending_requests_for_worker = io_state
@@ -1622,6 +2269,81 @@ fn close_worker_connection(
         Ordering::Acquire,
         |current| Some(current.saturating_sub(1)),
     );
+    let _ = worker_event_sender.send(WorkerEvent::ConnectionClosed {
+        connection_id: connection.connection_id,
+    });
+}
+
+fn can_migrate_connection(connection: &WorkerConnection) -> bool {
+    connection.lifecycle == ConnectionLifecycle::Active
+        && connection.pending_request_count == 0
+        && connection.pending_runtime_requests.is_empty()
+        && connection.logical.parser.pending_bytes() == 0
+        && connection.reply_order.completed.is_empty()
+        && connection.write_buffer.is_empty()
+}
+
+fn take_worker_connection_for_migration(
+    poll: &Poll,
+    connection_id: u64,
+    io_state: &mut WorkerIoState,
+) -> Result<MigratedWorkerConnection, String> {
+    let Some((&token, _)) = io_state
+        .connections
+        .iter()
+        .find(|(_, connection)| connection.connection_id == connection_id)
+    else {
+        return Err("connection is not owned by worker".to_owned());
+    };
+    let Some(mut connection) = io_state.connections.remove(&token) else {
+        return Err("connection disappeared during migration".to_owned());
+    };
+    if !can_migrate_connection(&connection) {
+        let _ = io_state.connections.insert(token, connection);
+        return Err("connection state does not allow migration".to_owned());
+    }
+    let _ = io_state.in_active_parse_set.remove(&token);
+    let _ = io_state.in_active_deferred_set.remove(&token);
+    let _ = poll.registry().deregister(&mut connection.socket);
+    let _ = io_state.live_connection_count.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |current| Some(current.saturating_sub(1)),
+    );
+    Ok(MigratedWorkerConnection { connection })
+}
+
+fn adopt_migrated_worker_connection(
+    poll: &Poll,
+    mut migrated: MigratedWorkerConnection,
+    io_state: &mut WorkerIoState,
+) -> MigrationAdoptResult {
+    let token = Token(io_state.next_token);
+    io_state.next_token = io_state.next_token.saturating_add(1);
+    migrated.connection.interest = if migrated.connection.can_read() {
+        Interest::READABLE
+    } else {
+        Interest::WRITABLE
+    };
+    if !migrated.connection.write_buffer.is_empty() {
+        migrated.connection.interest |= Interest::WRITABLE;
+    }
+    if poll
+        .registry()
+        .register(
+            &mut migrated.connection.socket,
+            token,
+            migrated.connection.interest,
+        )
+        .is_err()
+    {
+        return Err(Box::new(migrated));
+    }
+    let _ = io_state.connections.insert(token, migrated.connection);
+    let _ = io_state
+        .live_connection_count
+        .fetch_add(1, Ordering::AcqRel);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1634,6 +2356,7 @@ mod tests {
     use dfly_common::config::RuntimeConfig;
     use dfly_core::command::CommandFrame;
     use dfly_core::runtime::RuntimeEnvelope;
+    use dfly_facade::net_proactor::{MultiplexApi, MultiplexSelection, select_multiplex_backend};
     use dfly_facade::protocol::ClientProtocol;
     use googletest::prelude::*;
     use mio::{Poll, Token};
@@ -1885,6 +2608,7 @@ mod tests {
             io_worker_count: 1,
             max_pending_requests_per_connection: 32,
             max_pending_requests_per_worker: 128,
+            ..ServerReactorConfig::default()
         };
         let watermarks = config
             .normalized_backpressure_watermarks()
@@ -1902,6 +2626,7 @@ mod tests {
             io_worker_count: 1,
             max_pending_requests_per_connection: 32,
             max_pending_requests_per_worker: 128,
+            ..ServerReactorConfig::default()
         };
         let error = config
             .normalized_backpressure_watermarks()
@@ -1911,6 +2636,320 @@ mod tests {
             format!("{error}").contains("low watermark must be smaller than high watermark"),
             eq(true)
         );
+    }
+
+    #[rstest]
+    fn backend_fallback_selection() {
+        let selection = select_multiplex_backend(&RuntimeConfig {
+            force_epoll: true,
+            ..RuntimeConfig::default()
+        });
+        assert_that!(selection.api_label(), eq("epoll"));
+        assert_that!(selection.fallback_reason.is_some(), eq(true));
+    }
+
+    #[rstest]
+    fn net_engine_rejects_unimplemented_io_uring_backend() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let selection = MultiplexSelection {
+            api: MultiplexApi::IoUring,
+            fallback_reason: None,
+        };
+        let bind_result = super::NetEngine::bind_with_memcache(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            ServerReactorConfig::default(),
+            selection,
+            &app_executor,
+        );
+        let error_text = match bind_result {
+            Ok(_) => panic!("io_uring backend should not bind without implementation"),
+            Err(error) => format!("{error}"),
+        };
+        assert_that!(
+            error_text.contains("not implemented"),
+            eq(true)
+        );
+    }
+
+    #[rstest]
+    fn listener_affinity_distribution() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 4,
+            io_worker_dispatch_start: 1,
+            io_worker_dispatch_count: 2,
+            ..ServerReactorConfig::default()
+        };
+        let mut reactor = ThreadedServerReactor::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            config,
+            &app_executor,
+        )
+        .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local address should be available");
+
+        let mut clients = Vec::new();
+        for _ in 0..8 {
+            let client = TcpStream::connect(listen_addr).expect("connect should succeed");
+            clients.push(client);
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            let counts = reactor.worker_connection_counts();
+            if counts[1] > 0 && counts[2] > 0 {
+                assert_that!(counts[0], eq(0_usize));
+                assert_that!(counts[3], eq(0_usize));
+                return;
+            }
+        }
+        panic!("expected connection distribution to stay within configured dispatch window");
+    }
+
+    #[rstest]
+    fn connection_migration_preserves_order() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            io_worker_dispatch_count: 2,
+            enable_connection_migration: true,
+            ..ServerReactorConfig::default()
+        };
+        let mut reactor = ThreadedServerReactor::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            config,
+            &app_executor,
+        )
+        .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local address should be available");
+        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+
+        let connection_id = {
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut connection_id = None;
+            while Instant::now() < deadline {
+                let _ = reactor
+                    .poll_once(Some(Duration::from_millis(5)))
+                    .expect("threaded reactor poll should succeed");
+                if let Some(id) = reactor.active_connection_ids().first().copied() {
+                    connection_id = Some(id);
+                    break;
+                }
+            }
+            connection_id.expect("accepted connection should be tracked")
+        };
+
+        let owner = reactor
+            .connection_owner(connection_id)
+            .expect("connection owner should be known");
+        let target_worker = (owner + 1) % 2;
+        reactor
+            .migrate_connection(connection_id, target_worker)
+            .expect("migration should succeed");
+
+        let second_migration = reactor.migrate_connection(connection_id, owner);
+        assert_that!(second_migration.is_err(), eq(true));
+
+        let mut request = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..24 {
+            let key = format!("mk{index}");
+            let value = format!("mv{index}");
+            request.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.len(),
+                    key,
+                    value.len(),
+                    value
+                )
+                .as_bytes(),
+            );
+            request.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
+            );
+            expected.extend_from_slice(b"+OK\r\n");
+            expected.extend_from_slice(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
+        }
+        client
+            .write_all(&request)
+            .expect("pipeline write should succeed");
+
+        let mut response = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+
+            let mut chunk = [0_u8; 4096];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => response.extend_from_slice(&chunk[..read_len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("pipeline read failed: {error}"),
+            }
+            if response.len() >= expected.len() {
+                break;
+            }
+        }
+
+        assert_that!(&response, eq(&expected));
+    }
+
+    #[rstest]
+    fn connection_migration_failure_rolls_back_to_source_owner() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            io_worker_dispatch_count: 2,
+            enable_connection_migration: true,
+            ..ServerReactorConfig::default()
+        };
+        let mut reactor = ThreadedServerReactor::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            config,
+            &app_executor,
+        )
+        .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local address should be available");
+        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+
+        let connection_id = {
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut connection_id = None;
+            while Instant::now() < deadline {
+                let _ = reactor
+                    .poll_once(Some(Duration::from_millis(5)))
+                    .expect("threaded reactor poll should succeed");
+                if let Some(id) = reactor.active_connection_ids().first().copied() {
+                    connection_id = Some(id);
+                    break;
+                }
+            }
+            connection_id.expect("accepted connection should be tracked")
+        };
+
+        let owner = reactor
+            .connection_owner(connection_id)
+            .expect("connection owner should be known");
+        let target_worker = (owner + 1) % 2;
+        reactor.workers[target_worker]
+            .sender
+            .send(super::WorkerCommand::Shutdown)
+            .expect("target worker shutdown signal should send");
+        if let Some(join) = reactor.workers[target_worker].join.take() {
+            let _ = join.join();
+        }
+
+        let migration = reactor.migrate_connection(connection_id, target_worker);
+        assert_that!(migration.is_err(), eq(true));
+        assert_that!(reactor.connection_owner(connection_id), eq(Some(owner)));
+
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .expect("ping write should succeed after rollback");
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        let mut response = Vec::new();
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            let mut chunk = [0_u8; 64];
+            match client.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read_len) => {
+                    response.extend_from_slice(&chunk[..read_len]);
+                    if response.ends_with(b"+PONG\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("ping read failed after rollback: {error}"),
+            }
+        }
+
+        assert_that!(&response, eq(&b"+PONG\r\n".to_vec()));
+    }
+
+    #[rstest]
+    fn connection_close_cleans_migrated_marker() {
+        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
+        let config = ServerReactorConfig {
+            io_worker_count: 2,
+            io_worker_dispatch_count: 2,
+            enable_connection_migration: true,
+            ..ServerReactorConfig::default()
+        };
+        let mut reactor = ThreadedServerReactor::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            config,
+            &app_executor,
+        )
+        .expect("threaded reactor bind should succeed");
+        let listen_addr = reactor
+            .local_addr()
+            .expect("local address should be available");
+        let client = TcpStream::connect(listen_addr).expect("connect should succeed");
+        client
+            .set_nonblocking(true)
+            .expect("client should be nonblocking");
+
+        let connection_id = {
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut connection_id = None;
+            while Instant::now() < deadline {
+                let _ = reactor
+                    .poll_once(Some(Duration::from_millis(5)))
+                    .expect("threaded reactor poll should succeed");
+                if let Some(id) = reactor.active_connection_ids().first().copied() {
+                    connection_id = Some(id);
+                    break;
+                }
+            }
+            connection_id.expect("accepted connection should be tracked")
+        };
+
+        let owner = reactor
+            .connection_owner(connection_id)
+            .expect("connection owner should be known");
+        let target_worker = (owner + 1) % 2;
+        reactor
+            .migrate_connection(connection_id, target_worker)
+            .expect("migration should succeed");
+        assert_that!(reactor.migrated_connections.contains(&connection_id), eq(true));
+
+        let _ = client.shutdown(Shutdown::Both);
+        drop(client);
+
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            let _ = reactor
+                .poll_once(Some(Duration::from_millis(5)))
+                .expect("threaded reactor poll should succeed");
+            if reactor.connection_owner(connection_id).is_none() {
+                break;
+            }
+        }
+
+        assert_that!(reactor.connection_owner(connection_id).is_none(), eq(true));
+        assert_that!(reactor.migrated_connections.contains(&connection_id), eq(false));
     }
 
     #[rstest]
@@ -2579,6 +3618,7 @@ mod tests {
             .expect("client blocking mode should be configurable");
 
         let mut connection = super::WorkerConnection::new(
+            1,
             mio::net::TcpStream::from_std(server_stream),
             ClientProtocol::Resp,
         );
@@ -2640,6 +3680,7 @@ mod tests {
             .expect("accepted socket should be nonblocking");
 
         let mut connection = super::WorkerConnection::new(
+            1,
             mio::net::TcpStream::from_std(server_stream),
             ClientProtocol::Resp,
         );
@@ -2660,7 +3701,15 @@ mod tests {
 
         let poll = Poll::new().expect("poll creation should succeed");
         let mut io_state = super::WorkerIoState::new(Arc::new(AtomicUsize::new(1)));
-        super::close_worker_connection(&poll, Token(2), connection, &mut io_state, &app_executor);
+        let (event_sender, _event_receiver) = std::sync::mpsc::channel::<super::WorkerEvent>();
+        super::close_worker_connection(
+            &poll,
+            Token(2),
+            connection,
+            &mut io_state,
+            &app_executor,
+            &event_sender,
+        );
         assert_that!(io_state.detached_runtime_tickets.len(), eq(1_usize));
 
         app_executor.with_app(|app| {

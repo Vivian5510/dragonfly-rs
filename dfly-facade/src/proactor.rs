@@ -181,7 +181,7 @@ enum ProactorParseCompletion {
     Released,
 }
 
-/// In-memory proactor pool using one worker thread per I/O queue.
+/// In-memory parser-worker pool using one worker thread per I/O queue.
 ///
 /// Each worker hosts a current-thread Tokio runtime and executes parse callbacks inside local
 /// tasks, matching Dragonfly's "thread + fiber" shape at the network ingress boundary.
@@ -198,6 +198,9 @@ pub struct ProactorPool {
 }
 const PROACTOR_WORKER_YIELD_INTERVAL: usize = 64;
 const DEFAULT_QUEUE_SOFT_LIMIT: usize = usize::MAX;
+
+/// Compatibility alias clarifying that this pool is parser-focused, not the network acceptor.
+pub type ParserWorkerPool = ProactorPool;
 
 fn update_peak_pending(peak: &AtomicUsize, candidate: usize) {
     let mut observed = peak.load(Ordering::Acquire);

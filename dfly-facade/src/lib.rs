@@ -1,6 +1,7 @@
 //! Facade layer abstractions for protocol and connection lifecycle.
 
 pub mod connection;
+pub mod net_proactor;
 pub mod proactor;
 pub mod protocol;
 
@@ -21,8 +22,12 @@ impl FacadeModule {
     /// Builds the facade bootstrap model from process config.
     #[must_use]
     pub fn from_config(config: &RuntimeConfig) -> Self {
-        // Reactor runtime maps accepted sockets across a fixed I/O worker set.
-        let io_thread_count = config.shard_count.get().max(1);
+        // Runtime keeps one parser/socket owner per I/O worker.
+        let io_thread_count = if config.conn_io_threads == 0 {
+            config.shard_count.get().max(1)
+        } else {
+            config.conn_io_threads.max(1)
+        };
         Self {
             redis_port: config.redis_port,
             memcached_port: config.memcached_port,
