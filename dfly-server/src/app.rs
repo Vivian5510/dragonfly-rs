@@ -1,6 +1,7 @@
 //! Process composition root for `dfly-server`.
 
 mod runtime_exec;
+mod direct_runtime;
 mod tx_runtime;
 mod runtime_ticket;
 mod bootstrap;
