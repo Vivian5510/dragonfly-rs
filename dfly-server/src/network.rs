@@ -4,7 +4,7 @@
 //! from readiness events. This module provides the same shape for `dragonfly-rs`:
 //! per-protocol listeners + per-connection state machine driven by `mio::Poll`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -697,6 +697,8 @@ impl WorkerConnection {
 struct WorkerIoState {
     connections: HashMap<Token, WorkerConnection>,
     pending_requests_for_worker: usize,
+    active_deferred_tokens: VecDeque<Token>,
+    in_active_deferred_set: HashSet<Token>,
     detached_runtime_tickets: Vec<RuntimeReplyTicket>,
     live_connection_count: Arc<AtomicUsize>,
     next_token: usize,
@@ -707,6 +709,8 @@ impl WorkerIoState {
         Self {
             connections: HashMap::new(),
             pending_requests_for_worker: 0,
+            active_deferred_tokens: VecDeque::new(),
+            in_active_deferred_set: HashSet::new(),
             detached_runtime_tickets: Vec::new(),
             live_connection_count,
             next_token: CONNECTION_TOKEN_START,
@@ -1099,9 +1103,13 @@ fn progress_worker_runtime_replies(
     io_state: &mut WorkerIoState,
     backpressure: BackpressureThresholds,
 ) {
-    let tokens = io_state.connections.keys().copied().collect::<Vec<_>>();
-    for token in &tokens {
-        let Some(mut connection) = io_state.connections.remove(token) else {
+    let active_count = io_state.active_deferred_tokens.len();
+    for _ in 0..active_count {
+        let Some(token) = io_state.active_deferred_tokens.pop_front() else {
+            break;
+        };
+        let _ = io_state.in_active_deferred_set.remove(&token);
+        let Some(mut connection) = io_state.connections.remove(&token) else {
             continue;
         };
         drain_connection_pending_runtime_replies(
@@ -1110,6 +1118,7 @@ fn progress_worker_runtime_replies(
             io_state,
             backpressure,
         );
+        let has_pending_runtime = !connection.pending_runtime_requests.is_empty();
         if connection.should_try_flush() {
             flush_worker_connection_writes(
                 &mut connection,
@@ -1119,14 +1128,17 @@ fn progress_worker_runtime_replies(
             );
         }
         if connection.should_close_now() {
-            close_worker_connection(poll, connection, io_state, app_executor);
+            close_worker_connection(poll, token, connection, io_state, app_executor);
             continue;
         }
-        if refresh_worker_interest(poll, *token, &mut connection).is_err() {
-            close_worker_connection(poll, connection, io_state, app_executor);
+        if refresh_worker_interest(poll, token, &mut connection).is_err() {
+            close_worker_connection(poll, token, connection, io_state, app_executor);
             continue;
         }
-        let _ = io_state.connections.insert(*token, connection);
+        if has_pending_runtime {
+            enqueue_active_deferred_connection(io_state, token);
+        }
+        let _ = io_state.connections.insert(token, connection);
     }
 }
 
@@ -1146,7 +1158,13 @@ fn handle_worker_connection_event(
     }
 
     if snapshot.readable() && connection.can_read() {
-        read_worker_connection_bytes(&mut connection, app_executor, io_state, backpressure);
+        read_worker_connection_bytes(
+            snapshot.token,
+            &mut connection,
+            app_executor,
+            io_state,
+            backpressure,
+        );
         drain_connection_pending_runtime_replies(
             &mut connection,
             app_executor,
@@ -1164,12 +1182,12 @@ fn handle_worker_connection_event(
     }
 
     if connection.should_close_now() {
-        close_worker_connection(poll, connection, io_state, app_executor);
+        close_worker_connection(poll, snapshot.token, connection, io_state, app_executor);
         return;
     }
 
     if refresh_worker_interest(poll, snapshot.token, &mut connection).is_err() {
-        close_worker_connection(poll, connection, io_state, app_executor);
+        close_worker_connection(poll, snapshot.token, connection, io_state, app_executor);
         return;
     }
 
@@ -1177,6 +1195,7 @@ fn handle_worker_connection_event(
 }
 
 fn read_worker_connection_bytes(
+    token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
@@ -1194,6 +1213,7 @@ fn read_worker_connection_bytes(
             Ok(read_len) => {
                 connection.logical.parser.feed_bytes(&chunk[..read_len]);
                 match drain_worker_parsed_commands(
+                    token,
                     connection,
                     app_executor,
                     io_state,
@@ -1232,6 +1252,7 @@ enum ParseDrainAction {
 }
 
 fn drain_worker_parsed_commands(
+    token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
@@ -1250,6 +1271,7 @@ fn drain_worker_parsed_commands(
         match connection.logical.parser.try_pop_command() {
             Ok(Some(parsed)) => {
                 if !execute_worker_parsed_command(
+                    token,
                     connection,
                     app_executor,
                     io_state,
@@ -1288,6 +1310,7 @@ fn worker_command_backpressure_armed(
 }
 
 fn execute_worker_parsed_command(
+    token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
@@ -1307,6 +1330,7 @@ fn execute_worker_parsed_command(
             connection
                 .pending_runtime_requests
                 .push(PendingRuntimeRequest { request_id, ticket });
+            enqueue_active_deferred_connection(io_state, token);
             connection.update_command_backpressure_state(
                 io_state.pending_requests_for_worker,
                 backpressure.max_pending_per_connection,
@@ -1364,6 +1388,12 @@ fn drain_connection_pending_runtime_replies(
             io_state,
             backpressure,
         );
+    }
+}
+
+fn enqueue_active_deferred_connection(io_state: &mut WorkerIoState, token: Token) {
+    if io_state.in_active_deferred_set.insert(token) {
+        io_state.active_deferred_tokens.push_back(token);
     }
 }
 
@@ -1538,10 +1568,12 @@ fn refresh_worker_interest(
 
 fn close_worker_connection(
     poll: &Poll,
+    token: Token,
     mut connection: WorkerConnection,
     io_state: &mut WorkerIoState,
     app_executor: &AppExecutor,
 ) {
+    let _ = io_state.in_active_deferred_set.remove(&token);
     if connection.pending_request_count > 0 {
         io_state.pending_requests_for_worker = io_state
             .pending_requests_for_worker
@@ -1571,7 +1603,7 @@ mod tests {
     use dfly_core::runtime::RuntimeEnvelope;
     use dfly_facade::protocol::ClientProtocol;
     use googletest::prelude::*;
-    use mio::Poll;
+    use mio::{Poll, Token};
     use rstest::rstest;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -2023,9 +2055,10 @@ mod tests {
     }
 
     #[rstest]
-    fn threaded_reactor_deferred_pipeline_does_not_block_other_connection_progress() {
+    fn many_idle_connections_do_not_slow_deferred_progress() {
         const PIPELINE_GETS: usize = 256;
         const PING_COUNT: usize = 12;
+        const IDLE_CLIENTS: usize = 32;
 
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let config = ServerReactorConfig {
@@ -2047,6 +2080,27 @@ mod tests {
         client_b
             .set_nonblocking(true)
             .expect("second client should be nonblocking");
+        let mut idle_clients = Vec::with_capacity(IDLE_CLIENTS);
+        for _ in 0..IDLE_CLIENTS {
+            let mut attempts = 0_u32;
+            let idle = loop {
+                attempts = attempts.saturating_add(1);
+                assert_that!(attempts <= 200, eq(true));
+                match TcpStream::connect(listen_addr) {
+                    Ok(stream) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        let _ = reactor
+                            .poll_once(Some(Duration::from_millis(1)))
+                            .expect("threaded reactor poll should succeed");
+                    }
+                    Err(error) => panic!("idle connect should succeed: {error}"),
+                }
+            };
+            idle.set_nonblocking(true)
+                .expect("idle client should be nonblocking");
+            idle_clients.push(idle);
+        }
+        assert_that!(idle_clients.len(), eq(IDLE_CLIENTS));
 
         let distribution_deadline = Instant::now() + Duration::from_millis(800);
         let mut counts = Vec::new();
@@ -2325,7 +2379,7 @@ mod tests {
     }
 
     #[rstest]
-    fn threaded_reactor_preserves_order_when_get_reply_is_deferred() {
+    fn deferred_ready_queue_preserves_reply_order() {
         let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
         let config = ServerReactorConfig {
             io_worker_count: 2,
@@ -2508,6 +2562,7 @@ mod tests {
 
         let mut io_state = super::WorkerIoState::new(Arc::new(AtomicUsize::new(0)));
         super::read_worker_connection_bytes(
+            Token(2),
             &mut connection,
             &app_executor,
             &mut io_state,
@@ -2572,7 +2627,7 @@ mod tests {
 
         let poll = Poll::new().expect("poll creation should succeed");
         let mut io_state = super::WorkerIoState::new(Arc::new(AtomicUsize::new(1)));
-        super::close_worker_connection(&poll, connection, &mut io_state, &app_executor);
+        super::close_worker_connection(&poll, Token(2), connection, &mut io_state, &app_executor);
         assert_that!(io_state.detached_runtime_tickets.len(), eq(1_usize));
 
         app_executor.with_app(|app| {
