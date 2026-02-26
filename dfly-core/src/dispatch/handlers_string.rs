@@ -1,4 +1,5 @@
-use super::{DispatchState, ValueEntry, normalize_redis_range, parse_redis_i64, parse_redis_u64};
+use super::{DispatchState, ValueEntry};
+use super::parse_numbers::{normalize_redis_range, parse_redis_i64, parse_redis_u64};
 use crate::command::{CommandFrame, CommandReply};
 use dfly_common::ids::DbIndex;
 

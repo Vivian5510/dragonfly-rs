@@ -1,4 +1,5 @@
 use super::DispatchState;
+use super::parse_numbers::parse_redis_i64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SetCondition {
@@ -70,7 +71,7 @@ pub(super) fn parse_set_options(args: &[Vec<u8>]) -> Result<SetOptions, String> 
             let Some(raw_expire) = args.get(index.saturating_add(1)) else {
                 return Err("syntax error".to_owned());
             };
-            let Ok(expire) = super::parse_redis_i64(raw_expire) else {
+            let Ok(expire) = parse_redis_i64(raw_expire) else {
                 return Err("value is not an integer or out of range".to_owned());
             };
             if expire <= 0 {
