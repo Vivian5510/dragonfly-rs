@@ -14,7 +14,6 @@ use dfly_facade::protocol::ClientProtocol;
 use dfly_transaction::plan::{TransactionHop, TransactionMode, TransactionPlan};
 use dfly_transaction::scheduler::TransactionScheduler;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::Duration;
 
 impl ServerApp {
     pub(super) fn execute_transaction_plan(
@@ -689,14 +688,16 @@ impl ServerApp {
         Ok(replies)
     }
 
-    fn runtime_sequences_ready(&self, barriers: &[RuntimeSequenceBarrier]) -> DflyResult<bool> {
+    fn runtime_sequences_ready_from_snapshot(
+        barriers: &[RuntimeSequenceBarrier],
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
         for barrier in barriers {
-            let ready = self.runtime.wait_for_processed_sequence(
-                barrier.shard,
-                barrier.sequence,
-                Duration::ZERO,
-            )?;
-            if !ready {
+            let Some(processed_sequence) = processed_snapshot.get(usize::from(barrier.shard))
+            else {
+                return Err(DflyError::InvalidState("target shard is out of range"));
+            };
+            if *processed_sequence < barrier.sequence {
                 return Ok(false);
             }
         }
@@ -818,7 +819,33 @@ impl ServerApp {
         Ok(CommandReply::Array(replies))
     }
 
-    fn try_advance_msetnx_ticket(&self, ticket: &mut RuntimeReplyTicket) -> DflyResult<bool> {
+    fn try_advance_msetnx_ticket(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
+        match &ticket.aggregation {
+            RuntimeReplyAggregation::MsetNx {
+                stage: RuntimeMsetNxStage::WaitingExists,
+                ..
+            } => self.try_advance_msetnx_waiting_exists(ticket, processed_snapshot),
+            RuntimeReplyAggregation::MsetNx {
+                stage: RuntimeMsetNxStage::WaitingSet,
+                ..
+            } => self.try_advance_msetnx_waiting_set(ticket, processed_snapshot),
+            RuntimeReplyAggregation::MsetNx {
+                stage: RuntimeMsetNxStage::Completed(_),
+                ..
+            } => Ok(true),
+            _ => Self::runtime_sequences_ready_from_snapshot(&ticket.barriers, processed_snapshot),
+        }
+    }
+
+    fn try_advance_msetnx_waiting_exists(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
         let RuntimeReplyAggregation::MsetNx {
             grouped_set_commands,
             exists_replies,
@@ -826,117 +853,115 @@ impl ServerApp {
             stage,
         } = &mut ticket.aggregation
         else {
-            return self.runtime_sequences_ready(&ticket.barriers);
+            return Ok(true);
         };
-
-        loop {
-            match stage {
-                RuntimeMsetNxStage::WaitingExists => {
-                    if !self.runtime_sequences_ready(exists_replies)? {
-                        return Ok(false);
-                    }
-                    let exists_grouped = self.take_grouped_worker_replies(exists_replies)?;
-                    let mut existing = 0_i64;
-                    for reply in exists_grouped {
-                        match reply {
-                            CommandReply::Integer(count) => {
-                                existing = existing.saturating_add(count.max(0));
-                            }
-                            CommandReply::Moved { slot, endpoint } => {
-                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved {
-                                    slot,
-                                    endpoint,
-                                });
-                                return Ok(true);
-                            }
-                            CommandReply::Error(message) => {
-                                *stage =
-                                    RuntimeMsetNxStage::Completed(CommandReply::Error(message));
-                                return Ok(true);
-                            }
-                            _ => {
-                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
-                                    "internal error: EXISTS did not return integer reply"
-                                        .to_owned(),
-                                ));
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    if existing > 0 {
-                        *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(0));
-                        return Ok(true);
-                    }
-
-                    let submitted = match self.submit_grouped_worker_commands_deferred(
-                        ticket.db,
-                        grouped_set_commands.clone(),
-                        true,
-                    ) {
-                        Ok(submitted) => submitted,
-                        Err(error) => {
-                            *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(format!(
-                                "runtime dispatch failed: {error}"
-                            )));
-                            return Ok(true);
-                        }
-                    };
-                    set_replies.clone_from(&submitted);
-                    ticket.barriers = submitted;
-                    *stage = RuntimeMsetNxStage::WaitingSet;
+        if !Self::runtime_sequences_ready_from_snapshot(exists_replies, processed_snapshot)? {
+            return Ok(false);
+        }
+        let exists_grouped = self.take_grouped_worker_replies(exists_replies)?;
+        let mut existing = 0_i64;
+        for reply in exists_grouped {
+            match reply {
+                CommandReply::Integer(count) => {
+                    existing = existing.saturating_add(count.max(0));
                 }
-                RuntimeMsetNxStage::WaitingSet => {
-                    if !self.runtime_sequences_ready(set_replies)? {
-                        return Ok(false);
-                    }
-                    let grouped_set = self.take_grouped_worker_replies(set_replies)?;
-                    for reply in grouped_set {
-                        match reply {
-                            CommandReply::SimpleString(ok) if ok == "OK" => {}
-                            CommandReply::Moved { slot, endpoint } => {
-                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved {
-                                    slot,
-                                    endpoint,
-                                });
-                                return Ok(true);
-                            }
-                            CommandReply::Error(message) => {
-                                *stage =
-                                    RuntimeMsetNxStage::Completed(CommandReply::Error(message));
-                                return Ok(true);
-                            }
-                            _ => {
-                                *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
-                                    "MSETNX failed while setting key".to_owned(),
-                                ));
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(1));
+                CommandReply::Moved { slot, endpoint } => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved { slot, endpoint });
                     return Ok(true);
                 }
-                RuntimeMsetNxStage::Completed(_) => return Ok(true),
+                CommandReply::Error(message) => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(message));
+                    return Ok(true);
+                }
+                _ => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
+                        "internal error: EXISTS did not return integer reply".to_owned(),
+                    ));
+                    return Ok(true);
+                }
             }
         }
+        if existing > 0 {
+            *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(0));
+            return Ok(true);
+        }
+
+        let submitted = match self.submit_grouped_worker_commands_deferred(
+            ticket.db,
+            grouped_set_commands.clone(),
+            true,
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(format!(
+                    "runtime dispatch failed: {error}"
+                )));
+                return Ok(true);
+            }
+        };
+        set_replies.clone_from(&submitted);
+        ticket.barriers.clone_from(&submitted);
+        *stage = RuntimeMsetNxStage::WaitingSet;
+        // Set phase was just submitted in this round; wait for a fresh snapshot.
+        Ok(false)
+    }
+
+    fn try_advance_msetnx_waiting_set(
+        &self,
+        ticket: &mut RuntimeReplyTicket,
+        processed_snapshot: &[u64],
+    ) -> DflyResult<bool> {
+        let RuntimeReplyAggregation::MsetNx {
+            set_replies, stage, ..
+        } = &mut ticket.aggregation
+        else {
+            return Ok(true);
+        };
+        if !Self::runtime_sequences_ready_from_snapshot(set_replies, processed_snapshot)? {
+            return Ok(false);
+        }
+        let grouped_set = self.take_grouped_worker_replies(set_replies)?;
+        for reply in grouped_set {
+            match reply {
+                CommandReply::SimpleString(ok) if ok == "OK" => {}
+                CommandReply::Moved { slot, endpoint } => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Moved { slot, endpoint });
+                    return Ok(true);
+                }
+                CommandReply::Error(message) => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(message));
+                    return Ok(true);
+                }
+                _ => {
+                    *stage = RuntimeMsetNxStage::Completed(CommandReply::Error(
+                        "MSETNX failed while setting key".to_owned(),
+                    ));
+                    return Ok(true);
+                }
+            }
+        }
+        *stage = RuntimeMsetNxStage::Completed(CommandReply::Integer(1));
+        Ok(true)
     }
 
     pub(crate) fn runtime_reply_ticket_ready(
         &self,
         ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<bool> {
+        let processed_snapshot = self.runtime.snapshot_processed_sequences()?;
         if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. }) {
-            return self.try_advance_msetnx_ticket(ticket);
+            return self.try_advance_msetnx_ticket(ticket, &processed_snapshot);
         }
-        self.runtime_sequences_ready(&ticket.barriers)
+        Self::runtime_sequences_ready_from_snapshot(&ticket.barriers, &processed_snapshot)
     }
 
     pub(crate) fn take_runtime_reply_ticket(
         &self,
         ticket: &mut RuntimeReplyTicket,
     ) -> DflyResult<Vec<u8>> {
+        let processed_snapshot = self.runtime.snapshot_processed_sequences()?;
         if matches!(&ticket.aggregation, RuntimeReplyAggregation::MsetNx { .. })
-            && !self.try_advance_msetnx_ticket(ticket)?
+            && !self.try_advance_msetnx_ticket(ticket, &processed_snapshot)?
         {
             return Err(DflyError::InvalidState(
                 "runtime deferred reply is not ready",

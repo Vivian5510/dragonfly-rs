@@ -539,6 +539,25 @@ impl InMemoryShardRuntime {
         Ok(guard.processed_sequence >= sequence)
     }
 
+    /// Returns one point-in-time snapshot of per-shard processed sequence values.
+    ///
+    /// Index `i` in the returned vector corresponds to shard `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DflyError::InvalidState` when any shard execution-state mutex is poisoned.
+    pub fn snapshot_processed_sequences(&self) -> DflyResult<Vec<u64>> {
+        let mut snapshot = Vec::with_capacity(self.execution_per_shard.len());
+        for state in self.execution_per_shard.iter() {
+            let guard = state
+                .inner
+                .lock()
+                .map_err(|_| DflyError::InvalidState("runtime log mutex is poisoned"))?;
+            snapshot.push(guard.processed_sequence);
+        }
+        Ok(snapshot)
+    }
+
     /// Blocks until one shard has processed one specific submission sequence.
     ///
     /// Dragonfly transaction barriers are open-ended synchronization points
