@@ -33,6 +33,8 @@ use tokio::sync::mpsc::{
 #[cfg(target_os = "linux")]
 use tokio::sync::oneshot;
 #[cfg(target_os = "linux")]
+use tokio_uring::buf::BoundedBuf;
+#[cfg(target_os = "linux")]
 use tokio_uring::net::TcpStream as IoUringTcpStream;
 
 use crate::app::{
@@ -53,6 +55,9 @@ const DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS: usize = 64;
 const WORKER_READ_BUDGET_PER_EVENT: usize = 8;
 const WORKER_PARSE_BUDGET_PER_READ: usize = 32;
 const WORKER_WRITE_BUDGET_BYTES_PER_EVENT: usize = 64 * 1024;
+const WRITE_BUFFER_COMPACT_THRESHOLD_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const IO_URING_DEFERRED_REAP_MAX_WAIT: Duration = Duration::from_millis(500);
 
 /// Top-level network engine over one selected multiplex backend.
 pub struct NetEngine {
@@ -61,7 +66,7 @@ pub struct NetEngine {
 }
 
 enum NetEngineBackend {
-    Epoll(EpollBackend),
+    Mio(MioBackend),
     #[cfg(target_os = "linux")]
     IoUring(IoUringBackend),
 }
@@ -79,28 +84,47 @@ impl NetEngine {
         selection: MultiplexSelection,
         app_executor: &AppExecutor,
     ) -> DflyResult<Self> {
-        let backend = match selection.api {
-            MultiplexApi::Epoll => NetEngineBackend::Epoll(EpollBackend::bind_with_memcache(
+        #[cfg(target_os = "linux")]
+        let mut resolved_selection = selection;
+        #[cfg(not(target_os = "linux"))]
+        let resolved_selection = selection;
+        let backend = match resolved_selection.api {
+            MultiplexApi::Mio => NetEngineBackend::Mio(MioBackend::bind_with_memcache(
                 resp_addr,
                 memcache_addr,
                 config,
                 app_executor,
             )?),
             #[cfg(target_os = "linux")]
-            MultiplexApi::IoUring => NetEngineBackend::IoUring(IoUringBackend::bind_with_memcache(
-                resp_addr,
-                memcache_addr,
-                config,
-                app_executor,
-            )?),
+            MultiplexApi::IoUring => {
+                match IoUringBackend::bind_with_memcache(resp_addr, memcache_addr, config, app_executor)
+                {
+                    Ok(backend) => NetEngineBackend::IoUring(backend),
+                    Err(error) => {
+                        resolved_selection.api = MultiplexApi::Mio;
+                        resolved_selection.fallback_reason = Some(format!(
+                            "io_uring backend init failed, fallback to mio: {error}"
+                        ));
+                        NetEngineBackend::Mio(MioBackend::bind_with_memcache(
+                            resp_addr,
+                            memcache_addr,
+                            config,
+                            app_executor,
+                        )?)
+                    }
+                }
+            }
             #[cfg(not(target_os = "linux"))]
             MultiplexApi::IoUring => {
                 return Err(DflyError::InvalidConfig(
-                    "io_uring backend is Linux-only; select epoll backend",
+                    "io_uring backend is Linux-only; select mio backend",
                 ));
             }
         };
-        Ok(Self { selection, backend })
+        Ok(Self {
+            selection: resolved_selection,
+            backend,
+        })
     }
 
     /// Runs one poll cycle on the selected backend.
@@ -110,7 +134,7 @@ impl NetEngine {
     /// Returns `DflyError::Io` when backend polling fails.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> DflyResult<usize> {
         match &mut self.backend {
-            NetEngineBackend::Epoll(backend) => backend.poll_once(timeout),
+            NetEngineBackend::Mio(backend) => backend.poll_once(timeout),
             #[cfg(target_os = "linux")]
             NetEngineBackend::IoUring(backend) => backend.poll_once(timeout),
         }
@@ -123,7 +147,7 @@ impl NetEngine {
     /// Returns `DflyError::Io` when backend polling fails.
     pub fn run(&mut self) -> DflyResult<()> {
         match &mut self.backend {
-            NetEngineBackend::Epoll(_) => loop {
+            NetEngineBackend::Mio(_) => loop {
                 let _ = self.poll_once(Some(Duration::from_millis(10)))?;
             },
             #[cfg(target_os = "linux")]
@@ -263,127 +287,11 @@ impl ServerReactorConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct EventSnapshot {
-    token: Token,
-    flags: u8,
-}
-
-const EVENT_FLAG_READABLE: u8 = 1_u8 << 0;
-const EVENT_FLAG_WRITABLE: u8 = 1_u8 << 1;
-const EVENT_FLAG_READ_CLOSED: u8 = 1_u8 << 2;
-const EVENT_FLAG_WRITE_CLOSED: u8 = 1_u8 << 3;
-const EVENT_FLAG_ERROR: u8 = 1_u8 << 4;
-
-impl EventSnapshot {
-    fn from_mio_event(event: &mio::event::Event) -> Self {
-        let mut flags = 0_u8;
-        if event.is_readable() {
-            flags |= EVENT_FLAG_READABLE;
-        }
-        if event.is_writable() {
-            flags |= EVENT_FLAG_WRITABLE;
-        }
-        if event.is_read_closed() {
-            flags |= EVENT_FLAG_READ_CLOSED;
-        }
-        if event.is_write_closed() {
-            flags |= EVENT_FLAG_WRITE_CLOSED;
-        }
-        if event.is_error() {
-            flags |= EVENT_FLAG_ERROR;
-        }
-        Self {
-            token: event.token(),
-            flags,
-        }
-    }
-
-    fn readable(self) -> bool {
-        (self.flags & EVENT_FLAG_READABLE) != 0
-    }
-
-    fn writable(self) -> bool {
-        (self.flags & EVENT_FLAG_WRITABLE) != 0
-    }
-
-    fn closed_or_error(self) -> bool {
-        (self.flags & (EVENT_FLAG_READ_CLOSED | EVENT_FLAG_WRITE_CLOSED | EVENT_FLAG_ERROR)) != 0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionLifecycle {
     Active,
     Draining,
     Closing,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ReactorConnection {
-    socket: TcpStream,
-    logical: ServerConnection,
-    write_buffer: Vec<u8>,
-    lifecycle: ConnectionLifecycle,
-    read_paused_by_backpressure: bool,
-    interest: Interest,
-}
-
-#[cfg(test)]
-impl ReactorConnection {
-    fn new(socket: TcpStream, protocol: ClientProtocol) -> Self {
-        let logical = ServerApp::new_connection(protocol);
-        Self {
-            socket,
-            logical,
-            write_buffer: Vec::new(),
-            lifecycle: ConnectionLifecycle::Active,
-            read_paused_by_backpressure: false,
-            interest: Interest::READABLE,
-        }
-    }
-
-    fn on_peer_closed_or_error(&mut self) {
-        if self.lifecycle == ConnectionLifecycle::Active {
-            self.lifecycle = ConnectionLifecycle::Draining;
-        }
-    }
-
-    fn mark_draining(&mut self) {
-        if self.lifecycle == ConnectionLifecycle::Active {
-            self.lifecycle = ConnectionLifecycle::Draining;
-        }
-    }
-
-    fn mark_closing(&mut self) {
-        self.lifecycle = ConnectionLifecycle::Closing;
-    }
-
-    fn can_read(&self) -> bool {
-        self.lifecycle == ConnectionLifecycle::Active && !self.read_paused_by_backpressure
-    }
-
-    fn should_try_flush(&self) -> bool {
-        !self.write_buffer.is_empty()
-    }
-
-    fn should_close_now(&self) -> bool {
-        self.lifecycle == ConnectionLifecycle::Closing
-            || (self.lifecycle == ConnectionLifecycle::Draining && self.write_buffer.is_empty())
-    }
-
-    fn update_backpressure_state(&mut self, high_watermark: usize, low_watermark: usize) {
-        if self.read_paused_by_backpressure {
-            if self.write_buffer.len() <= low_watermark {
-                self.read_paused_by_backpressure = false;
-            }
-            return;
-        }
-        if self.write_buffer.len() >= high_watermark {
-            self.read_paused_by_backpressure = true;
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -393,376 +301,10 @@ struct ReactorListener {
     socket: TcpListener,
 }
 
-/// One reactor instance managing protocol listeners and all accepted connections.
 #[cfg(test)]
-#[derive(Debug)]
-pub struct ServerReactor {
-    poll: Poll,
-    events: Events,
-    listeners: Vec<ReactorListener>,
-    next_token: usize,
-    write_high_watermark: usize,
-    write_low_watermark: usize,
-    connections: HashMap<Token, ReactorConnection>,
-}
-
+mod single_reactor;
 #[cfg(test)]
-impl ServerReactor {
-    /// Binds one RESP listener and registers it in the reactor poller.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::InvalidState` if the listener or poll registration fails.
-    pub fn bind(addr: SocketAddr, config: ServerReactorConfig) -> DflyResult<Self> {
-        Self::bind_with_memcache(addr, None, config)
-    }
-
-    /// Binds RESP listener and optional Memcache listener in one reactor.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::InvalidState` if any listener bind/registration fails.
-    pub fn bind_with_memcache(
-        resp_addr: SocketAddr,
-        memcache_addr: Option<SocketAddr>,
-        config: ServerReactorConfig,
-    ) -> DflyResult<Self> {
-        let poll =
-            Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
-        let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
-        let (write_high_watermark, write_low_watermark) =
-            config.normalized_backpressure_watermarks()?;
-
-        let mut resp_listener = TcpListener::bind(resp_addr)
-            .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
-        poll.registry()
-            .register(&mut resp_listener, RESP_LISTENER_TOKEN, Interest::READABLE)
-            .map_err(|error| {
-                DflyError::Io(format!("register RESP listener in poll failed: {error}"))
-            })?;
-        listeners.push(ReactorListener {
-            token: RESP_LISTENER_TOKEN,
-            protocol: ClientProtocol::Resp,
-            socket: resp_listener,
-        });
-
-        if let Some(addr) = memcache_addr {
-            let mut memcache_listener = TcpListener::bind(addr).map_err(|error| {
-                DflyError::Io(format!("bind Memcache listener failed: {error}"))
-            })?;
-            poll.registry()
-                .register(
-                    &mut memcache_listener,
-                    MEMCACHE_LISTENER_TOKEN,
-                    Interest::READABLE,
-                )
-                .map_err(|error| {
-                    DflyError::Io(format!(
-                        "register Memcache listener in poll failed: {error}"
-                    ))
-                })?;
-            listeners.push(ReactorListener {
-                token: MEMCACHE_LISTENER_TOKEN,
-                protocol: ClientProtocol::Memcache,
-                socket: memcache_listener,
-            });
-        }
-
-        Ok(Self {
-            poll,
-            events: Events::with_capacity(config.normalized_max_events()),
-            listeners,
-            next_token: CONNECTION_TOKEN_START,
-            write_high_watermark,
-            write_low_watermark,
-            connections: HashMap::new(),
-        })
-    }
-
-    /// Processes one readiness cycle and executes accepted/ready commands.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DflyError::InvalidState` if polling, socket registration, or socket I/O fails.
-    pub fn poll_once(
-        &mut self,
-        app: &mut ServerApp,
-        timeout: Option<Duration>,
-    ) -> DflyResult<usize> {
-        self.poll
-            .poll(&mut self.events, timeout)
-            .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
-        let snapshots = self
-            .events
-            .iter()
-            .map(EventSnapshot::from_mio_event)
-            .collect::<Vec<_>>();
-
-        for snapshot in &snapshots {
-            if let Some(listener_index) = self.listener_index(snapshot.token) {
-                self.accept_new_connections(listener_index)?;
-                continue;
-            }
-            self.handle_connection_event(app, *snapshot)?;
-        }
-
-        Ok(snapshots.len())
-    }
-
-    #[cfg(test)]
-    fn local_addr(&self) -> DflyResult<SocketAddr> {
-        self.listener_local_addr(ClientProtocol::Resp)
-    }
-
-    #[cfg(test)]
-    fn memcache_local_addr(&self) -> DflyResult<SocketAddr> {
-        self.listener_local_addr(ClientProtocol::Memcache)
-    }
-
-    #[cfg(test)]
-    fn connection_count(&self) -> usize {
-        self.connections.len()
-    }
-
-    fn listener_index(&self, token: Token) -> Option<usize> {
-        self.listeners
-            .iter()
-            .position(|listener| listener.token == token)
-    }
-
-    #[cfg(test)]
-    fn listener_local_addr(&self, protocol: ClientProtocol) -> DflyResult<SocketAddr> {
-        let Some(listener) = self
-            .listeners
-            .iter()
-            .find(|listener| listener.protocol == protocol)
-        else {
-            return Err(DflyError::InvalidState(
-                "network listener protocol is not enabled",
-            ));
-        };
-
-        listener
-            .socket
-            .local_addr()
-            .map_err(|error| DflyError::Io(format!("query local address failed: {error}")))
-    }
-
-    fn accept_new_connections(&mut self, listener_index: usize) -> DflyResult<()> {
-        let protocol = self
-            .listeners
-            .get(listener_index)
-            .map(|listener| listener.protocol)
-            .ok_or(DflyError::InvalidState(
-                "reactor listener index is out of range",
-            ))?;
-
-        loop {
-            let accept_result = {
-                let listener =
-                    self.listeners
-                        .get_mut(listener_index)
-                        .ok_or(DflyError::InvalidState(
-                            "reactor listener index is out of range",
-                        ))?;
-                listener.socket.accept()
-            };
-
-            match accept_result {
-                Ok((mut socket, _peer)) => {
-                    let token = self.allocate_connection_token();
-                    self.poll
-                        .registry()
-                        .register(&mut socket, token, Interest::READABLE)
-                        .map_err(|error| {
-                            DflyError::Io(format!(
-                                "register accepted connection in poll failed: {error}"
-                            ))
-                        })?;
-                    let _ = socket.set_nodelay(true);
-                    let _ = self
-                        .connections
-                        .insert(token, ReactorConnection::new(socket, protocol));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => {
-                    return Err(DflyError::Io(format!("accept connection failed: {error}")));
-                }
-            }
-        }
-    }
-
-    fn handle_connection_event(
-        &mut self,
-        app: &mut ServerApp,
-        snapshot: EventSnapshot,
-    ) -> DflyResult<()> {
-        let Some(mut connection) = self.connections.remove(&snapshot.token) else {
-            return Ok(());
-        };
-
-        if snapshot.closed_or_error() {
-            connection.on_peer_closed_or_error();
-        }
-
-        if snapshot.readable() && connection.can_read() {
-            Self::read_connection_bytes(
-                app,
-                &mut connection,
-                self.write_high_watermark,
-                self.write_low_watermark,
-            );
-        }
-        if snapshot.writable() && connection.should_try_flush() {
-            Self::flush_connection_writes(
-                &mut connection,
-                self.write_high_watermark,
-                self.write_low_watermark,
-            );
-        }
-
-        if connection.should_close_now() {
-            self.close_connection(app, snapshot.token, connection)?;
-            return Ok(());
-        }
-
-        self.refresh_connection_interest(snapshot.token, &mut connection)?;
-        let _ = self.connections.insert(snapshot.token, connection);
-        Ok(())
-    }
-
-    fn read_connection_bytes(
-        app: &mut ServerApp,
-        connection: &mut ReactorConnection,
-        write_high_watermark: usize,
-        write_low_watermark: usize,
-    ) {
-        let mut chunk = [0_u8; READ_CHUNK_BYTES];
-        loop {
-            match connection.socket.read(&mut chunk) {
-                Ok(0) => {
-                    connection.mark_draining();
-                    return;
-                }
-                Ok(read_len) => {
-                    match ingress_connection_bytes(app, &mut connection.logical, &chunk[..read_len])
-                    {
-                        Ok(replies) => {
-                            for reply in replies {
-                                connection.write_buffer.extend_from_slice(&reply);
-                                connection.update_backpressure_state(
-                                    write_high_watermark,
-                                    write_low_watermark,
-                                );
-                            }
-                            if connection.read_paused_by_backpressure {
-                                // Once backpressure is armed we must stop draining socket bytes in
-                                // this readiness turn and leave remaining input in kernel buffers.
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            let parse_error = protocol_parse_error_reply(
-                                connection.logical.context.protocol,
-                                &error,
-                            );
-                            connection.write_buffer.extend_from_slice(&parse_error);
-                            if connection.logical.context.protocol == ClientProtocol::Resp {
-                                connection.mark_draining();
-                            }
-                            connection.update_backpressure_state(
-                                write_high_watermark,
-                                write_low_watermark,
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(_error) => {
-                    connection.mark_closing();
-                    return;
-                }
-            }
-        }
-    }
-
-    fn flush_connection_writes(
-        connection: &mut ReactorConnection,
-        write_high_watermark: usize,
-        write_low_watermark: usize,
-    ) {
-        while !connection.write_buffer.is_empty() {
-            match connection.socket.write(connection.write_buffer.as_slice()) {
-                Ok(0) => {
-                    connection.mark_closing();
-                    return;
-                }
-                Ok(written) => {
-                    let _ = connection.write_buffer.drain(..written);
-                    connection.update_backpressure_state(write_high_watermark, write_low_watermark);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(_error) => {
-                    connection.mark_closing();
-                    return;
-                }
-            }
-        }
-    }
-
-    fn refresh_connection_interest(
-        &self,
-        token: Token,
-        connection: &mut ReactorConnection,
-    ) -> DflyResult<()> {
-        let mut next_interest = if connection.can_read() {
-            Interest::READABLE
-        } else {
-            Interest::WRITABLE
-        };
-        if !connection.write_buffer.is_empty() {
-            next_interest |= Interest::WRITABLE;
-        }
-        if next_interest == connection.interest {
-            return Ok(());
-        }
-
-        self.poll
-            .registry()
-            .reregister(&mut connection.socket, token, next_interest)
-            .map_err(|error| {
-                DflyError::Io(format!("refresh connection poll interest failed: {error}"))
-            })?;
-        connection.interest = next_interest;
-        Ok(())
-    }
-
-    fn close_connection(
-        &self,
-        app: &mut ServerApp,
-        token: Token,
-        mut connection: ReactorConnection,
-    ) -> DflyResult<()> {
-        self.poll
-            .registry()
-            .deregister(&mut connection.socket)
-            .map_err(|error| {
-                DflyError::Io(format!(
-                    "deregister closed connection {} failed: {error}",
-                    token.0
-                ))
-            })?;
-        app.disconnect_connection(&mut connection.logical);
-        Ok(())
-    }
-
-    fn allocate_connection_token(&mut self) -> Token {
-        let token = Token(self.next_token);
-        self.next_token = self.next_token.saturating_add(1);
-        token
-    }
-}
+use single_reactor::{ReactorConnection, ServerReactor};
 
 const THREADED_IO_WORKER_POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
@@ -810,6 +352,7 @@ struct WorkerConnection {
     socket: TcpStream,
     logical: ServerConnection,
     write_buffer: Vec<u8>,
+    write_cursor: usize,
     next_request_id: u64,
     pending_request_count: usize,
     pending_runtime_requests: Vec<PendingRuntimeRequest>,
@@ -827,6 +370,7 @@ impl WorkerConnection {
             socket,
             logical: ServerApp::new_connection(protocol),
             write_buffer: Vec::new(),
+            write_cursor: 0,
             next_request_id: 1,
             pending_request_count: 0,
             pending_runtime_requests: Vec::new(),
@@ -861,22 +405,24 @@ impl WorkerConnection {
     }
 
     fn should_try_flush(&self) -> bool {
-        !self.write_buffer.is_empty()
+        !write_buffer_is_empty(&self.write_buffer, self.write_cursor)
     }
 
     fn should_close_now(&self) -> bool {
         self.lifecycle == ConnectionLifecycle::Closing
-            || (self.lifecycle == ConnectionLifecycle::Draining && self.write_buffer.is_empty())
+            || (self.lifecycle == ConnectionLifecycle::Draining
+                && write_buffer_is_empty(&self.write_buffer, self.write_cursor))
     }
 
     fn update_backpressure_state(&mut self, high_watermark: usize, low_watermark: usize) {
+        let buffered_bytes = write_buffer_pending_len(&self.write_buffer, self.write_cursor);
         if self.read_paused_by_backpressure {
-            if self.write_buffer.len() <= low_watermark {
+            if buffered_bytes <= low_watermark {
                 self.read_paused_by_backpressure = false;
             }
             return;
         }
-        if self.write_buffer.len() >= high_watermark {
+        if buffered_bytes >= high_watermark {
             self.read_paused_by_backpressure = true;
         }
     }
@@ -896,6 +442,11 @@ impl WorkerConnection {
 #[derive(Debug)]
 struct WorkerIoState {
     connections: HashMap<Token, WorkerConnection>,
+    loop_state: WorkerLoopState,
+}
+
+#[derive(Debug)]
+struct WorkerLoopState {
     pending_requests_for_worker: usize,
     active_parse_tokens: VecDeque<Token>,
     in_active_parse_set: HashSet<Token>,
@@ -910,14 +461,16 @@ impl WorkerIoState {
     fn new(live_connection_count: Arc<AtomicUsize>) -> Self {
         Self {
             connections: HashMap::new(),
-            pending_requests_for_worker: 0,
-            active_parse_tokens: VecDeque::new(),
-            in_active_parse_set: HashSet::new(),
-            active_deferred_tokens: VecDeque::new(),
-            in_active_deferred_set: HashSet::new(),
-            detached_runtime_tickets: Vec::new(),
-            live_connection_count,
-            next_token: CONNECTION_TOKEN_START,
+            loop_state: WorkerLoopState {
+                pending_requests_for_worker: 0,
+                active_parse_tokens: VecDeque::new(),
+                in_active_parse_set: HashSet::new(),
+                active_deferred_tokens: VecDeque::new(),
+                in_active_deferred_set: HashSet::new(),
+                detached_runtime_tickets: Vec::new(),
+                live_connection_count,
+                next_token: CONNECTION_TOKEN_START,
+            },
         }
     }
 }
@@ -928,6 +481,66 @@ struct BackpressureThresholds {
     low: usize,
     max_pending_per_connection: usize,
     max_pending_per_worker: usize,
+}
+
+fn resolve_backpressure_thresholds(config: ServerReactorConfig) -> DflyResult<BackpressureThresholds> {
+    let (write_high_watermark, write_low_watermark) = config.normalized_backpressure_watermarks()?;
+    let (max_pending_per_connection, max_pending_per_worker) = config.normalized_pending_request_limits();
+    Ok(BackpressureThresholds {
+        high: write_high_watermark,
+        low: write_low_watermark,
+        max_pending_per_connection: max_pending_per_connection.max(1),
+        max_pending_per_worker: max_pending_per_worker.max(1),
+    })
+}
+
+fn bind_acceptor_listeners(
+    acceptor_poll: &Poll,
+    resp_addr: SocketAddr,
+    memcache_addr: Option<SocketAddr>,
+) -> DflyResult<Vec<ReactorListener>> {
+    let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
+    listeners.push(bind_acceptor_listener(
+        acceptor_poll,
+        resp_addr,
+        RESP_LISTENER_TOKEN,
+        ClientProtocol::Resp,
+        "RESP",
+    )?);
+    if let Some(addr) = memcache_addr {
+        listeners.push(bind_acceptor_listener(
+            acceptor_poll,
+            addr,
+            MEMCACHE_LISTENER_TOKEN,
+            ClientProtocol::Memcache,
+            "Memcache",
+        )?);
+    }
+    Ok(listeners)
+}
+
+fn bind_acceptor_listener(
+    acceptor_poll: &Poll,
+    addr: SocketAddr,
+    token: Token,
+    protocol: ClientProtocol,
+    protocol_name: &str,
+) -> DflyResult<ReactorListener> {
+    let mut listener = TcpListener::bind(addr)
+        .map_err(|error| DflyError::Io(format!("bind {protocol_name} listener failed: {error}")))?;
+    acceptor_poll
+        .registry()
+        .register(&mut listener, token, Interest::READABLE)
+        .map_err(|error| {
+            DflyError::Io(format!(
+                "register {protocol_name} listener in poll failed: {error}"
+            ))
+        })?;
+    Ok(ReactorListener {
+        token,
+        protocol,
+        socket: listener,
+    })
 }
 
 #[derive(Debug)]
@@ -962,6 +575,152 @@ struct WorkerDispatchWindow {
     count: usize,
 }
 
+#[derive(Debug, Default)]
+struct WorkerOwnedConnections {
+    live: HashSet<u64>,
+    round_robin: VecDeque<u64>,
+}
+
+impl WorkerOwnedConnections {
+    fn insert(&mut self, connection_id: u64) {
+        if self.live.insert(connection_id) {
+            self.round_robin.push_back(connection_id);
+        }
+    }
+
+    fn remove(&mut self, connection_id: u64) {
+        let _ = self.live.remove(&connection_id);
+    }
+
+    fn next_candidate(&mut self, migrated_connections: &HashSet<u64>) -> Option<u64> {
+        let turn_len = self.round_robin.len();
+        for _ in 0..turn_len {
+            let connection_id = self.round_robin.pop_front()?;
+            if self.live.contains(&connection_id) {
+                self.round_robin.push_back(connection_id);
+                if !migrated_connections.contains(&connection_id) {
+                    return Some(connection_id);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn write_buffer_pending_len(write_buffer: &[u8], write_cursor: usize) -> usize {
+    write_buffer.len().saturating_sub(write_cursor)
+}
+
+fn write_buffer_is_empty(write_buffer: &[u8], write_cursor: usize) -> bool {
+    write_buffer_pending_len(write_buffer, write_cursor) == 0
+}
+
+fn write_buffer_maybe_compact(write_buffer: &mut Vec<u8>, write_cursor: &mut usize) {
+    if *write_cursor == 0 {
+        return;
+    }
+    if *write_cursor >= write_buffer.len() {
+        write_buffer.clear();
+        *write_cursor = 0;
+        return;
+    }
+    if *write_cursor >= WRITE_BUFFER_COMPACT_THRESHOLD_BYTES
+        && (*write_cursor).saturating_mul(2) >= write_buffer.len()
+    {
+        let _ = write_buffer.drain(..*write_cursor);
+        *write_cursor = 0;
+    }
+}
+
+fn write_buffer_append(write_buffer: &mut Vec<u8>, write_cursor: &mut usize, payload: &[u8]) {
+    write_buffer_maybe_compact(write_buffer, write_cursor);
+    write_buffer.extend_from_slice(payload);
+}
+
+fn write_buffer_pending_slice(write_buffer: &[u8], write_cursor: usize) -> &[u8] {
+    if write_cursor >= write_buffer.len() {
+        &[]
+    } else {
+        &write_buffer[write_cursor..]
+    }
+}
+
+fn write_buffer_advance(write_buffer: &mut Vec<u8>, write_cursor: &mut usize, written: usize) {
+    let pending = write_buffer_pending_len(write_buffer, *write_cursor);
+    let consumed = written.min(pending);
+    *write_cursor = write_cursor.saturating_add(consumed);
+    write_buffer_maybe_compact(write_buffer, write_cursor);
+}
+
+fn connection_owner_upsert(
+    connection_owner_by_id: &mut HashMap<u64, usize>,
+    connection_counts_by_worker: &mut [usize],
+    owned_connections_by_worker: &mut [WorkerOwnedConnections],
+    connection_id: u64,
+    worker_id: usize,
+) {
+    let previous_owner = connection_owner_by_id.insert(connection_id, worker_id);
+    if let Some(previous_worker) = previous_owner
+        && previous_worker < connection_counts_by_worker.len()
+    {
+        connection_counts_by_worker[previous_worker] =
+            connection_counts_by_worker[previous_worker].saturating_sub(1);
+        if let Some(owned) = owned_connections_by_worker.get_mut(previous_worker) {
+            owned.remove(connection_id);
+        }
+    }
+    if worker_id < connection_counts_by_worker.len() {
+        connection_counts_by_worker[worker_id] =
+            connection_counts_by_worker[worker_id].saturating_add(1);
+        if let Some(owned) = owned_connections_by_worker.get_mut(worker_id) {
+            owned.insert(connection_id);
+        }
+    }
+}
+
+fn connection_owner_remove(
+    connection_owner_by_id: &mut HashMap<u64, usize>,
+    connection_counts_by_worker: &mut [usize],
+    owned_connections_by_worker: &mut [WorkerOwnedConnections],
+    connection_id: u64,
+) -> Option<usize> {
+    let owner = connection_owner_by_id.remove(&connection_id)?;
+    if owner < connection_counts_by_worker.len() {
+        connection_counts_by_worker[owner] = connection_counts_by_worker[owner].saturating_sub(1);
+        if let Some(owned) = owned_connections_by_worker.get_mut(owner) {
+            owned.remove(connection_id);
+        }
+    }
+    Some(owner)
+}
+
+fn rebalance_source_and_target(connection_counts_by_worker: &[usize]) -> Option<(usize, usize)> {
+    let (source_worker, source_count) = connection_counts_by_worker
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| **count)
+        .map(|(index, count)| (index, *count))?;
+    let (target_worker, target_count) = connection_counts_by_worker
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, count)| **count)
+        .map(|(index, count)| (index, *count))?;
+    if source_count <= target_count.saturating_add(1) {
+        return None;
+    }
+    Some((source_worker, target_worker))
+}
+
+fn select_rebalance_connection_id(
+    owned_connections_by_worker: &mut [WorkerOwnedConnections],
+    source_worker: usize,
+    migrated_connections: &HashSet<u64>,
+) -> Option<u64> {
+    owned_connections_by_worker
+        .get_mut(source_worker)
+        .and_then(|owned| owned.next_candidate(migrated_connections))
+}
+
 /// Acceptor + fixed I/O worker runtime.
 ///
 /// The acceptor thread only accepts/dispatches sockets and coordinates command execution against
@@ -969,6 +728,7 @@ struct WorkerDispatchWindow {
 pub struct ThreadedServerReactor {
     acceptor_poll: Poll,
     acceptor_events: Events,
+    ready_listener_indexes: Vec<usize>,
     listeners: Vec<ReactorListener>,
     workers: Vec<WorkerHandle>,
     worker_events: Receiver<WorkerEvent>,
@@ -983,6 +743,8 @@ pub struct ThreadedServerReactor {
     rebalance_dirty: bool,
     next_connection_id: u64,
     connection_owner_by_id: HashMap<u64, usize>,
+    connection_counts_by_worker: Vec<usize>,
+    owned_connections_by_worker: Vec<WorkerOwnedConnections>,
     migrated_connections: HashSet<u64>,
 }
 
@@ -1015,11 +777,8 @@ impl ThreadedServerReactor {
     ) -> DflyResult<Self> {
         let acceptor_poll =
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
-        let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
-        let (write_high_watermark, write_low_watermark) =
-            config.normalized_backpressure_watermarks()?;
-        let (max_pending_per_connection, max_pending_per_worker) =
-            config.normalized_pending_request_limits();
+        let listeners = bind_acceptor_listeners(&acceptor_poll, resp_addr, memcache_addr)?;
+        let backpressure = resolve_backpressure_thresholds(config)?;
         let worker_count = config.normalized_io_worker_count();
         let dispatch_window = WorkerDispatchWindow {
             start: config.normalized_dispatch_start(worker_count),
@@ -1027,43 +786,6 @@ impl ThreadedServerReactor {
         };
         let max_events = config.normalized_max_events();
         let (worker_event_sender, worker_event_receiver) = mpsc::channel::<WorkerEvent>();
-
-        let mut resp_listener = TcpListener::bind(resp_addr)
-            .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
-        acceptor_poll
-            .registry()
-            .register(&mut resp_listener, RESP_LISTENER_TOKEN, Interest::READABLE)
-            .map_err(|error| {
-                DflyError::Io(format!("register RESP listener in poll failed: {error}"))
-            })?;
-        listeners.push(ReactorListener {
-            token: RESP_LISTENER_TOKEN,
-            protocol: ClientProtocol::Resp,
-            socket: resp_listener,
-        });
-
-        if let Some(addr) = memcache_addr {
-            let mut memcache_listener = TcpListener::bind(addr).map_err(|error| {
-                DflyError::Io(format!("bind Memcache listener failed: {error}"))
-            })?;
-            acceptor_poll
-                .registry()
-                .register(
-                    &mut memcache_listener,
-                    MEMCACHE_LISTENER_TOKEN,
-                    Interest::READABLE,
-                )
-                .map_err(|error| {
-                    DflyError::Io(format!(
-                        "register Memcache listener in poll failed: {error}"
-                    ))
-                })?;
-            listeners.push(ReactorListener {
-                token: MEMCACHE_LISTENER_TOKEN,
-                protocol: ClientProtocol::Memcache,
-                socket: memcache_listener,
-            });
-        }
 
         let mut workers = Vec::with_capacity(worker_count);
         #[cfg(test)]
@@ -1081,12 +803,7 @@ impl ThreadedServerReactor {
                     io_worker_thread_main(
                         &command_receiver,
                         max_events,
-                        BackpressureThresholds {
-                            high: write_high_watermark,
-                            low: write_low_watermark,
-                            max_pending_per_connection,
-                            max_pending_per_worker,
-                        },
+                        backpressure,
                         &executor,
                         live_connection_count,
                         &event_sender,
@@ -1104,6 +821,7 @@ impl ThreadedServerReactor {
         Ok(Self {
             acceptor_poll,
             acceptor_events: Events::with_capacity(max_events),
+            ready_listener_indexes: Vec::with_capacity(max_events),
             listeners,
             workers,
             worker_events: worker_event_receiver,
@@ -1118,6 +836,10 @@ impl ThreadedServerReactor {
             rebalance_dirty: false,
             next_connection_id: 1,
             connection_owner_by_id: HashMap::new(),
+            connection_counts_by_worker: vec![0; worker_count],
+            owned_connections_by_worker: (0..worker_count)
+                .map(|_| WorkerOwnedConnections::default())
+                .collect(),
             migrated_connections: HashSet::new(),
         })
     }
@@ -1131,21 +853,23 @@ impl ThreadedServerReactor {
         self.acceptor_poll
             .poll(&mut self.acceptor_events, timeout)
             .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
-        let snapshots = self
-            .acceptor_events
-            .iter()
-            .map(EventSnapshot::from_mio_event)
-            .collect::<Vec<_>>();
-
-        let mut accepted = 0_usize;
-        for snapshot in &snapshots {
-            if let Some(listener_index) = self.listener_index(snapshot.token) {
-                accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
+        let mut observed = 0_usize;
+        self.ready_listener_indexes.clear();
+        for event in &self.acceptor_events {
+            observed = observed.saturating_add(1);
+            if let Some(listener_index) = self.listener_index(event.token()) {
+                self.ready_listener_indexes.push(listener_index);
             }
+        }
+        let mut accepted = 0_usize;
+        let ready_count = self.ready_listener_indexes.len();
+        for index in 0..ready_count {
+            let listener_index = self.ready_listener_indexes[index];
+            accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
         }
         self.drain_worker_events();
         self.maybe_rebalance_connections_if_needed();
-        Ok(snapshots.len().saturating_add(accepted))
+        Ok(observed.saturating_add(accepted))
     }
 
     #[cfg(test)]
@@ -1237,7 +961,7 @@ impl ThreadedServerReactor {
                             socket,
                         },
                     )?;
-                    let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
+                    self.upsert_connection_owner(connection_id, worker_id);
                     self.mark_rebalance_dirty();
                     accepted = accepted.saturating_add(1);
                 }
@@ -1267,6 +991,25 @@ impl ThreadedServerReactor {
         connection_id
     }
 
+    fn upsert_connection_owner(&mut self, connection_id: u64, worker_id: usize) {
+        connection_owner_upsert(
+            &mut self.connection_owner_by_id,
+            &mut self.connection_counts_by_worker,
+            &mut self.owned_connections_by_worker,
+            connection_id,
+            worker_id,
+        );
+    }
+
+    fn remove_connection_owner(&mut self, connection_id: u64) -> Option<usize> {
+        connection_owner_remove(
+            &mut self.connection_owner_by_id,
+            &mut self.connection_counts_by_worker,
+            &mut self.owned_connections_by_worker,
+            connection_id,
+        )
+    }
+
     fn allocate_worker_index(&mut self, socket: &TcpStream) -> usize {
         if self.use_peer_hash_dispatch
             && let Some(worker_id) = self.select_worker_by_peer_hash(socket)
@@ -1293,7 +1036,7 @@ impl ThreadedServerReactor {
         while let Ok(WorkerEvent::ConnectionClosed { connection_id }) =
             self.worker_events.try_recv()
         {
-            if self.connection_owner_by_id.remove(&connection_id).is_some() {
+            if self.remove_connection_owner(connection_id).is_some() {
                 self.mark_rebalance_dirty();
             }
             let _ = self.migrated_connections.remove(&connection_id);
@@ -1383,43 +1126,17 @@ impl ThreadedServerReactor {
         {
             return Ok(false);
         }
-        let mut counts = vec![0_usize; self.workers.len()];
-        for owner in self.connection_owner_by_id.values().copied() {
-            if let Some(count) = counts.get_mut(owner) {
-                *count = count.saturating_add(1);
-            }
-        }
-        let Some((source_worker, source_count)) = counts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, count)| **count)
-            .map(|(index, count)| (index, *count))
+        let Some((source_worker, target_worker)) =
+            rebalance_source_and_target(&self.connection_counts_by_worker)
         else {
             return Ok(false);
         };
-        let Some((target_worker, target_count)) = counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, count)| **count)
-            .map(|(index, count)| (index, *count))
-        else {
-            return Ok(false);
-        };
-        if source_count <= target_count.saturating_add(1) {
-            return Ok(false);
-        }
 
-        let Some(connection_id) =
-            self.connection_owner_by_id
-                .iter()
-                .find_map(|(connection_id, owner)| {
-                    if *owner == source_worker && !self.migrated_connections.contains(connection_id)
-                    {
-                        Some(*connection_id)
-                    } else {
-                        None
-                    }
-                })
+        let Some(connection_id) = select_rebalance_connection_id(
+            &mut self.owned_connections_by_worker,
+            source_worker,
+            &self.migrated_connections,
+        )
         else {
             return Ok(false);
         };
@@ -1503,22 +1220,20 @@ impl ThreadedServerReactor {
                 ));
             }
         }
-        let _ = self
-            .connection_owner_by_id
-            .insert(connection_id, target_worker);
+        self.upsert_connection_owner(connection_id, target_worker);
         let _ = self.migrated_connections.insert(connection_id);
         self.mark_rebalance_dirty();
         Ok(())
     }
 }
 
-/// `epoll` backend implementation for the top-level network engine.
-pub struct EpollBackend {
+/// `mio` backend implementation for the top-level network engine.
+pub struct MioBackend {
     reactor: ThreadedServerReactor,
 }
 
-impl EpollBackend {
-    /// Binds listeners/workers for the epoll backend.
+impl MioBackend {
+    /// Binds listeners/workers for the mio backend.
     ///
     /// # Errors
     ///
@@ -1539,7 +1254,7 @@ impl EpollBackend {
         })
     }
 
-    /// Runs one poll cycle of the epoll backend.
+    /// Runs one poll cycle of the mio backend.
     ///
     /// # Errors
     ///
@@ -1556,7 +1271,6 @@ enum IoUringWorkerCommand {
         connection_id: u64,
         protocol: ClientProtocol,
         socket: StdTcpStream,
-        response: IoUringAddConnectionAckSender,
     },
     TakeConnectionForMigration {
         connection_id: u64,
@@ -1570,15 +1284,49 @@ enum IoUringWorkerCommand {
 }
 
 #[cfg(target_os = "linux")]
-type IoUringAddConnectionAckResult = Result<(), String>;
-#[cfg(target_os = "linux")]
-type IoUringAddConnectionAckSender = Sender<IoUringAddConnectionAckResult>;
-#[cfg(target_os = "linux")]
 type IoUringMigrationAdoptResult = Result<(), Box<IoUringMigratedConnection>>;
 #[cfg(target_os = "linux")]
 type IoUringMigrationAdoptSender = Sender<IoUringMigrationAdoptResult>;
 #[cfg(target_os = "linux")]
 type IoUringMigrationAdoptReceiver = Receiver<IoUringMigrationAdoptResult>;
+#[cfg(target_os = "linux")]
+type IoUringDetachedRuntimeTickets = Arc<std::sync::Mutex<Vec<RuntimeReplyTicket>>>;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct IoUringConnectionTaskContext {
+    app_executor: AppExecutor,
+    backpressure: BackpressureThresholds,
+    worker_event_sender: Sender<IoUringWorkerEvent>,
+    worker_pending_requests: Arc<AtomicUsize>,
+    detached_runtime_tickets: IoUringDetachedRuntimeTickets,
+    closed_sender: TokioUnboundedSender<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct IoUringWorkerLoopContext {
+    app_executor: AppExecutor,
+    backpressure: BackpressureThresholds,
+    worker_event_sender: Sender<IoUringWorkerEvent>,
+    worker_pending_requests: Arc<AtomicUsize>,
+    detached_runtime_tickets: IoUringDetachedRuntimeTickets,
+    closed_sender: TokioUnboundedSender<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringWorkerLoopContext {
+    fn to_connection_task_context(&self) -> IoUringConnectionTaskContext {
+        IoUringConnectionTaskContext {
+            app_executor: self.app_executor.clone(),
+            backpressure: self.backpressure,
+            worker_event_sender: self.worker_event_sender.clone(),
+            worker_pending_requests: Arc::clone(&self.worker_pending_requests),
+            detached_runtime_tickets: Arc::clone(&self.detached_runtime_tickets),
+            closed_sender: self.closed_sender.clone(),
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -1609,6 +1357,7 @@ struct IoUringMigratedConnection {
     socket: StdTcpStream,
     logical: ServerConnection,
     write_buffer: Vec<u8>,
+    write_cursor: usize,
     next_request_id: u64,
     pending_request_count: usize,
     pending_runtime_requests: Vec<PendingRuntimeRequest>,
@@ -1626,6 +1375,7 @@ impl IoUringMigratedConnection {
             socket,
             logical: ServerApp::new_connection(protocol),
             write_buffer: Vec::new(),
+            write_cursor: 0,
             next_request_id: 1,
             pending_request_count: 0,
             pending_runtime_requests: Vec::new(),
@@ -1641,17 +1391,20 @@ impl IoUringMigratedConnection {
     }
 
     fn should_close_now(&self) -> bool {
-        self.draining && self.pending_request_count == 0 && self.write_buffer.is_empty()
+        self.draining
+            && self.pending_request_count == 0
+            && write_buffer_is_empty(&self.write_buffer, self.write_cursor)
     }
 
     fn update_backpressure_state(&mut self, high_watermark: usize, low_watermark: usize) {
+        let buffered_bytes = write_buffer_pending_len(&self.write_buffer, self.write_cursor);
         if self.read_paused_by_backpressure {
-            if self.write_buffer.len() <= low_watermark {
+            if buffered_bytes <= low_watermark {
                 self.read_paused_by_backpressure = false;
             }
             return;
         }
-        if self.write_buffer.len() >= high_watermark {
+        if buffered_bytes >= high_watermark {
             self.read_paused_by_backpressure = true;
         }
     }
@@ -1682,6 +1435,7 @@ struct IoUringWorkerHandle {
 pub struct IoUringBackend {
     acceptor_poll: Poll,
     acceptor_events: Events,
+    ready_listener_indexes: Vec<usize>,
     listeners: Vec<ReactorListener>,
     workers: Vec<IoUringWorkerHandle>,
     worker_events: Receiver<IoUringWorkerEvent>,
@@ -1694,6 +1448,8 @@ pub struct IoUringBackend {
     rebalance_dirty: bool,
     next_connection_id: u64,
     connection_owner_by_id: HashMap<u64, usize>,
+    connection_counts_by_worker: Vec<usize>,
+    owned_connections_by_worker: Vec<WorkerOwnedConnections>,
     migrated_connections: HashSet<u64>,
 }
 
@@ -1712,11 +1468,8 @@ impl IoUringBackend {
     ) -> DflyResult<Self> {
         let acceptor_poll =
             Poll::new().map_err(|error| DflyError::Io(format!("create poll failed: {error}")))?;
-        let mut listeners = Vec::with_capacity(if memcache_addr.is_some() { 2 } else { 1 });
-        let (write_high_watermark, write_low_watermark) =
-            config.normalized_backpressure_watermarks()?;
-        let (max_pending_per_connection, max_pending_per_worker) =
-            config.normalized_pending_request_limits();
+        let listeners = bind_acceptor_listeners(&acceptor_poll, resp_addr, memcache_addr)?;
+        let backpressure = resolve_backpressure_thresholds(config)?;
         let worker_count = config.normalized_io_worker_count();
         let dispatch_window = WorkerDispatchWindow {
             start: config.normalized_dispatch_start(worker_count),
@@ -1724,51 +1477,38 @@ impl IoUringBackend {
         };
         let max_events = config.normalized_max_events();
         let (worker_event_sender, worker_event_receiver) = mpsc::channel::<IoUringWorkerEvent>();
+        let workers = Self::spawn_workers(worker_count, app_executor, backpressure, &worker_event_sender)?;
 
-        let mut resp_listener = TcpListener::bind(resp_addr)
-            .map_err(|error| DflyError::Io(format!("bind RESP listener failed: {error}")))?;
-        acceptor_poll
-            .registry()
-            .register(&mut resp_listener, RESP_LISTENER_TOKEN, Interest::READABLE)
-            .map_err(|error| {
-                DflyError::Io(format!("register RESP listener in poll failed: {error}"))
-            })?;
-        listeners.push(ReactorListener {
-            token: RESP_LISTENER_TOKEN,
-            protocol: ClientProtocol::Resp,
-            socket: resp_listener,
-        });
+        Ok(Self {
+            acceptor_poll,
+            acceptor_events: Events::with_capacity(max_events),
+            ready_listener_indexes: Vec::with_capacity(max_events),
+            listeners,
+            workers,
+            worker_events: worker_event_receiver,
+            dispatch_window,
+            next_rr_offset: 0,
+            use_peer_hash_dispatch: config.use_peer_hash_dispatch,
+            migration_enabled: config.enable_connection_migration,
+            rebalance_scan_ticks: 0,
+            rebalance_scan_interval_ticks: DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS,
+            rebalance_dirty: false,
+            next_connection_id: 1,
+            connection_owner_by_id: HashMap::new(),
+            connection_counts_by_worker: vec![0; worker_count],
+            owned_connections_by_worker: (0..worker_count)
+                .map(|_| WorkerOwnedConnections::default())
+                .collect(),
+            migrated_connections: HashSet::new(),
+        })
+    }
 
-        if let Some(addr) = memcache_addr {
-            let mut memcache_listener = TcpListener::bind(addr).map_err(|error| {
-                DflyError::Io(format!("bind Memcache listener failed: {error}"))
-            })?;
-            acceptor_poll
-                .registry()
-                .register(
-                    &mut memcache_listener,
-                    MEMCACHE_LISTENER_TOKEN,
-                    Interest::READABLE,
-                )
-                .map_err(|error| {
-                    DflyError::Io(format!(
-                        "register Memcache listener in poll failed: {error}"
-                    ))
-                })?;
-            listeners.push(ReactorListener {
-                token: MEMCACHE_LISTENER_TOKEN,
-                protocol: ClientProtocol::Memcache,
-                socket: memcache_listener,
-            });
-        }
-
-        let backpressure = BackpressureThresholds {
-            high: write_high_watermark,
-            low: write_low_watermark,
-            max_pending_per_connection: max_pending_per_connection.max(1),
-            max_pending_per_worker: max_pending_per_worker.max(1),
-        };
-
+    fn spawn_workers(
+        worker_count: usize,
+        app_executor: &AppExecutor,
+        backpressure: BackpressureThresholds,
+        worker_event_sender: &Sender<IoUringWorkerEvent>,
+    ) -> DflyResult<Vec<IoUringWorkerHandle>> {
         let mut workers = Vec::with_capacity(worker_count);
         for worker_id in 0..worker_count {
             let (sender, receiver) = tokio_unbounded_channel::<IoUringWorkerCommand>();
@@ -1795,24 +1535,7 @@ impl IoUringBackend {
                 join: Some(join),
             });
         }
-
-        Ok(Self {
-            acceptor_poll,
-            acceptor_events: Events::with_capacity(max_events),
-            listeners,
-            workers,
-            worker_events: worker_event_receiver,
-            dispatch_window,
-            next_rr_offset: 0,
-            use_peer_hash_dispatch: config.use_peer_hash_dispatch,
-            migration_enabled: config.enable_connection_migration,
-            rebalance_scan_ticks: 0,
-            rebalance_scan_interval_ticks: DEFAULT_REBALANCE_SCAN_INTERVAL_TICKS,
-            rebalance_dirty: false,
-            next_connection_id: 1,
-            connection_owner_by_id: HashMap::new(),
-            migrated_connections: HashSet::new(),
-        })
+        Ok(workers)
     }
 
     /// Runs one acceptor cycle and dispatches accepted sockets to `io_uring` workers.
@@ -1824,20 +1547,23 @@ impl IoUringBackend {
         self.acceptor_poll
             .poll(&mut self.acceptor_events, timeout)
             .map_err(|error| DflyError::Io(format!("poll wait failed: {error}")))?;
-        let snapshots = self
-            .acceptor_events
-            .iter()
-            .map(EventSnapshot::from_mio_event)
-            .collect::<Vec<_>>();
-        let mut accepted = 0_usize;
-        for snapshot in &snapshots {
-            if let Some(listener_index) = self.listener_index(snapshot.token) {
-                accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
+        let mut observed = 0_usize;
+        self.ready_listener_indexes.clear();
+        for event in &self.acceptor_events {
+            observed = observed.saturating_add(1);
+            if let Some(listener_index) = self.listener_index(event.token()) {
+                self.ready_listener_indexes.push(listener_index);
             }
+        }
+        let mut accepted = 0_usize;
+        let ready_count = self.ready_listener_indexes.len();
+        for index in 0..ready_count {
+            let listener_index = self.ready_listener_indexes[index];
+            accepted = accepted.saturating_add(self.accept_new_connections(listener_index)?);
         }
         self.drain_worker_events();
         self.maybe_rebalance_connections_if_needed();
-        Ok(snapshots.len().saturating_add(accepted))
+        Ok(observed.saturating_add(accepted))
     }
 
     /// Runs accept loop and dispatches accepted sockets to `io_uring` workers.
@@ -1884,31 +1610,15 @@ impl IoUringBackend {
                     let connection_id = self.allocate_connection_id();
                     let worker_id = self.allocate_worker_index(&socket);
                     let socket = mio_stream_into_std(socket);
-                    let (response_sender, response_receiver) =
-                        mpsc::channel::<IoUringAddConnectionAckResult>();
                     self.dispatch_to_worker(
                         worker_id,
                         IoUringWorkerCommand::AddConnection {
                             connection_id,
                             protocol,
                             socket,
-                            response: response_sender,
                         },
                     )?;
-                    match response_receiver.recv_timeout(Duration::from_secs(1)) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(message)) => {
-                            return Err(DflyError::Io(format!(
-                                "io_uring worker {worker_id} rejected connection {connection_id}: {message}"
-                            )));
-                        }
-                        Err(error) => {
-                            return Err(DflyError::Io(format!(
-                                "io_uring worker {worker_id} did not acknowledge connection {connection_id}: {error}"
-                            )));
-                        }
-                    }
-                    let _ = self.connection_owner_by_id.insert(connection_id, worker_id);
+                    self.upsert_connection_owner(connection_id, worker_id);
                     self.mark_rebalance_dirty();
                     accepted = accepted.saturating_add(1);
                 }
@@ -1945,6 +1655,25 @@ impl IoUringBackend {
         connection_id
     }
 
+    fn upsert_connection_owner(&mut self, connection_id: u64, worker_id: usize) {
+        connection_owner_upsert(
+            &mut self.connection_owner_by_id,
+            &mut self.connection_counts_by_worker,
+            &mut self.owned_connections_by_worker,
+            connection_id,
+            worker_id,
+        );
+    }
+
+    fn remove_connection_owner(&mut self, connection_id: u64) -> Option<usize> {
+        connection_owner_remove(
+            &mut self.connection_owner_by_id,
+            &mut self.connection_counts_by_worker,
+            &mut self.owned_connections_by_worker,
+            connection_id,
+        )
+    }
+
     fn allocate_worker_index(&mut self, socket: &TcpStream) -> usize {
         if self.use_peer_hash_dispatch
             && let Some(worker_id) = self.select_worker_by_peer_hash(socket)
@@ -1971,7 +1700,7 @@ impl IoUringBackend {
         while let Ok(IoUringWorkerEvent::ConnectionClosed { connection_id }) =
             self.worker_events.try_recv()
         {
-            if self.connection_owner_by_id.remove(&connection_id).is_some() {
+            if self.remove_connection_owner(connection_id).is_some() {
                 self.mark_rebalance_dirty();
             }
             let _ = self.migrated_connections.remove(&connection_id);
@@ -2062,43 +1791,17 @@ impl IoUringBackend {
         {
             return Ok(false);
         }
-        let mut counts = vec![0_usize; self.workers.len()];
-        for owner in self.connection_owner_by_id.values().copied() {
-            if let Some(count) = counts.get_mut(owner) {
-                *count = count.saturating_add(1);
-            }
-        }
-        let Some((source_worker, source_count)) = counts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, count)| **count)
-            .map(|(index, count)| (index, *count))
+        let Some((source_worker, target_worker)) =
+            rebalance_source_and_target(&self.connection_counts_by_worker)
         else {
             return Ok(false);
         };
-        let Some((target_worker, target_count)) = counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, count)| **count)
-            .map(|(index, count)| (index, *count))
-        else {
-            return Ok(false);
-        };
-        if source_count <= target_count.saturating_add(1) {
-            return Ok(false);
-        }
 
-        let Some(connection_id) =
-            self.connection_owner_by_id
-                .iter()
-                .find_map(|(connection_id, owner)| {
-                    if *owner == source_worker && !self.migrated_connections.contains(connection_id)
-                    {
-                        Some(*connection_id)
-                    } else {
-                        None
-                    }
-                })
+        let Some(connection_id) = select_rebalance_connection_id(
+            &mut self.owned_connections_by_worker,
+            source_worker,
+            &self.migrated_connections,
+        )
         else {
             return Ok(false);
         };
@@ -2184,9 +1887,7 @@ impl IoUringBackend {
                 ));
             }
         }
-        let _ = self
-            .connection_owner_by_id
-            .insert(connection_id, target_worker);
+        self.upsert_connection_owner(connection_id, target_worker);
         let _ = self.migrated_connections.insert(connection_id);
         self.mark_rebalance_dirty();
         Ok(())
@@ -2223,123 +1924,150 @@ fn io_uring_worker_thread_main(
 ) {
     tokio_uring::start(async move {
         let mut controls = HashMap::<u64, TokioUnboundedSender<IoUringConnectionControl>>::new();
-        while let Some(command) = receiver.recv().await {
-            match command {
-                IoUringWorkerCommand::AddConnection {
-                    connection_id,
-                    protocol,
-                    socket,
-                    response,
-                } => {
-                    if controls.contains_key(&connection_id) {
-                        let _ = response.send(Err("connection is already tracked by io_uring worker".to_owned()));
-                        continue;
-                    }
-                    let control = spawn_io_uring_connection_task(
-                        IoUringMigratedConnection::new(connection_id, socket, protocol),
-                        app_executor.clone(),
-                        backpressure,
-                        worker_event_sender.clone(),
-                        Arc::clone(&worker_pending_requests),
-                    );
-                    let _ = controls.insert(connection_id, control);
-                    let _ = response.send(Ok(()));
-                }
-                IoUringWorkerCommand::TakeConnectionForMigration {
-                    connection_id,
-                    response,
-                } => {
-                    let Some(control) = controls.remove(&connection_id) else {
-                        let _ = response.send(Err(
-                            "connection is not tracked by io_uring worker".to_owned()
-                        ));
-                        continue;
-                    };
-                    let (migrate_sender, migrate_receiver) =
-                        oneshot::channel::<Result<IoUringMigratedConnection, String>>();
-                    if control
-                        .send(IoUringConnectionControl::Migrate {
-                            response: migrate_sender,
-                        })
-                        .is_err()
-                    {
-                        let _ = response.send(Err(
-                            "connection task is unavailable while migrating".to_owned(),
-                        ));
-                        continue;
-                    }
-                    let migration = match tokio::time::timeout(
-                        Duration::from_secs(1),
-                        migrate_receiver,
-                    )
-                    .await
-                    {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_)) => Err("connection task dropped migration response".to_owned()),
-                        Err(_) => {
-                            Err("io_uring connection task timed out during migration".to_owned())
-                        }
-                    };
-                    match migration {
-                        Ok(connection) => {
-                            let _ = response.send(Ok(connection));
-                        }
-                        Err(message) => {
-                            let _ = controls.insert(connection_id, control);
-                            let _ = response.send(Err(message));
-                        }
-                    }
-                }
-                IoUringWorkerCommand::AdoptMigratedConnection {
-                    connection,
-                    response,
-                } => {
-                    let connection = *connection;
-                    let connection_id = connection.connection_id;
-                    if controls.contains_key(&connection_id) {
-                        let _ = response.send(Err(Box::new(connection)));
-                        continue;
-                    }
-                    let control = spawn_io_uring_connection_task(
-                        connection,
-                        app_executor.clone(),
-                        backpressure,
-                        worker_event_sender.clone(),
-                        Arc::clone(&worker_pending_requests),
-                    );
-                    let _ = controls.insert(connection_id, control);
-                    let _ = response.send(Ok(()));
-                }
-                IoUringWorkerCommand::Shutdown => {
-                    for control in controls.values() {
-                        let _ = control.send(IoUringConnectionControl::Shutdown);
-                    }
-                    break;
-                }
+        let (closed_sender, mut closed_receiver) = tokio_unbounded_channel::<u64>();
+        let detached_runtime_tickets: IoUringDetachedRuntimeTickets =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let context = IoUringWorkerLoopContext {
+            app_executor,
+            backpressure,
+            worker_event_sender,
+            worker_pending_requests,
+            detached_runtime_tickets,
+            closed_sender,
+        };
+
+        loop {
+            io_uring_reap_detached_runtime_replies(
+                &context.app_executor,
+                &context.detached_runtime_tickets,
+            );
+            io_uring_prune_closed_controls(&mut controls, &mut closed_receiver);
+            let command = match tokio::time::timeout(Duration::from_millis(5), receiver.recv()).await {
+                Ok(Some(command)) => command,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            if !io_uring_dispatch_worker_command(command, &mut controls, &context).await {
+                break;
             }
         }
     });
 }
 
 #[cfg(target_os = "linux")]
+fn io_uring_prune_closed_controls(
+    controls: &mut HashMap<u64, TokioUnboundedSender<IoUringConnectionControl>>,
+    closed_receiver: &mut TokioUnboundedReceiver<u64>,
+) {
+    while let Ok(connection_id) = closed_receiver.try_recv() {
+        let _ = controls.remove(&connection_id);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_dispatch_worker_command(
+    command: IoUringWorkerCommand,
+    controls: &mut HashMap<u64, TokioUnboundedSender<IoUringConnectionControl>>,
+    context: &IoUringWorkerLoopContext,
+) -> bool {
+    match command {
+        IoUringWorkerCommand::AddConnection {
+            connection_id,
+            protocol,
+            socket,
+        } => {
+            if controls.contains_key(&connection_id) {
+                let _ = context
+                    .worker_event_sender
+                    .send(IoUringWorkerEvent::ConnectionClosed { connection_id });
+                return true;
+            }
+            let control = spawn_io_uring_connection_task(
+                IoUringMigratedConnection::new(connection_id, socket, protocol),
+                context.to_connection_task_context(),
+            );
+            let _ = controls.insert(connection_id, control);
+            true
+        }
+        IoUringWorkerCommand::TakeConnectionForMigration {
+            connection_id,
+            response,
+        } => {
+            io_uring_handle_take_connection_for_migration(connection_id, response, controls).await;
+            true
+        }
+        IoUringWorkerCommand::AdoptMigratedConnection {
+            connection,
+            response,
+        } => {
+            let connection = *connection;
+            let connection_id = connection.connection_id;
+            if controls.contains_key(&connection_id) {
+                let _ = response.send(Err(Box::new(connection)));
+                return true;
+            }
+            let control =
+                spawn_io_uring_connection_task(connection, context.to_connection_task_context());
+            let _ = controls.insert(connection_id, control);
+            let _ = response.send(Ok(()));
+            true
+        }
+        IoUringWorkerCommand::Shutdown => {
+            for control in controls.values() {
+                let _ = control.send(IoUringConnectionControl::Shutdown);
+            }
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_handle_take_connection_for_migration(
+    connection_id: u64,
+    response: Sender<Result<IoUringMigratedConnection, String>>,
+    controls: &mut HashMap<u64, TokioUnboundedSender<IoUringConnectionControl>>,
+) {
+    let Some(control) = controls.remove(&connection_id) else {
+        let _ = response.send(Err("connection is not tracked by io_uring worker".to_owned()));
+        return;
+    };
+    let (migrate_sender, migrate_receiver) =
+        oneshot::channel::<Result<IoUringMigratedConnection, String>>();
+    if control
+        .send(IoUringConnectionControl::Migrate {
+            response: migrate_sender,
+        })
+        .is_err()
+    {
+        let _ = response.send(Err(
+            "connection task is unavailable while migrating".to_owned(),
+        ));
+        return;
+    }
+    let migration = match tokio::time::timeout(Duration::from_secs(1), migrate_receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("connection task dropped migration response".to_owned()),
+        Err(_) => Err("io_uring connection task timed out during migration".to_owned()),
+    };
+    match migration {
+        Ok(connection) => {
+            let _ = response.send(Ok(connection));
+        }
+        Err(message) => {
+            let _ = controls.insert(connection_id, control);
+            let _ = response.send(Err(message));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_io_uring_connection_task(
     connection: IoUringMigratedConnection,
-    app_executor: AppExecutor,
-    backpressure: BackpressureThresholds,
-    worker_event_sender: Sender<IoUringWorkerEvent>,
-    worker_pending_requests: Arc<AtomicUsize>,
+    context: IoUringConnectionTaskContext,
 ) -> TokioUnboundedSender<IoUringConnectionControl> {
     let (control_sender, control_receiver) = tokio_unbounded_channel::<IoUringConnectionControl>();
     tokio_uring::spawn(async move {
-        io_uring_connection_main(
-            connection,
-            app_executor,
-            backpressure,
-            control_receiver,
-            worker_event_sender,
-            worker_pending_requests,
-        )
-        .await;
+        io_uring_connection_main(connection, control_receiver, context).await;
     });
     control_sender
 }
@@ -2355,21 +2083,11 @@ fn io_uring_stream_from_connection_socket(
 #[cfg(target_os = "linux")]
 async fn io_uring_connection_main(
     mut connection: IoUringMigratedConnection,
-    app_executor: AppExecutor,
-    backpressure: BackpressureThresholds,
     mut control_receiver: TokioUnboundedReceiver<IoUringConnectionControl>,
-    worker_event_sender: Sender<IoUringWorkerEvent>,
-    worker_pending_requests: Arc<AtomicUsize>,
+    context: IoUringConnectionTaskContext,
 ) {
     let Ok(stream) = io_uring_stream_from_connection_socket(&connection.socket) else {
-        io_uring_finalize_connection(
-            &app_executor,
-            &mut connection,
-            backpressure,
-            &worker_pending_requests,
-            &worker_event_sender,
-        )
-        .await;
+        io_uring_finalize_connection_with_context(&mut connection, &context).await;
         return;
     };
 
@@ -2396,74 +2114,91 @@ async fn io_uring_connection_main(
             break;
         }
 
-        let mut made_progress = false;
-        if io_uring_drain_pending_runtime_replies(
-            &app_executor,
-            &mut connection,
-            backpressure,
-            &worker_pending_requests,
-        ) {
-            made_progress = true;
-        }
-
-        let pending_for_worker = worker_pending_requests.load(Ordering::Acquire);
-        connection.update_command_backpressure_state(
-            pending_for_worker,
-            backpressure.max_pending_per_connection,
-            backpressure.max_pending_per_worker,
-        );
-
-        if io_uring_drain_parsed_commands(
-            &app_executor,
-            &mut connection,
-            backpressure,
-            &worker_pending_requests,
-        ) {
-            made_progress = true;
-        }
-
-        if io_uring_flush_connection_writes(&stream, &mut connection, backpressure).await {
-            made_progress = true;
-        }
-
+        let made_progress = io_uring_progress_connection_turn(&stream, &context, &mut connection).await;
         if connection.should_close_now() {
             break;
-        }
-
-        if connection.can_read() {
-            match io_uring_connection_has_readable_bytes(&connection.socket) {
-                Ok(true) => {
-                    if io_uring_read_connection_bytes(
-                        &stream,
-                        &app_executor,
-                        &mut connection,
-                        backpressure,
-                        &worker_pending_requests,
-                    )
-                    .await
-                    {
-                        made_progress = true;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Ok(false) | Err(_) => {
-                    connection.draining = true;
-                    made_progress = true;
-                }
-            }
         }
         if !made_progress {
             tokio::task::yield_now().await;
         }
     }
+    io_uring_finalize_connection_with_context(&mut connection, &context).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_progress_connection_turn(
+    stream: &IoUringTcpStream,
+    context: &IoUringConnectionTaskContext,
+    connection: &mut IoUringMigratedConnection,
+) -> bool {
+    let mut made_progress = false;
+    if io_uring_drain_pending_runtime_replies(
+        &context.app_executor,
+        connection,
+        context.backpressure,
+        &context.worker_pending_requests,
+    ) {
+        made_progress = true;
+    }
+
+    let pending_for_worker = context.worker_pending_requests.load(Ordering::Acquire);
+    connection.update_command_backpressure_state(
+        pending_for_worker,
+        context.backpressure.max_pending_per_connection,
+        context.backpressure.max_pending_per_worker,
+    );
+    if io_uring_drain_parsed_commands(
+        &context.app_executor,
+        connection,
+        context.backpressure,
+        &context.worker_pending_requests,
+    ) {
+        made_progress = true;
+    }
+    if io_uring_flush_connection_writes(stream, connection, context.backpressure).await {
+        made_progress = true;
+    }
+    if connection.can_read() {
+        match io_uring_connection_has_readable_bytes(&connection.socket) {
+            Ok(true) => {
+                if io_uring_read_connection_bytes(
+                    stream,
+                    &context.app_executor,
+                    connection,
+                    context.backpressure,
+                    &context.worker_pending_requests,
+                )
+                .await
+                {
+                    made_progress = true;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(false) | Err(_) => {
+                connection.draining = true;
+                made_progress = true;
+            }
+        }
+    }
+    made_progress
+}
+
+#[cfg(target_os = "linux")]
+async fn io_uring_finalize_connection_with_context(
+    connection: &mut IoUringMigratedConnection,
+    context: &IoUringConnectionTaskContext,
+) {
+    let connection_id = connection.connection_id;
     io_uring_finalize_connection(
-        &app_executor,
-        &mut connection,
-        backpressure,
-        &worker_pending_requests,
-        &worker_event_sender,
+        &context.app_executor,
+        connection,
+        context.backpressure,
+        &context.worker_pending_requests,
+        &context.worker_event_sender,
+        &context.detached_runtime_tickets,
     )
     .await;
+    let _ = context.closed_sender.send(connection_id);
 }
 
 #[cfg(target_os = "linux")]
@@ -2473,6 +2208,7 @@ async fn io_uring_finalize_connection(
     backpressure: BackpressureThresholds,
     worker_pending_requests: &Arc<AtomicUsize>,
     worker_event_sender: &Sender<IoUringWorkerEvent>,
+    detached_runtime_tickets: &IoUringDetachedRuntimeTickets,
 ) {
     if !connection.pending_runtime_requests.is_empty() {
         io_uring_reap_pending_runtime_replies(
@@ -2480,8 +2216,27 @@ async fn io_uring_finalize_connection(
             connection,
             backpressure,
             worker_pending_requests,
+            IO_URING_DEFERRED_REAP_MAX_WAIT,
         )
         .await;
+        if !connection.pending_runtime_requests.is_empty() {
+            let mut detached = detached_runtime_tickets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            detached.extend(
+                connection
+                    .pending_runtime_requests
+                    .drain(..)
+                    .map(|pending| pending.ticket),
+            );
+        }
+    }
+    if connection.pending_request_count > 0 {
+        let pending = connection.pending_request_count;
+        connection.pending_request_count = 0;
+        let _ = worker_pending_requests.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(pending))
+        });
     }
     app_executor.disconnect_connection(&mut connection.logical);
     let _ = worker_event_sender.send(IoUringWorkerEvent::ConnectionClosed {
@@ -2544,12 +2299,13 @@ async fn io_uring_flush_connection_writes(
     connection: &mut IoUringMigratedConnection,
     backpressure: BackpressureThresholds,
 ) -> bool {
-    if connection.write_buffer.is_empty() {
+    if write_buffer_is_empty(&connection.write_buffer, connection.write_cursor) {
         return false;
     }
     if let Ok(written) = io_uring_flush_write_buffer_budget(
         stream,
         &mut connection.write_buffer,
+        &mut connection.write_cursor,
         WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
     )
     .await
@@ -2709,7 +2465,9 @@ async fn io_uring_reap_pending_runtime_replies(
     connection: &mut IoUringMigratedConnection,
     backpressure: BackpressureThresholds,
     worker_pending_requests: &Arc<AtomicUsize>,
+    max_wait: Duration,
 ) {
+    let deadline = std::time::Instant::now() + max_wait;
     while !connection.pending_runtime_requests.is_empty() {
         let progressed = io_uring_drain_pending_runtime_replies(
             app_executor,
@@ -2718,8 +2476,53 @@ async fn io_uring_reap_pending_runtime_replies(
             worker_pending_requests,
         );
         if !progressed {
-            tokio::task::yield_now().await;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_reap_detached_runtime_replies(
+    app_executor: &AppExecutor,
+    detached_runtime_tickets: &IoUringDetachedRuntimeTickets,
+) {
+    let mut detached = {
+        let mut guard = detached_runtime_tickets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *guard)
+    };
+
+    let processed_snapshot = app_executor.runtime_processed_sequences_snapshot().ok();
+    let mut pending = Vec::new();
+    for mut ticket in detached.drain(..) {
+        let ready = match &processed_snapshot {
+            Some(snapshot) => app_executor
+                .runtime_reply_ticket_ready_with_snapshot(&mut ticket, snapshot)
+                .unwrap_or(true),
+            None => app_executor.runtime_reply_ticket_ready(&mut ticket).unwrap_or(true),
+        };
+        if !ready {
+            pending.push(ticket);
+            continue;
+        }
+        let _ = match &processed_snapshot {
+            Some(_) => app_executor.take_runtime_reply_ticket_ready(&mut ticket),
+            None => app_executor.take_runtime_reply_ticket(&mut ticket),
+        };
+    }
+
+    if !pending.is_empty() {
+        let mut guard = detached_runtime_tickets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.extend(pending);
     }
 }
 
@@ -2765,7 +2568,7 @@ fn io_uring_record_completed_request(
         connection.reply_order.next_request_id =
             connection.reply_order.next_request_id.saturating_add(1);
         if let Some(reply) = reply {
-            connection.write_buffer.extend_from_slice(&reply);
+            write_buffer_append(&mut connection.write_buffer, &mut connection.write_cursor, &reply);
         }
         io_uring_complete_request(connection, worker_pending_requests);
     }
@@ -2782,17 +2585,21 @@ fn io_uring_record_completed_request(
 async fn io_uring_flush_write_buffer_budget(
     stream: &IoUringTcpStream,
     write_buffer: &mut Vec<u8>,
+    write_cursor: &mut usize,
     write_budget_bytes: usize,
 ) -> Result<usize, std::io::Error> {
-    if write_buffer.is_empty() {
+    write_buffer_maybe_compact(write_buffer, write_cursor);
+    if write_buffer_is_empty(write_buffer, *write_cursor) {
         return Ok(0);
     }
     let mut remaining_budget = write_budget_bytes.max(1);
     let mut written_total = 0_usize;
-    while !write_buffer.is_empty() && remaining_budget > 0 {
-        let chunk_len = remaining_budget.min(write_buffer.len());
-        let payload = write_buffer[..chunk_len].to_vec();
-        let (result, _payload) = stream.write(payload).submit().await;
+    while !write_buffer_is_empty(write_buffer, *write_cursor) && remaining_budget > 0 {
+        let chunk_len = remaining_budget.min(write_buffer_pending_len(write_buffer, *write_cursor));
+        let payload = std::mem::take(write_buffer);
+        let slice = payload.slice(*write_cursor..(*write_cursor).saturating_add(chunk_len));
+        let (result, slice) = stream.write(slice).submit().await;
+        *write_buffer = slice.into_inner();
         match result {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -2802,7 +2609,7 @@ async fn io_uring_flush_write_buffer_budget(
             }
             Ok(written) => {
                 let bounded_written = written.min(chunk_len);
-                let _ = write_buffer.drain(..bounded_written);
+                write_buffer_advance(write_buffer, write_cursor, bounded_written);
                 written_total = written_total.saturating_add(bounded_written);
                 remaining_budget = remaining_budget.saturating_sub(bounded_written);
             }
@@ -2820,7 +2627,7 @@ fn can_migrate_io_uring_connection(connection: &IoUringMigratedConnection) -> bo
         && connection.pending_runtime_requests.is_empty()
         && connection.logical.parser.pending_bytes() == 0
         && connection.reply_order.completed.is_empty()
-        && connection.write_buffer.is_empty()
+        && write_buffer_is_empty(&connection.write_buffer, connection.write_cursor)
 }
 
 impl Drop for ThreadedServerReactor {
@@ -2875,14 +2682,15 @@ fn io_worker_thread_main(
         {
             return;
         }
-        let snapshots = events
-            .iter()
-            .map(EventSnapshot::from_mio_event)
-            .collect::<Vec<_>>();
-        for snapshot in &snapshots {
+        for event in &events {
             handle_worker_connection_event(
                 &poll,
-                *snapshot,
+                WorkerEventFlags {
+                    token: event.token(),
+                    readable: event.is_readable(),
+                    writable: event.is_writable(),
+                    closed_or_error: event.is_read_closed() || event.is_write_closed() || event.is_error(),
+                },
                 app_executor,
                 &mut io_state,
                 backpressure,
@@ -2919,8 +2727,8 @@ fn drain_worker_commands(
                 protocol,
                 mut socket,
             }) => {
-                let token = Token(io_state.next_token);
-                io_state.next_token = io_state.next_token.saturating_add(1);
+                let token = Token(io_state.loop_state.next_token);
+                io_state.loop_state.next_token = io_state.loop_state.next_token.saturating_add(1);
                 if poll
                     .registry()
                     .register(&mut socket, token, Interest::READABLE)
@@ -2933,6 +2741,7 @@ fn drain_worker_commands(
                     WorkerConnection::new(connection_id, socket, protocol),
                 );
                 let _ = io_state
+                    .loop_state
                     .live_connection_count
                     .fetch_add(1, Ordering::AcqRel);
             }
@@ -2963,94 +2772,86 @@ fn progress_worker_parse_backlog(
     backpressure: BackpressureThresholds,
     worker_event_sender: &Sender<WorkerEvent>,
 ) {
-    let active_count = io_state.active_parse_tokens.len();
+    let active_count = io_state.loop_state.active_parse_tokens.len();
     for _ in 0..active_count {
-        let Some(token) = io_state.active_parse_tokens.pop_front() else {
+        let Some(token) = io_state.loop_state.active_parse_tokens.pop_front() else {
             break;
         };
-        let _ = io_state.in_active_parse_set.remove(&token);
-        let Some(mut connection) = io_state.connections.remove(&token) else {
-            continue;
-        };
+        let _ = io_state.loop_state.in_active_parse_set.remove(&token);
 
-        let mut should_requeue_parse = false;
-        if connection.can_read() {
-            match drain_worker_parsed_commands(
-                token,
-                &mut connection,
-                app_executor,
-                io_state,
-                backpressure,
-                WORKER_PARSE_BUDGET_PER_READ,
-            ) {
-                ParseDrainAction::StopReadTurn => {
-                    should_requeue_parse = true;
-                }
-                ParseDrainAction::CloseConnection => {
-                    close_worker_connection(
-                        poll,
-                        token,
-                        connection,
-                        io_state,
-                        app_executor,
-                        worker_event_sender,
-                    );
-                    continue;
-                }
-                ParseDrainAction::ContinueParserDrain | ParseDrainAction::ContinueSocketRead => {}
-            }
-        } else if connection.read_paused_by_command_backpressure
-            && connection.logical.parser.pending_bytes() > 0
+        let mut should_close = false;
         {
-            // Keep parse backlog active while command backpressure is armed so parser progress
-            // resumes as soon as pending request counters drop.
-            should_requeue_parse = true;
+            let (connections, loop_state) = (&mut io_state.connections, &mut io_state.loop_state);
+            let Some(connection) = connections.get_mut(&token) else {
+                continue;
+            };
+
+            let mut should_requeue_parse = false;
+            if connection.can_read() {
+                match drain_worker_parsed_commands(
+                    token,
+                    connection,
+                    app_executor,
+                    loop_state,
+                    backpressure,
+                    WORKER_PARSE_BUDGET_PER_READ,
+                ) {
+                    ParseDrainAction::StopReadTurn => {
+                        should_requeue_parse = true;
+                    }
+                    ParseDrainAction::CloseConnection => {
+                        should_close = true;
+                    }
+                    ParseDrainAction::ContinueParserDrain | ParseDrainAction::ContinueSocketRead => {}
+                }
+            } else if connection.read_paused_by_command_backpressure
+                && connection.logical.parser.pending_bytes() > 0
+            {
+                // Keep parse backlog active while command backpressure is armed so parser progress
+                // resumes as soon as pending request counters drop.
+                should_requeue_parse = true;
+            }
+
+            if !should_close {
+                drain_connection_pending_runtime_replies(
+                    connection,
+                    app_executor,
+                    loop_state,
+                    backpressure,
+                );
+                if connection.should_try_flush() {
+                    flush_worker_connection_writes(
+                        connection,
+                        backpressure.high,
+                        backpressure.low,
+                        WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
+                    );
+                }
+                if connection.should_close_now() || refresh_worker_interest(poll, token, connection).is_err() {
+                    should_close = true;
+                } else {
+                    if should_requeue_parse {
+                        enqueue_active_parse_connection(loop_state, token);
+                    }
+                    if !connection.pending_runtime_requests.is_empty() {
+                        enqueue_active_deferred_connection(loop_state, token);
+                    }
+                }
+            }
         }
 
-        drain_connection_pending_runtime_replies(
-            &mut connection,
-            app_executor,
-            io_state,
-            backpressure,
-        );
-        if connection.should_try_flush() {
-            flush_worker_connection_writes(
-                &mut connection,
-                backpressure.high,
-                backpressure.low,
-                WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
-            );
-        }
-        if connection.should_close_now() {
+        if should_close
+            && let Some(connection) = io_state.connections.remove(&token)
+        {
             close_worker_connection(
                 poll,
                 token,
                 connection,
-                io_state,
+                &mut io_state.loop_state,
                 app_executor,
                 worker_event_sender,
             );
-            continue;
         }
-        if refresh_worker_interest(poll, token, &mut connection).is_err() {
-            close_worker_connection(
-                poll,
-                token,
-                connection,
-                io_state,
-                app_executor,
-                worker_event_sender,
-            );
-            continue;
-        }
-
-        if should_requeue_parse {
-            enqueue_active_parse_connection(io_state, token);
-        }
-        if !connection.pending_runtime_requests.is_empty() {
-            enqueue_active_deferred_connection(io_state, token);
-        }
-        let _ = io_state.connections.insert(token, connection);
     }
 }
 
@@ -3061,131 +2862,124 @@ fn progress_worker_runtime_replies(
     backpressure: BackpressureThresholds,
     worker_event_sender: &Sender<WorkerEvent>,
 ) {
-    let active_count = io_state.active_deferred_tokens.len();
+    let active_count = io_state.loop_state.active_deferred_tokens.len();
     for _ in 0..active_count {
-        let Some(token) = io_state.active_deferred_tokens.pop_front() else {
+        let Some(token) = io_state.loop_state.active_deferred_tokens.pop_front() else {
             break;
         };
-        let _ = io_state.in_active_deferred_set.remove(&token);
-        let Some(mut connection) = io_state.connections.remove(&token) else {
-            continue;
-        };
-        drain_connection_pending_runtime_replies(
-            &mut connection,
-            app_executor,
-            io_state,
-            backpressure,
-        );
-        let has_pending_runtime = !connection.pending_runtime_requests.is_empty();
-        if connection.should_try_flush() {
-            flush_worker_connection_writes(
-                &mut connection,
-                backpressure.high,
-                backpressure.low,
-                WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
-            );
+        let _ = io_state.loop_state.in_active_deferred_set.remove(&token);
+
+        let mut should_close = false;
+        {
+            let (connections, loop_state) = (&mut io_state.connections, &mut io_state.loop_state);
+            let Some(connection) = connections.get_mut(&token) else {
+                continue;
+            };
+
+            drain_connection_pending_runtime_replies(connection, app_executor, loop_state, backpressure);
+            let has_pending_runtime = !connection.pending_runtime_requests.is_empty();
+            if connection.should_try_flush() {
+                flush_worker_connection_writes(
+                    connection,
+                    backpressure.high,
+                    backpressure.low,
+                    WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
+                );
+            }
+            if connection.should_close_now() || refresh_worker_interest(poll, token, connection).is_err() {
+                should_close = true;
+            } else if has_pending_runtime {
+                enqueue_active_deferred_connection(loop_state, token);
+            }
         }
-        if connection.should_close_now() {
+
+        if should_close
+            && let Some(connection) = io_state.connections.remove(&token)
+        {
             close_worker_connection(
                 poll,
                 token,
                 connection,
-                io_state,
+                &mut io_state.loop_state,
                 app_executor,
                 worker_event_sender,
             );
-            continue;
         }
-        if refresh_worker_interest(poll, token, &mut connection).is_err() {
-            close_worker_connection(
-                poll,
-                token,
-                connection,
-                io_state,
-                app_executor,
-                worker_event_sender,
-            );
-            continue;
-        }
-        if has_pending_runtime {
-            enqueue_active_deferred_connection(io_state, token);
-        }
-        let _ = io_state.connections.insert(token, connection);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerEventFlags {
+    token: Token,
+    readable: bool,
+    writable: bool,
+    closed_or_error: bool,
 }
 
 fn handle_worker_connection_event(
     poll: &Poll,
-    snapshot: EventSnapshot,
+    event: WorkerEventFlags,
     app_executor: &AppExecutor,
     io_state: &mut WorkerIoState,
     backpressure: BackpressureThresholds,
     worker_event_sender: &Sender<WorkerEvent>,
 ) {
-    let Some(mut connection) = io_state.connections.remove(&snapshot.token) else {
-        return;
-    };
+    let mut should_close = false;
+    {
+        let (connections, loop_state) = (&mut io_state.connections, &mut io_state.loop_state);
+        let Some(connection) = connections.get_mut(&event.token) else {
+            return;
+        };
 
-    if snapshot.closed_or_error() {
-        connection.on_peer_closed_or_error();
+        if event.closed_or_error {
+            connection.on_peer_closed_or_error();
+        }
+
+        if event.readable && connection.can_read() {
+            read_worker_connection_bytes(
+                event.token,
+                connection,
+                app_executor,
+                loop_state,
+                backpressure,
+            );
+            drain_connection_pending_runtime_replies(connection, app_executor, loop_state, backpressure);
+        }
+        if event.writable && connection.should_try_flush() {
+            flush_worker_connection_writes(
+                connection,
+                backpressure.high,
+                backpressure.low,
+                WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
+            );
+        }
+
+        if connection.should_close_now()
+            || refresh_worker_interest(poll, event.token, connection).is_err()
+        {
+            should_close = true;
+        }
     }
 
-    if snapshot.readable() && connection.can_read() {
-        read_worker_connection_bytes(
-            snapshot.token,
-            &mut connection,
-            app_executor,
-            io_state,
-            backpressure,
-        );
-        drain_connection_pending_runtime_replies(
-            &mut connection,
-            app_executor,
-            io_state,
-            backpressure,
-        );
-    }
-    if snapshot.writable() && connection.should_try_flush() {
-        flush_worker_connection_writes(
-            &mut connection,
-            backpressure.high,
-            backpressure.low,
-            WORKER_WRITE_BUDGET_BYTES_PER_EVENT,
-        );
-    }
-
-    if connection.should_close_now() {
+    if should_close
+        && let Some(connection) = io_state.connections.remove(&event.token)
+    {
         close_worker_connection(
             poll,
-            snapshot.token,
+            event.token,
             connection,
-            io_state,
+            &mut io_state.loop_state,
             app_executor,
             worker_event_sender,
         );
-        return;
     }
-
-    if refresh_worker_interest(poll, snapshot.token, &mut connection).is_err() {
-        close_worker_connection(
-            poll,
-            snapshot.token,
-            connection,
-            io_state,
-            app_executor,
-            worker_event_sender,
-        );
-        return;
-    }
-
-    let _ = io_state.connections.insert(snapshot.token, connection);
 }
 
 fn read_worker_connection_bytes(
     token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
 ) {
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
@@ -3203,14 +2997,14 @@ fn read_worker_connection_bytes(
                     token,
                     connection,
                     app_executor,
-                    io_state,
+                    loop_state,
                     backpressure,
                     WORKER_PARSE_BUDGET_PER_READ,
                 ) {
                     ParseDrainAction::ContinueParserDrain
                     | ParseDrainAction::ContinueSocketRead => {}
                     ParseDrainAction::StopReadTurn => {
-                        enqueue_active_parse_connection(io_state, token);
+                        enqueue_active_parse_connection(loop_state, token);
                         return;
                     }
                     ParseDrainAction::CloseConnection => return,
@@ -3246,7 +3040,7 @@ fn drain_worker_parsed_commands(
     token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
     parse_budget: usize,
 ) -> ParseDrainAction {
@@ -3256,7 +3050,7 @@ fn drain_worker_parsed_commands(
             return ParseDrainAction::StopReadTurn;
         }
         remaining_budget = remaining_budget.saturating_sub(1);
-        if worker_command_backpressure_armed(connection, io_state, backpressure) {
+        if worker_command_backpressure_armed(connection, loop_state, backpressure) {
             return ParseDrainAction::StopReadTurn;
         }
         match connection.logical.parser.try_pop_command() {
@@ -3265,7 +3059,7 @@ fn drain_worker_parsed_commands(
                     token,
                     connection,
                     app_executor,
-                    io_state,
+                    loop_state,
                     backpressure,
                     parsed,
                 ) {
@@ -3274,7 +3068,7 @@ fn drain_worker_parsed_commands(
             }
             Ok(None) => return ParseDrainAction::ContinueSocketRead,
             Err(error) => {
-                match handle_worker_parse_error(connection, io_state, backpressure, &error) {
+                match handle_worker_parse_error(connection, loop_state, backpressure, &error) {
                     ParseDrainAction::ContinueParserDrain => {}
                     action => return action,
                 }
@@ -3285,14 +3079,14 @@ fn drain_worker_parsed_commands(
 
 fn worker_command_backpressure_armed(
     connection: &mut WorkerConnection,
-    io_state: &WorkerIoState,
+    loop_state: &WorkerLoopState,
     backpressure: BackpressureThresholds,
 ) -> bool {
     let armed = connection.pending_request_count >= backpressure.max_pending_per_connection
-        || io_state.pending_requests_for_worker >= backpressure.max_pending_per_worker;
+        || loop_state.pending_requests_for_worker >= backpressure.max_pending_per_worker;
     if armed {
         connection.update_command_backpressure_state(
-            io_state.pending_requests_for_worker,
+            loop_state.pending_requests_for_worker,
             backpressure.max_pending_per_connection,
             backpressure.max_pending_per_worker,
         );
@@ -3304,26 +3098,26 @@ fn execute_worker_parsed_command(
     token: Token,
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
     parsed: ParsedCommand,
 ) -> bool {
     let request_id = connection.next_request_id;
     connection.next_request_id = connection.next_request_id.saturating_add(1);
-    mark_worker_request_submitted(connection, &mut io_state.pending_requests_for_worker);
+    mark_worker_request_submitted(connection, &mut loop_state.pending_requests_for_worker);
 
     match app_executor.execute_parsed_command_deferred(&mut connection.logical, parsed) {
         ParsedCommandExecution::Immediate(reply) => {
-            record_completed_worker_request(connection, request_id, reply, io_state, backpressure);
+            record_completed_worker_request(connection, request_id, reply, loop_state, backpressure);
             true
         }
         ParsedCommandExecution::Deferred(ticket) => {
             connection
                 .pending_runtime_requests
                 .push(PendingRuntimeRequest { request_id, ticket });
-            enqueue_active_deferred_connection(io_state, token);
+            enqueue_active_deferred_connection(loop_state, token);
             connection.update_command_backpressure_state(
-                io_state.pending_requests_for_worker,
+                loop_state.pending_requests_for_worker,
                 backpressure.max_pending_per_connection,
                 backpressure.max_pending_per_worker,
             );
@@ -3335,7 +3129,7 @@ fn execute_worker_parsed_command(
 fn drain_connection_pending_runtime_replies(
     connection: &mut WorkerConnection,
     app_executor: &AppExecutor,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
 ) {
     if connection.pending_runtime_requests.is_empty() {
@@ -3350,7 +3144,7 @@ fn drain_connection_pending_runtime_replies(
                     connection,
                     pending.request_id,
                     Some(reply),
-                    io_state,
+                    loop_state,
                     backpressure,
                 );
             }
@@ -3374,7 +3168,7 @@ fn drain_connection_pending_runtime_replies(
                     connection,
                     pending.request_id,
                     Some(reply),
-                    io_state,
+                    loop_state,
                     backpressure,
                 );
                 continue;
@@ -3397,21 +3191,21 @@ fn drain_connection_pending_runtime_replies(
             connection,
             pending.request_id,
             reply,
-            io_state,
+            loop_state,
             backpressure,
         );
     }
 }
 
-fn enqueue_active_parse_connection(io_state: &mut WorkerIoState, token: Token) {
-    if io_state.in_active_parse_set.insert(token) {
-        io_state.active_parse_tokens.push_back(token);
+fn enqueue_active_parse_connection(loop_state: &mut WorkerLoopState, token: Token) {
+    if loop_state.in_active_parse_set.insert(token) {
+        loop_state.active_parse_tokens.push_back(token);
     }
 }
 
-fn enqueue_active_deferred_connection(io_state: &mut WorkerIoState, token: Token) {
-    if io_state.in_active_deferred_set.insert(token) {
-        io_state.active_deferred_tokens.push_back(token);
+fn enqueue_active_deferred_connection(loop_state: &mut WorkerLoopState, token: Token) {
+    if loop_state.in_active_deferred_set.insert(token) {
+        loop_state.active_deferred_tokens.push_back(token);
     }
 }
 
@@ -3419,16 +3213,16 @@ fn record_completed_worker_request(
     connection: &mut WorkerConnection,
     request_id: u64,
     reply: Option<Vec<u8>>,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
 ) {
     let _ = connection.reply_order.completed.insert(request_id, reply);
-    flush_worker_ordered_replies(connection, io_state, backpressure);
+    flush_worker_ordered_replies(connection, loop_state, backpressure);
 }
 
 fn flush_worker_ordered_replies(
     connection: &mut WorkerConnection,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
 ) {
     loop {
@@ -3442,13 +3236,13 @@ fn flush_worker_ordered_replies(
         connection.reply_order.next_request_id =
             connection.reply_order.next_request_id.saturating_add(1);
         if let Some(reply) = reply {
-            connection.write_buffer.extend_from_slice(&reply);
+            write_buffer_append(&mut connection.write_buffer, &mut connection.write_cursor, &reply);
         }
-        complete_worker_request(connection, &mut io_state.pending_requests_for_worker);
+        complete_worker_request(connection, &mut loop_state.pending_requests_for_worker);
     }
     connection.update_backpressure_state(backpressure.high, backpressure.low);
     connection.update_command_backpressure_state(
-        io_state.pending_requests_for_worker,
+        loop_state.pending_requests_for_worker,
         backpressure.max_pending_per_connection,
         backpressure.max_pending_per_worker,
     );
@@ -3456,16 +3250,16 @@ fn flush_worker_ordered_replies(
 
 fn handle_worker_parse_error(
     connection: &mut WorkerConnection,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     backpressure: BackpressureThresholds,
     error: &DflyError,
 ) -> ParseDrainAction {
     let request_id = connection.next_request_id;
     connection.next_request_id = connection.next_request_id.saturating_add(1);
-    mark_worker_request_submitted(connection, &mut io_state.pending_requests_for_worker);
+    mark_worker_request_submitted(connection, &mut loop_state.pending_requests_for_worker);
     let protocol = connection.logical.context.protocol;
     let reply = protocol_parse_error_reply(protocol, error);
-    record_completed_worker_request(connection, request_id, Some(reply), io_state, backpressure);
+    record_completed_worker_request(connection, request_id, Some(reply), loop_state, backpressure);
 
     if protocol == ClientProtocol::Memcache {
         if !connection.logical.parser.recover_after_protocol_error() {
@@ -3515,14 +3309,14 @@ fn runtime_dispatch_error_reply(protocol: ClientProtocol, error: &DflyError) -> 
 }
 
 fn reap_detached_runtime_replies(app_executor: &AppExecutor, io_state: &mut WorkerIoState) {
-    if io_state.detached_runtime_tickets.is_empty() {
+    if io_state.loop_state.detached_runtime_tickets.is_empty() {
         return;
     }
     let processed_snapshot = app_executor.runtime_processed_sequences_snapshot().ok();
     let mut index = 0_usize;
-    while index < io_state.detached_runtime_tickets.len() {
+    while index < io_state.loop_state.detached_runtime_tickets.len() {
         let ready = {
-            let ticket = &mut io_state.detached_runtime_tickets[index];
+            let ticket = &mut io_state.loop_state.detached_runtime_tickets[index];
             match &processed_snapshot {
                 Some(snapshot) => app_executor
                     .runtime_reply_ticket_ready_with_snapshot(ticket, snapshot)
@@ -3536,7 +3330,7 @@ fn reap_detached_runtime_replies(app_executor: &AppExecutor, io_state: &mut Work
             index = index.saturating_add(1);
             continue;
         }
-        let mut ticket = io_state.detached_runtime_tickets.swap_remove(index);
+        let mut ticket = io_state.loop_state.detached_runtime_tickets.swap_remove(index);
         let _ = match &processed_snapshot {
             Some(_) => app_executor.take_runtime_reply_ticket_ready(&mut ticket),
             None => app_executor.take_runtime_reply_ticket(&mut ticket),
@@ -3551,15 +3345,23 @@ fn flush_worker_connection_writes(
     write_budget_bytes: usize,
 ) {
     let mut remaining_budget = write_budget_bytes.max(1);
-    while !connection.write_buffer.is_empty() && remaining_budget > 0 {
-        match connection.socket.write(connection.write_buffer.as_slice()) {
+    while !write_buffer_is_empty(&connection.write_buffer, connection.write_cursor) && remaining_budget > 0
+    {
+        match connection
+            .socket
+            .write(write_buffer_pending_slice(&connection.write_buffer, connection.write_cursor))
+        {
             Ok(0) => {
                 connection.mark_closing();
                 return;
             }
             Ok(written) => {
                 remaining_budget = remaining_budget.saturating_sub(written);
-                let _ = connection.write_buffer.drain(..written);
+                write_buffer_advance(
+                    &mut connection.write_buffer,
+                    &mut connection.write_cursor,
+                    written,
+                );
                 connection.update_backpressure_state(write_high_watermark, write_low_watermark);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
@@ -3581,7 +3383,7 @@ fn refresh_worker_interest(
     } else {
         Interest::WRITABLE
     };
-    if !connection.write_buffer.is_empty() {
+    if connection.should_try_flush() {
         next_interest |= Interest::WRITABLE;
     }
     if next_interest == connection.interest {
@@ -3600,23 +3402,23 @@ fn close_worker_connection(
     poll: &Poll,
     token: Token,
     mut connection: WorkerConnection,
-    io_state: &mut WorkerIoState,
+    loop_state: &mut WorkerLoopState,
     app_executor: &AppExecutor,
     worker_event_sender: &Sender<WorkerEvent>,
 ) {
-    let _ = io_state.in_active_parse_set.remove(&token);
-    let _ = io_state.in_active_deferred_set.remove(&token);
+    let _ = loop_state.in_active_parse_set.remove(&token);
+    let _ = loop_state.in_active_deferred_set.remove(&token);
     if connection.pending_request_count > 0 {
-        io_state.pending_requests_for_worker = io_state
+        loop_state.pending_requests_for_worker = loop_state
             .pending_requests_for_worker
             .saturating_sub(connection.pending_request_count);
     }
     for pending in connection.pending_runtime_requests.drain(..) {
-        io_state.detached_runtime_tickets.push(pending.ticket);
+        loop_state.detached_runtime_tickets.push(pending.ticket);
     }
     let _ = poll.registry().deregister(&mut connection.socket);
     app_executor.disconnect_connection(&mut connection.logical);
-    let _ = io_state.live_connection_count.fetch_update(
+    let _ = loop_state.live_connection_count.fetch_update(
         Ordering::AcqRel,
         Ordering::Acquire,
         |current| Some(current.saturating_sub(1)),
@@ -3632,7 +3434,7 @@ fn can_migrate_connection(connection: &WorkerConnection) -> bool {
         && connection.pending_runtime_requests.is_empty()
         && connection.logical.parser.pending_bytes() == 0
         && connection.reply_order.completed.is_empty()
-        && connection.write_buffer.is_empty()
+        && write_buffer_is_empty(&connection.write_buffer, connection.write_cursor)
 }
 
 fn take_worker_connection_for_migration(
@@ -3654,10 +3456,10 @@ fn take_worker_connection_for_migration(
         let _ = io_state.connections.insert(token, connection);
         return Err("connection state does not allow migration".to_owned());
     }
-    let _ = io_state.in_active_parse_set.remove(&token);
-    let _ = io_state.in_active_deferred_set.remove(&token);
+    let _ = io_state.loop_state.in_active_parse_set.remove(&token);
+    let _ = io_state.loop_state.in_active_deferred_set.remove(&token);
     let _ = poll.registry().deregister(&mut connection.socket);
-    let _ = io_state.live_connection_count.fetch_update(
+    let _ = io_state.loop_state.live_connection_count.fetch_update(
         Ordering::AcqRel,
         Ordering::Acquire,
         |current| Some(current.saturating_sub(1)),
@@ -3670,14 +3472,14 @@ fn adopt_migrated_worker_connection(
     mut migrated: MigratedWorkerConnection,
     io_state: &mut WorkerIoState,
 ) -> MigrationAdoptResult {
-    let token = Token(io_state.next_token);
-    io_state.next_token = io_state.next_token.saturating_add(1);
+    let token = Token(io_state.loop_state.next_token);
+    io_state.loop_state.next_token = io_state.loop_state.next_token.saturating_add(1);
     migrated.connection.interest = if migrated.connection.can_read() {
         Interest::READABLE
     } else {
         Interest::WRITABLE
     };
-    if !migrated.connection.write_buffer.is_empty() {
+    if migrated.connection.should_try_flush() {
         migrated.connection.interest |= Interest::WRITABLE;
     }
     if poll
@@ -3693,1854 +3495,13 @@ fn adopt_migrated_worker_connection(
     }
     let _ = io_state.connections.insert(token, migrated.connection);
     let _ = io_state
+        .loop_state
         .live_connection_count
         .fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ConnectionLifecycle, ReactorConnection, ServerReactor, ServerReactorConfig,
-        ThreadedServerReactor,
-    };
-    #[cfg(target_os = "linux")]
-    use super::IoUringBackend;
-    use crate::app::{AppExecutor, ParsedCommandExecution, ServerApp};
-    use dfly_common::config::RuntimeConfig;
-    use dfly_core::command::CommandFrame;
-    use dfly_facade::net_proactor::{MultiplexApi, MultiplexSelection, select_multiplex_backend};
-    use dfly_facade::protocol::{ClientProtocol, ParsedCommand};
-    use googletest::prelude::*;
-    use mio::{Poll, Token};
-    use rstest::rstest;
-    use std::io::{Read, Write};
-    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-    use std::sync::{Arc, atomic::AtomicUsize};
-    use std::time::{Duration, Instant};
+#[path = "network/tests.rs"]
+mod tests;
 
-    #[rstest]
-    fn reactor_executes_resp_ping_roundtrip() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ServerReactor::bind(bind_addr, ServerReactorConfig::default())
-            .expect("reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("nonblocking client should be configurable");
-        client
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .expect("write ping should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(600);
-        let mut response = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("reactor poll should succeed");
-
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read_len) => {
-                    response.extend_from_slice(&chunk[..read_len]);
-                    if response.ends_with(b"+PONG\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from client failed: {error}"),
-            }
-        }
-
-        assert_that!(&response, eq(&b"+PONG\r\n".to_vec()));
-    }
-
-    #[rstest]
-    fn reactor_executes_memcache_roundtrip_on_optional_listener() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
-        let resp_bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let memcache_bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ServerReactor::bind_with_memcache(
-            resp_bind_addr,
-            Some(memcache_bind_addr),
-            ServerReactorConfig::default(),
-        )
-        .expect("reactor bind with memcache should succeed");
-        let memcache_addr = reactor
-            .memcache_local_addr()
-            .expect("memcache local addr should be available");
-
-        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("nonblocking client should be configurable");
-        client
-            .write_all(b"set user:42 0 0 5\r\nalice\r\nget user:42\r\n")
-            .expect("write memcache commands should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(600);
-        let mut response = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("reactor poll should succeed");
-
-            let mut chunk = [0_u8; 128];
-            match client.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read_len) => {
-                    response.extend_from_slice(&chunk[..read_len]);
-                    if response.ends_with(b"END\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from memcache client failed: {error}"),
-            }
-        }
-
-        assert_that!(
-            &response,
-            eq(&b"STORED\r\nVALUE user:42 0 5\r\nalice\r\nEND\r\n".to_vec())
-        );
-    }
-
-    #[rstest]
-    fn reactor_memcache_parse_error_uses_client_error_and_keeps_connection_open() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
-        let mut reactor = ServerReactor::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ServerReactorConfig::default(),
-        )
-        .expect("reactor bind with memcache should succeed");
-        let memcache_addr = reactor
-            .memcache_local_addr()
-            .expect("memcache local addr should be available");
-
-        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("nonblocking client should be configurable");
-
-        client
-            .write_all(b"set user:42 0 0 5\r\nalice\r\n")
-            .expect("write memcache set should succeed");
-
-        let store_deadline = Instant::now() + Duration::from_millis(600);
-        let mut store_reply = Vec::new();
-        while Instant::now() < store_deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("reactor poll should succeed");
-
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    store_reply.extend_from_slice(&chunk[..read_len]);
-                    if store_reply.ends_with(b"STORED\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from memcache client failed: {error}"),
-            }
-        }
-        assert_that!(&store_reply, eq(&b"STORED\r\n".to_vec()));
-
-        client
-            .write_all(b"set broken 0 0 -1\r\nget user:42\r\n")
-            .expect("write invalid+valid memcache pipeline should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(800);
-        let mut response = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("reactor poll should succeed");
-
-            let mut chunk = [0_u8; 256];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    response.extend_from_slice(&chunk[..read_len]);
-                    if response.ends_with(b"END\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from memcache client failed: {error}"),
-            }
-        }
-
-        let text = String::from_utf8_lossy(&response);
-        assert_that!(text.contains("CLIENT_ERROR"), eq(true));
-        assert_that!(
-            text.contains("VALUE user:42 0 5\r\nalice\r\nEND\r\n"),
-            eq(true)
-        );
-    }
-
-    #[rstest]
-    fn reactor_drops_connection_state_after_peer_close() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ServerReactor::bind(bind_addr, ServerReactorConfig::default())
-            .expect("reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        drop(client);
-
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(&mut app, Some(Duration::from_millis(5)))
-                .expect("reactor poll should succeed");
-            if reactor.connection_count() == 0 {
-                break;
-            }
-        }
-
-        assert_that!(reactor.connection_count(), eq(0_usize));
-    }
-
-    #[rstest]
-    fn reactor_read_stops_same_cycle_after_backpressure_arms() {
-        let mut app = ServerApp::new(RuntimeConfig::default());
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("listener bind should succeed");
-        let listen_addr = listener
-            .local_addr()
-            .expect("listener must expose local addr");
-
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        let (server_stream, _) = listener.accept().expect("accept should succeed");
-        server_stream
-            .set_nonblocking(true)
-            .expect("accepted socket should be nonblocking");
-
-        let mut connection = ReactorConnection::new(
-            mio::net::TcpStream::from_std(server_stream),
-            ClientProtocol::Resp,
-        );
-        let one_ping = b"*1\r\n$4\r\nPING\r\n";
-        let mut payload = Vec::with_capacity(one_ping.len() * 1024);
-        for _ in 0..1024 {
-            payload.extend_from_slice(one_ping);
-        }
-        client
-            .write_all(&payload)
-            .expect("client payload write should succeed");
-        client
-            .shutdown(Shutdown::Write)
-            .expect("client write-half shutdown should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            ServerReactor::read_connection_bytes(&mut app, &mut connection, 64, 32);
-            if connection.read_paused_by_backpressure {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        assert_that!(connection.read_paused_by_backpressure, eq(true));
-        assert_that!(connection.lifecycle, eq(ConnectionLifecycle::Active));
-        assert_that!(connection.write_buffer.is_empty(), eq(false));
-    }
-
-    #[rstest]
-    fn reactor_config_accepts_small_custom_backpressure_values() {
-        let config = ServerReactorConfig {
-            max_events: 64,
-            write_high_watermark_bytes: 512,
-            write_low_watermark_bytes: 128,
-            io_worker_count: 1,
-            max_pending_requests_per_connection: 32,
-            max_pending_requests_per_worker: 128,
-            ..ServerReactorConfig::default()
-        };
-        let watermarks = config
-            .normalized_backpressure_watermarks()
-            .expect("custom backpressure values should be accepted");
-
-        assert_that!(&watermarks, eq(&(512_usize, 128_usize)));
-    }
-
-    #[rstest]
-    fn reactor_config_rejects_non_increasing_backpressure_values() {
-        let config = ServerReactorConfig {
-            max_events: 64,
-            write_high_watermark_bytes: 256,
-            write_low_watermark_bytes: 256,
-            io_worker_count: 1,
-            max_pending_requests_per_connection: 32,
-            max_pending_requests_per_worker: 128,
-            ..ServerReactorConfig::default()
-        };
-        let error = config
-            .normalized_backpressure_watermarks()
-            .expect_err("low >= high should be rejected");
-
-        assert_that!(
-            format!("{error}").contains("low watermark must be smaller than high watermark"),
-            eq(true)
-        );
-    }
-
-    #[rstest]
-    fn backend_fallback_selection() {
-        let selection = select_multiplex_backend(&RuntimeConfig {
-            force_epoll: true,
-            ..RuntimeConfig::default()
-        });
-        assert_that!(selection.api_label(), eq("epoll"));
-        assert_that!(selection.fallback_reason.is_some(), eq(true));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[rstest]
-    fn net_engine_rejects_io_uring_backend_on_non_linux() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let selection = MultiplexSelection {
-            api: MultiplexApi::IoUring,
-            fallback_reason: None,
-        };
-        let bind_result = super::NetEngine::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig::default(),
-            selection,
-            &app_executor,
-        );
-        let error_text = match bind_result {
-            Ok(_) => panic!("io_uring backend should not bind on non-linux"),
-            Err(error) => format!("{error}"),
-        };
-        assert_that!(error_text.contains("Linux-only"), eq(true));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn net_engine_binds_io_uring_backend_on_linux() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let selection = MultiplexSelection {
-            api: MultiplexApi::IoUring,
-            fallback_reason: None,
-        };
-        let bind_result = super::NetEngine::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig::default(),
-            selection,
-            &app_executor,
-        );
-        assert_that!(bind_result.is_ok(), eq(true));
-    }
-
-    #[cfg(target_os = "linux")]
-    fn io_uring_listener_addr(backend: &IoUringBackend, protocol: ClientProtocol) -> SocketAddr {
-        backend
-            .listeners
-            .iter()
-            .find_map(|listener| {
-                if listener.protocol == protocol {
-                    listener.socket.local_addr().ok()
-                } else {
-                    None
-                }
-            })
-            .expect("listener address should be available")
-    }
-
-    #[cfg(target_os = "linux")]
-    fn io_uring_wait_connection_id(backend: &mut IoUringBackend) -> u64 {
-        let deadline = Instant::now() + Duration::from_millis(1000);
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            if let Some(connection_id) = backend.connection_owner_by_id.keys().next().copied() {
-                return connection_id;
-            }
-        }
-        panic!("expected accepted io_uring connection id");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_resp_roundtrip() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig {
-                io_worker_count: 2,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
-        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-        client
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .expect("ping write should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(1200);
-        let mut reply = Vec::new();
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    reply.extend_from_slice(&chunk[..read_len]);
-                    if reply.ends_with(b"+PONG\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("resp read failed: {error}"),
-            }
-        }
-        assert_that!(&reply, eq(&b"+PONG\r\n".to_vec()));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_memcache_roundtrip() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ServerReactorConfig {
-                io_worker_count: 2,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let memcache_addr = io_uring_listener_addr(&backend, ClientProtocol::Memcache);
-        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-        client
-            .write_all(b"set mk 0 0 2\r\nok\r\nget mk\r\n")
-            .expect("memcache roundtrip write should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(1400);
-        let mut reply = Vec::new();
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 256];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    reply.extend_from_slice(&chunk[..read_len]);
-                    if reply.ends_with(b"END\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("memcache read failed: {error}"),
-            }
-        }
-        assert_that!(
-            &reply,
-            eq(&b"STORED\r\nVALUE mk 0 2\r\nok\r\nEND\r\n".to_vec())
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_migration_preserves_order() {
-        const IN_FLIGHT_GETS: usize = 1024;
-
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig {
-                io_worker_count: 2,
-                io_worker_dispatch_count: 2,
-                enable_connection_migration: true,
-                max_pending_requests_per_connection: 64,
-                max_pending_requests_per_worker: 256,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
-        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        let connection_id = io_uring_wait_connection_id(&mut backend);
-        let owner = backend
-            .connection_owner_by_id
-            .get(&connection_id)
-            .copied()
-            .expect("connection owner should exist");
-        let target_worker = (owner + 1) % 2;
-
-        let mut deferred_request = Vec::new();
-        for _ in 0..IN_FLIGHT_GETS {
-            deferred_request.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
-        }
-        client
-            .write_all(&deferred_request)
-            .expect("deferred pipeline write should succeed");
-
-        let mut first_reply = Vec::new();
-        let first_observe_deadline = Instant::now() + Duration::from_millis(1200);
-        while Instant::now() < first_observe_deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 1024];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    first_reply.extend_from_slice(&chunk[..read_len]);
-                    if !first_reply.is_empty() {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("deferred reply read failed: {error}"),
-            }
-        }
-        assert_that!(first_reply.is_empty(), eq(false));
-
-        let mut migrated = false;
-        match backend.migrate_connection(connection_id, target_worker) {
-            Ok(()) => {
-                // Runtime can occasionally drain the whole deferred wave before this first probe.
-                // Treat this as already-migrated and continue with order validation below.
-                migrated = true;
-            }
-            Err(migration_error) => {
-                assert_that!(
-                    format!("{migration_error}").contains("state does not allow migration"),
-                    eq(true)
-                );
-                assert_that!(
-                    backend.connection_owner_by_id.get(&connection_id).copied(),
-                    eq(Some(owner))
-                );
-            }
-        }
-
-        if !migrated {
-            let first_deadline = Instant::now() + Duration::from_millis(3000);
-            while Instant::now() < first_deadline {
-                let _ = backend
-                    .poll_once(Some(Duration::from_millis(5)))
-                    .expect("io_uring backend poll should succeed");
-                let mut chunk = [0_u8; 2048];
-                match client.read(&mut chunk) {
-                    Ok(0) => {}
-                    Ok(read_len) => {
-                        first_reply.extend_from_slice(&chunk[..read_len]);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("deferred reply read failed: {error}"),
-                }
-                if backend.migrate_connection(connection_id, target_worker).is_ok() {
-                    migrated = true;
-                    break;
-                }
-            }
-            assert_that!(migrated, eq(true));
-            assert_that!(first_reply.is_empty(), eq(false));
-        }
-
-        let second_migration = backend.migrate_connection(connection_id, owner);
-        assert_that!(second_migration.is_err(), eq(true));
-
-        let mut request = Vec::new();
-        let mut expected = Vec::new();
-        for index in 0..24 {
-            let key = format!("mk{index}");
-            let value = format!("mv{index}");
-            request.extend_from_slice(
-                format!(
-                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key.len(),
-                    key,
-                    value.len(),
-                    value
-                )
-                .as_bytes(),
-            );
-            request.extend_from_slice(
-                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
-            );
-            expected.extend_from_slice(b"+OK\r\n");
-            expected.extend_from_slice(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
-        }
-        client
-            .write_all(&request)
-            .expect("ordered pipeline write should succeed");
-
-        let mut response = Vec::new();
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 4096];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => response.extend_from_slice(&chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("ordered pipeline read failed: {error}"),
-            }
-            if response.ends_with(&expected) {
-                break;
-            }
-        }
-        assert_that!(response.ends_with(&expected), eq(true));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_backpressure_pauses_read() {
-        const DEFERRED_GETS: usize = 512;
-
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig {
-                io_worker_count: 1,
-                io_worker_dispatch_count: 1,
-                max_pending_requests_per_connection: 1,
-                max_pending_requests_per_worker: 1,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
-        let mut client = TcpStream::connect(resp_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-        let _ = io_uring_wait_connection_id(&mut backend);
-
-        let mut payload = Vec::new();
-        for _ in 0..DEFERRED_GETS {
-            payload.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
-        }
-        payload.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
-        client
-            .write_all(&payload)
-            .expect("pipeline write should succeed");
-
-        let mut early_reply = Vec::new();
-        for _ in 0..6 {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 1024];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => early_reply.extend_from_slice(&chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("early read failed: {error}"),
-            }
-        }
-        assert_that!(
-            String::from_utf8_lossy(&early_reply).contains("+PONG"),
-            eq(false)
-        );
-
-        let mut full_reply = early_reply;
-        let expected_len = DEFERRED_GETS
-            .saturating_mul(b"$-1\r\n".len())
-            .saturating_add(b"+PONG\r\n".len());
-        let deadline = Instant::now() + Duration::from_millis(3500);
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            let mut chunk = [0_u8; 2048];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => full_reply.extend_from_slice(&chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("full read failed: {error}"),
-            }
-            if full_reply.len() >= expected_len {
-                break;
-            }
-        }
-        assert_that!(full_reply.ends_with(b"+PONG\r\n"), eq(true));
-        assert_that!(full_reply.len() >= expected_len, eq(true));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_peer_close_reap_state() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig {
-                io_worker_count: 2,
-                io_worker_dispatch_count: 2,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
-        let client = TcpStream::connect(resp_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-        let connection_id = io_uring_wait_connection_id(&mut backend);
-
-        let _ = client.shutdown(Shutdown::Both);
-        drop(client);
-
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        while Instant::now() < deadline {
-            let _ = backend
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("io_uring backend poll should succeed");
-            if !backend.connection_owner_by_id.contains_key(&connection_id) {
-                break;
-            }
-        }
-        assert_that!(
-            backend.connection_owner_by_id.contains_key(&connection_id),
-            eq(false)
-        );
-        assert_that!(backend.migrated_connections.contains(&connection_id), eq(false));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[rstest]
-    fn io_uring_add_connection_ack_avoids_dirty_owner_on_worker_failure() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut backend = IoUringBackend::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            ServerReactorConfig {
-                io_worker_count: 1,
-                io_worker_dispatch_count: 1,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("io_uring backend bind should succeed");
-        let resp_addr = io_uring_listener_addr(&backend, ClientProtocol::Resp);
-
-        backend.workers[0]
-            .sender
-            .send(super::IoUringWorkerCommand::Shutdown)
-            .expect("shutdown command should send");
-        if let Some(join) = backend.workers[0].join.take() {
-            let _ = join.join();
-        }
-
-        let _client = TcpStream::connect(resp_addr).expect("connect should succeed");
-        let poll_result = backend.poll_once(Some(Duration::from_millis(5)));
-        assert_that!(poll_result.is_err(), eq(true));
-        assert_that!(backend.connection_owner_by_id.is_empty(), eq(true));
-    }
-
-    #[rstest]
-    fn listener_affinity_distribution() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 4,
-            io_worker_dispatch_start: 1,
-            io_worker_dispatch_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local address should be available");
-
-        let mut clients = Vec::new();
-        for _ in 0..8 {
-            let client = TcpStream::connect(listen_addr).expect("connect should succeed");
-            clients.push(client);
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let counts = reactor.worker_connection_counts();
-            if counts[1] > 0 && counts[2] > 0 {
-                assert_that!(counts[0], eq(0_usize));
-                assert_that!(counts[3], eq(0_usize));
-                return;
-            }
-        }
-        panic!("expected connection distribution to stay within configured dispatch window");
-    }
-
-    #[rstest]
-    fn connection_migration_preserves_order() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            io_worker_dispatch_count: 2,
-            enable_connection_migration: true,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local address should be available");
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        let connection_id = {
-            let deadline = Instant::now() + Duration::from_millis(800);
-            let mut connection_id = None;
-            while Instant::now() < deadline {
-                let _ = reactor
-                    .poll_once(Some(Duration::from_millis(5)))
-                    .expect("threaded reactor poll should succeed");
-                if let Some(id) = reactor.active_connection_ids().first().copied() {
-                    connection_id = Some(id);
-                    break;
-                }
-            }
-            connection_id.expect("accepted connection should be tracked")
-        };
-
-        let owner = reactor
-            .connection_owner(connection_id)
-            .expect("connection owner should be known");
-        let target_worker = (owner + 1) % 2;
-        reactor
-            .migrate_connection(connection_id, target_worker)
-            .expect("migration should succeed");
-
-        let second_migration = reactor.migrate_connection(connection_id, owner);
-        assert_that!(second_migration.is_err(), eq(true));
-
-        let mut request = Vec::new();
-        let mut expected = Vec::new();
-        for index in 0..24 {
-            let key = format!("mk{index}");
-            let value = format!("mv{index}");
-            request.extend_from_slice(
-                format!(
-                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key.len(),
-                    key,
-                    value.len(),
-                    value
-                )
-                .as_bytes(),
-            );
-            request.extend_from_slice(
-                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
-            );
-            expected.extend_from_slice(b"+OK\r\n");
-            expected.extend_from_slice(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
-        }
-        client
-            .write_all(&request)
-            .expect("pipeline write should succeed");
-
-        let mut response = Vec::new();
-        let deadline = Instant::now() + Duration::from_millis(2500);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut chunk = [0_u8; 4096];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => response.extend_from_slice(&chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("pipeline read failed: {error}"),
-            }
-            if response.len() >= expected.len() {
-                break;
-            }
-        }
-
-        assert_that!(&response, eq(&expected));
-    }
-
-    #[rstest]
-    fn connection_migration_failure_rolls_back_to_source_owner() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            io_worker_dispatch_count: 2,
-            enable_connection_migration: true,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local address should be available");
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        let connection_id = {
-            let deadline = Instant::now() + Duration::from_millis(800);
-            let mut connection_id = None;
-            while Instant::now() < deadline {
-                let _ = reactor
-                    .poll_once(Some(Duration::from_millis(5)))
-                    .expect("threaded reactor poll should succeed");
-                if let Some(id) = reactor.active_connection_ids().first().copied() {
-                    connection_id = Some(id);
-                    break;
-                }
-            }
-            connection_id.expect("accepted connection should be tracked")
-        };
-
-        let owner = reactor
-            .connection_owner(connection_id)
-            .expect("connection owner should be known");
-        let target_worker = (owner + 1) % 2;
-        reactor.workers[target_worker]
-            .sender
-            .send(super::WorkerCommand::Shutdown)
-            .expect("target worker shutdown signal should send");
-        if let Some(join) = reactor.workers[target_worker].join.take() {
-            let _ = join.join();
-        }
-
-        let migration = reactor.migrate_connection(connection_id, target_worker);
-        assert_that!(migration.is_err(), eq(true));
-        assert_that!(reactor.connection_owner(connection_id), eq(Some(owner)));
-
-        client
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .expect("ping write should succeed after rollback");
-        let deadline = Instant::now() + Duration::from_millis(1200);
-        let mut response = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    response.extend_from_slice(&chunk[..read_len]);
-                    if response.ends_with(b"+PONG\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("ping read failed after rollback: {error}"),
-            }
-        }
-
-        assert_that!(&response, eq(&b"+PONG\r\n".to_vec()));
-    }
-
-    #[rstest]
-    fn connection_close_cleans_migrated_marker() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            io_worker_dispatch_count: 2,
-            enable_connection_migration: true,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local address should be available");
-        let client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        let connection_id = {
-            let deadline = Instant::now() + Duration::from_millis(800);
-            let mut connection_id = None;
-            while Instant::now() < deadline {
-                let _ = reactor
-                    .poll_once(Some(Duration::from_millis(5)))
-                    .expect("threaded reactor poll should succeed");
-                if let Some(id) = reactor.active_connection_ids().first().copied() {
-                    connection_id = Some(id);
-                    break;
-                }
-            }
-            connection_id.expect("accepted connection should be tracked")
-        };
-
-        let owner = reactor
-            .connection_owner(connection_id)
-            .expect("connection owner should be known");
-        let target_worker = (owner + 1) % 2;
-        reactor
-            .migrate_connection(connection_id, target_worker)
-            .expect("migration should succeed");
-        assert_that!(
-            reactor.migrated_connections.contains(&connection_id),
-            eq(true)
-        );
-
-        let _ = client.shutdown(Shutdown::Both);
-        drop(client);
-
-        let deadline = Instant::now() + Duration::from_millis(1200);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            if reactor.connection_owner(connection_id).is_none() {
-                break;
-            }
-        }
-
-        assert_that!(reactor.connection_owner(connection_id).is_none(), eq(true));
-        assert_that!(
-            reactor.migrated_connections.contains(&connection_id),
-            eq(false)
-        );
-    }
-
-    #[rstest]
-    fn threaded_reactor_distributes_connections_across_workers() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
-            .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let _client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
-        let _client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(800);
-        let mut counts = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            counts = reactor.worker_connection_counts();
-            if counts.iter().filter(|count| **count > 0).count() == 2 {
-                break;
-            }
-        }
-
-        assert_that!(counts.len(), eq(2_usize));
-        assert_that!(
-            counts.iter().filter(|count| **count > 0).count(),
-            eq(2_usize)
-        );
-    }
-
-    #[rstest]
-    fn threaded_reactor_workers_progress_two_pipelines_concurrently() {
-        const PIPELINE_GETS: usize = 16;
-
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
-            .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
-        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
-        client_a
-            .set_nonblocking(true)
-            .expect("first client should be nonblocking");
-        client_b
-            .set_nonblocking(true)
-            .expect("second client should be nonblocking");
-
-        let distribution_deadline = Instant::now() + Duration::from_millis(800);
-        let mut counts = Vec::new();
-        while Instant::now() < distribution_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            counts = reactor.worker_connection_counts();
-            if counts.iter().filter(|count| **count > 0).count() == 2 {
-                break;
-            }
-        }
-        assert_that!(counts.len(), eq(2_usize));
-        assert_that!(
-            counts.iter().filter(|count| **count > 0).count(),
-            eq(2_usize)
-        );
-
-        client_a
-            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nka\r\n$1\r\n1\r\n")
-            .expect("first SET should write");
-        client_b
-            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nkb\r\n$1\r\n2\r\n")
-            .expect("second SET should write");
-
-        let mut set_reply_a = Vec::new();
-        let mut set_reply_b = Vec::new();
-        let set_deadline = Instant::now() + Duration::from_millis(900);
-        while Instant::now() < set_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut chunk_a = [0_u8; 64];
-            match client_a.read(&mut chunk_a) {
-                Ok(0) => {}
-                Ok(read_len) => set_reply_a.extend_from_slice(&chunk_a[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("first set reply read failed: {error}"),
-            }
-
-            let mut chunk_b = [0_u8; 64];
-            match client_b.read(&mut chunk_b) {
-                Ok(0) => {}
-                Ok(read_len) => set_reply_b.extend_from_slice(&chunk_b[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("second set reply read failed: {error}"),
-            }
-
-            if set_reply_a.ends_with(b"+OK\r\n") && set_reply_b.ends_with(b"+OK\r\n") {
-                break;
-            }
-        }
-        assert_that!(&set_reply_a, eq(&b"+OK\r\n".to_vec()));
-        assert_that!(&set_reply_b, eq(&b"+OK\r\n".to_vec()));
-
-        let mut pipeline_a = Vec::new();
-        let mut pipeline_b = Vec::new();
-        let one_get_a = b"*2\r\n$3\r\nGET\r\n$2\r\nka\r\n";
-        let one_get_b = b"*2\r\n$3\r\nGET\r\n$2\r\nkb\r\n";
-        for _ in 0..PIPELINE_GETS {
-            pipeline_a.extend_from_slice(one_get_a);
-            pipeline_b.extend_from_slice(one_get_b);
-        }
-
-        client_a
-            .write_all(&pipeline_a)
-            .expect("first pipeline write should succeed");
-        client_b
-            .write_all(&pipeline_b)
-            .expect("second pipeline write should succeed");
-
-        let mut expected_a = Vec::new();
-        let mut expected_b = Vec::new();
-        for _ in 0..PIPELINE_GETS {
-            expected_a.extend_from_slice(b"$1\r\n1\r\n");
-            expected_b.extend_from_slice(b"$1\r\n2\r\n");
-        }
-
-        let mut pipeline_reply_a = Vec::new();
-        let mut pipeline_reply_b = Vec::new();
-        let pipeline_deadline = Instant::now() + Duration::from_millis(2000);
-        while Instant::now() < pipeline_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut chunk_a = [0_u8; 512];
-            match client_a.read(&mut chunk_a) {
-                Ok(0) => {}
-                Ok(read_len) => pipeline_reply_a.extend_from_slice(&chunk_a[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("first pipeline reply read failed: {error}"),
-            }
-
-            let mut chunk_b = [0_u8; 512];
-            match client_b.read(&mut chunk_b) {
-                Ok(0) => {}
-                Ok(read_len) => pipeline_reply_b.extend_from_slice(&chunk_b[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("second pipeline reply read failed: {error}"),
-            }
-
-            if pipeline_reply_a.len() >= expected_a.len()
-                && pipeline_reply_b.len() >= expected_b.len()
-            {
-                break;
-            }
-        }
-
-        assert_that!(&pipeline_reply_a, eq(&expected_a));
-        assert_that!(&pipeline_reply_b, eq(&expected_b));
-    }
-
-    #[rstest]
-    fn many_idle_connections_do_not_slow_deferred_progress() {
-        const PIPELINE_GETS: usize = 256;
-        const PING_COUNT: usize = 12;
-        const IDLE_CLIENTS: usize = 32;
-
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
-            .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
-        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
-        client_a
-            .set_nonblocking(true)
-            .expect("first client should be nonblocking");
-        client_b
-            .set_nonblocking(true)
-            .expect("second client should be nonblocking");
-        let mut idle_clients = Vec::with_capacity(IDLE_CLIENTS);
-        for _ in 0..IDLE_CLIENTS {
-            let mut attempts = 0_u32;
-            let idle = loop {
-                attempts = attempts.saturating_add(1);
-                assert_that!(attempts <= 200, eq(true));
-                match TcpStream::connect(listen_addr) {
-                    Ok(stream) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        let _ = reactor
-                            .poll_once(Some(Duration::from_millis(1)))
-                            .expect("threaded reactor poll should succeed");
-                    }
-                    Err(error) => panic!("idle connect should succeed: {error}"),
-                }
-            };
-            idle.set_nonblocking(true)
-                .expect("idle client should be nonblocking");
-            idle_clients.push(idle);
-        }
-        assert_that!(idle_clients.len(), eq(IDLE_CLIENTS));
-
-        let distribution_deadline = Instant::now() + Duration::from_millis(800);
-        let mut counts = Vec::new();
-        while Instant::now() < distribution_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            counts = reactor.worker_connection_counts();
-            if counts.iter().filter(|count| **count > 0).count() == 2 {
-                break;
-            }
-        }
-        assert_that!(
-            counts.iter().filter(|count| **count > 0).count(),
-            eq(2_usize)
-        );
-
-        client_a
-            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nka\r\n$1\r\n1\r\n")
-            .expect("seed set should write");
-        let mut set_reply = Vec::new();
-        let set_deadline = Instant::now() + Duration::from_millis(900);
-        while Instant::now() < set_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 64];
-            match client_a.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => set_reply.extend_from_slice(&chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("seed set read failed: {error}"),
-            }
-            if set_reply.ends_with(b"+OK\r\n") {
-                break;
-            }
-        }
-        assert_that!(&set_reply, eq(&b"+OK\r\n".to_vec()));
-
-        let mut deferred_pipeline = Vec::new();
-        for _ in 0..PIPELINE_GETS {
-            deferred_pipeline.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$2\r\nka\r\n");
-        }
-        client_a
-            .write_all(&deferred_pipeline)
-            .expect("deferred pipeline write should succeed");
-
-        let mut ping_pipeline = Vec::new();
-        for _ in 0..PING_COUNT {
-            ping_pipeline.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
-        }
-        client_b
-            .write_all(&ping_pipeline)
-            .expect("ping pipeline write should succeed");
-
-        let expected_ping = b"+PONG\r\n".repeat(PING_COUNT);
-        let mut ping_reply = Vec::new();
-        let ping_deadline = Instant::now() + Duration::from_millis(1200);
-        while Instant::now() < ping_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut chunk_b = [0_u8; 512];
-            match client_b.read(&mut chunk_b) {
-                Ok(0) => {}
-                Ok(read_len) => ping_reply.extend_from_slice(&chunk_b[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("ping reply read failed: {error}"),
-            }
-            if ping_reply.len() >= expected_ping.len() {
-                break;
-            }
-        }
-
-        assert_that!(&ping_reply, eq(&expected_ping));
-    }
-
-    #[rstest]
-    fn threaded_reactor_mixed_read_write_pipelines_progress_without_hol_blocking() {
-        const PAIRS: usize = 16;
-
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut reactor = ThreadedServerReactor::bind(bind_addr, config, &app_executor)
-            .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("local addr should be available");
-
-        let mut client_a = TcpStream::connect(listen_addr).expect("first connect should succeed");
-        let mut client_b = TcpStream::connect(listen_addr).expect("second connect should succeed");
-        client_a
-            .set_nonblocking(true)
-            .expect("first client should be nonblocking");
-        client_b
-            .set_nonblocking(true)
-            .expect("second client should be nonblocking");
-
-        let distribution_deadline = Instant::now() + Duration::from_millis(800);
-        let mut counts = Vec::new();
-        while Instant::now() < distribution_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            counts = reactor.worker_connection_counts();
-            if counts.iter().filter(|count| **count > 0).count() == 2 {
-                break;
-            }
-        }
-        assert_that!(
-            counts.iter().filter(|count| **count > 0).count(),
-            eq(2_usize)
-        );
-
-        let mut pipeline_a = Vec::new();
-        let mut pipeline_b = Vec::new();
-        let mut expected_a = Vec::new();
-        let mut expected_b = Vec::new();
-        for index in 0..PAIRS {
-            let key_a = format!("ka{index}");
-            let value_a = format!("va{index}");
-            pipeline_a.extend_from_slice(
-                format!(
-                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key_a.len(),
-                    key_a,
-                    value_a.len(),
-                    value_a
-                )
-                .as_bytes(),
-            );
-            pipeline_a.extend_from_slice(
-                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key_a.len(), key_a).as_bytes(),
-            );
-            expected_a.extend_from_slice(b"+OK\r\n");
-            expected_a
-                .extend_from_slice(format!("${}\r\n{}\r\n", value_a.len(), value_a).as_bytes());
-
-            let key_b = format!("kb{index}");
-            let value_b = format!("vb{index}");
-            pipeline_b.extend_from_slice(
-                format!(
-                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    key_b.len(),
-                    key_b,
-                    value_b.len(),
-                    value_b
-                )
-                .as_bytes(),
-            );
-            pipeline_b.extend_from_slice(
-                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key_b.len(), key_b).as_bytes(),
-            );
-            expected_b.extend_from_slice(b"+OK\r\n");
-            expected_b
-                .extend_from_slice(format!("${}\r\n{}\r\n", value_b.len(), value_b).as_bytes());
-        }
-
-        client_a
-            .write_all(&pipeline_a)
-            .expect("first pipeline write should succeed");
-        client_b
-            .write_all(&pipeline_b)
-            .expect("second pipeline write should succeed");
-
-        let mut reply_a = Vec::new();
-        let mut reply_b = Vec::new();
-        let deadline = Instant::now() + Duration::from_millis(2500);
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut chunk_a = [0_u8; 4096];
-            match client_a.read(&mut chunk_a) {
-                Ok(0) => {}
-                Ok(read_len) => reply_a.extend_from_slice(&chunk_a[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("first mixed pipeline read failed: {error}"),
-            }
-
-            let mut chunk_b = [0_u8; 4096];
-            match client_b.read(&mut chunk_b) {
-                Ok(0) => {}
-                Ok(read_len) => reply_b.extend_from_slice(&chunk_b[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("second mixed pipeline read failed: {error}"),
-            }
-
-            if reply_a.len() >= expected_a.len() && reply_b.len() >= expected_b.len() {
-                break;
-            }
-        }
-
-        assert_that!(&reply_a, eq(&expected_a));
-        assert_that!(&reply_b, eq(&expected_b));
-    }
-
-    #[rstest]
-    fn threaded_reactor_executes_resp_and_memcache_roundtrip() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let resp_addr = reactor
-            .local_addr()
-            .expect("resp local addr should be available");
-        let memcache_addr = reactor
-            .memcache_local_addr()
-            .expect("memcache local addr should be available");
-
-        let mut resp_client = TcpStream::connect(resp_addr).expect("resp connect should succeed");
-        let mut mem_client =
-            TcpStream::connect(memcache_addr).expect("memcache connect should succeed");
-        resp_client
-            .set_nonblocking(true)
-            .expect("resp client should be nonblocking");
-        mem_client
-            .set_nonblocking(true)
-            .expect("memcache client should be nonblocking");
-
-        resp_client
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .expect("RESP ping write should succeed");
-        mem_client
-            .write_all(b"set mk 0 0 2\r\nok\r\nget mk\r\n")
-            .expect("Memcache roundtrip write should succeed");
-
-        let deadline = Instant::now() + Duration::from_millis(1000);
-        let mut resp_reply = Vec::new();
-        let mut mem_reply = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-
-            let mut resp_chunk = [0_u8; 64];
-            match resp_client.read(&mut resp_chunk) {
-                Ok(0) => {}
-                Ok(read_len) => resp_reply.extend_from_slice(&resp_chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from resp client failed: {error}"),
-            }
-
-            let mut mem_chunk = [0_u8; 256];
-            match mem_client.read(&mut mem_chunk) {
-                Ok(0) => {}
-                Ok(read_len) => mem_reply.extend_from_slice(&mem_chunk[..read_len]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read from memcache client failed: {error}"),
-            }
-
-            if resp_reply.ends_with(b"+PONG\r\n") && mem_reply.ends_with(b"END\r\n") {
-                break;
-            }
-        }
-
-        assert_that!(&resp_reply, eq(&b"+PONG\r\n".to_vec()));
-        assert_that!(
-            &mem_reply,
-            eq(&b"STORED\r\nVALUE mk 0 2\r\nok\r\nEND\r\n".to_vec())
-        );
-    }
-
-    #[rstest]
-    fn deferred_ready_queue_preserves_reply_order() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let config = ServerReactorConfig {
-            io_worker_count: 2,
-            ..ServerReactorConfig::default()
-        };
-        let mut reactor = ThreadedServerReactor::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            config,
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let listen_addr = reactor
-            .local_addr()
-            .expect("resp local addr should be available");
-
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        client
-            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
-            .expect("SET write should succeed");
-
-        let mut set_reply = Vec::new();
-        let set_deadline = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < set_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    set_reply.extend_from_slice(&chunk[..read_len]);
-                    if set_reply.ends_with(b"+OK\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read set reply failed: {error}"),
-            }
-        }
-        assert_that!(&set_reply, eq(&b"+OK\r\n".to_vec()));
-
-        client
-            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n*1\r\n$4\r\nPING\r\n")
-            .expect("pipeline write should succeed");
-
-        let mut pipeline_reply = Vec::new();
-        let pipeline_deadline = Instant::now() + Duration::from_millis(1000);
-        while Instant::now() < pipeline_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 128];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    pipeline_reply.extend_from_slice(&chunk[..read_len]);
-                    if pipeline_reply.ends_with(b"+PONG\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read pipeline reply failed: {error}"),
-            }
-        }
-
-        assert_that!(&pipeline_reply, eq(&b"$1\r\nv\r\n+PONG\r\n".to_vec()));
-    }
-
-    #[rstest]
-    fn threaded_reactor_memcache_parse_error_uses_client_error_and_keeps_connection_open() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let mut reactor = ThreadedServerReactor::bind_with_memcache(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ServerReactorConfig {
-                io_worker_count: 2,
-                ..ServerReactorConfig::default()
-            },
-            &app_executor,
-        )
-        .expect("threaded reactor bind should succeed");
-        let memcache_addr = reactor
-            .memcache_local_addr()
-            .expect("memcache local addr should be available");
-
-        let mut client = TcpStream::connect(memcache_addr).expect("connect should succeed");
-        client
-            .set_nonblocking(true)
-            .expect("client should be nonblocking");
-
-        client
-            .write_all(b"set user:42 0 0 5\r\nalice\r\n")
-            .expect("write set should succeed");
-        let store_deadline = Instant::now() + Duration::from_millis(600);
-        let mut store_reply = Vec::new();
-        while Instant::now() < store_deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 64];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    store_reply.extend_from_slice(&chunk[..read_len]);
-                    if store_reply.ends_with(b"STORED\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read store reply failed: {error}"),
-            }
-        }
-        assert_that!(&store_reply, eq(&b"STORED\r\n".to_vec()));
-
-        client
-            .write_all(b"set broken 0 0 -1\r\nget user:42\r\n")
-            .expect("write invalid+valid pipeline should succeed");
-        let deadline = Instant::now() + Duration::from_millis(1000);
-        let mut response = Vec::new();
-        while Instant::now() < deadline {
-            let _ = reactor
-                .poll_once(Some(Duration::from_millis(5)))
-                .expect("threaded reactor poll should succeed");
-            let mut chunk = [0_u8; 256];
-            match client.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(read_len) => {
-                    response.extend_from_slice(&chunk[..read_len]);
-                    if response.ends_with(b"END\r\n") {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read memcache reply failed: {error}"),
-            }
-        }
-        let text = String::from_utf8_lossy(&response);
-        assert_that!(text.contains("CLIENT_ERROR"), eq(true));
-        assert_that!(
-            text.contains("VALUE user:42 0 5\r\nalice\r\nEND\r\n"),
-            eq(true)
-        );
-    }
-
-    #[rstest]
-    fn worker_read_pauses_when_command_queue_limit_is_reached() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("listener bind should succeed");
-        let listen_addr = listener
-            .local_addr()
-            .expect("listener must expose local addr");
-        let mut client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        let (server_stream, _) = listener.accept().expect("accept should succeed");
-        server_stream
-            .set_nonblocking(true)
-            .expect("accepted socket should be nonblocking");
-        client
-            .set_nonblocking(false)
-            .expect("client blocking mode should be configurable");
-
-        let mut connection = super::WorkerConnection::new(
-            1,
-            mio::net::TcpStream::from_std(server_stream),
-            ClientProtocol::Resp,
-        );
-        let mut payload = Vec::new();
-        for _ in 0..8 {
-            payload.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
-        }
-        client
-            .write_all(&payload)
-            .expect("pipeline write should succeed");
-        client
-            .shutdown(Shutdown::Write)
-            .expect("write-half shutdown should succeed");
-
-        let mut io_state = super::WorkerIoState::new(Arc::new(AtomicUsize::new(0)));
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            super::read_worker_connection_bytes(
-                Token(2),
-                &mut connection,
-                &app_executor,
-                &mut io_state,
-                super::BackpressureThresholds {
-                    high: usize::MAX,
-                    low: usize::MAX / 2,
-                    max_pending_per_connection: 2,
-                    max_pending_per_worker: 2,
-                },
-            );
-            if connection.read_paused_by_command_backpressure {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        assert_that!(connection.read_paused_by_command_backpressure, eq(true));
-        assert_that!(connection.pending_request_count, eq(2_usize));
-        assert_that!(io_state.pending_requests_for_worker, eq(2_usize));
-    }
-
-    #[rstest]
-    fn disconnected_worker_connection_reaps_detached_deferred_replies() {
-        let app_executor = AppExecutor::new(ServerApp::new(RuntimeConfig::default()));
-        let frame = CommandFrame::new("GET", vec![b"leak-check".to_vec()]);
-        let mut command_connection = ServerApp::new_connection(ClientProtocol::Resp);
-        let execution = app_executor.execute_parsed_command_deferred(
-            &mut command_connection,
-            ParsedCommand {
-                name: frame.name.clone(),
-                args: frame.args.clone(),
-            },
-        );
-        let ParsedCommandExecution::Deferred(ticket) = execution else {
-            panic!("GET should dispatch via deferred runtime path");
-        };
-        let _shard = ticket
-            .barriers
-            .first()
-            .map(|barrier| barrier.shard)
-            .expect("deferred ticket should have one shard barrier");
-        let mut probe_ticket = ticket.clone();
-
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("listener bind should succeed");
-        let listen_addr = listener
-            .local_addr()
-            .expect("listener must expose local addr");
-        let _client = TcpStream::connect(listen_addr).expect("connect should succeed");
-        let (server_stream, _) = listener.accept().expect("accept should succeed");
-        server_stream
-            .set_nonblocking(true)
-            .expect("accepted socket should be nonblocking");
-
-        let mut connection = super::WorkerConnection::new(
-            1,
-            mio::net::TcpStream::from_std(server_stream),
-            ClientProtocol::Resp,
-        );
-        connection.pending_request_count = 1;
-        connection
-            .pending_runtime_requests
-            .push(super::PendingRuntimeRequest {
-                request_id: 1,
-                ticket,
-            });
-
-        let poll = Poll::new().expect("poll creation should succeed");
-        let mut io_state = super::WorkerIoState::new(Arc::new(AtomicUsize::new(1)));
-        let (event_sender, _event_receiver) = std::sync::mpsc::channel::<super::WorkerEvent>();
-        super::close_worker_connection(
-            &poll,
-            Token(2),
-            connection,
-            &mut io_state,
-            &app_executor,
-            &event_sender,
-        );
-        assert_that!(io_state.detached_runtime_tickets.len(), eq(1_usize));
-        let deadline = std::time::Instant::now() + Duration::from_millis(800);
-        let mut reply_ready = false;
-        while std::time::Instant::now() < deadline {
-            if app_executor
-                .runtime_reply_ticket_ready(&mut probe_ticket)
-                .expect("runtime readiness probe should succeed")
-            {
-                reply_ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_that!(reply_ready, eq(true));
-
-        super::reap_detached_runtime_replies(&app_executor, &mut io_state);
-        assert_that!(io_state.detached_runtime_tickets.is_empty(), eq(true));
-        let missing_after_reap = app_executor.take_runtime_reply_ticket_ready(&mut probe_ticket);
-        assert_that!(missing_after_reap.is_err(), eq(true));
-    }
-}

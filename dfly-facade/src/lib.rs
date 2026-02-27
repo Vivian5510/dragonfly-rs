@@ -2,7 +2,6 @@
 
 pub mod connection;
 pub mod net_proactor;
-pub mod proactor;
 pub mod protocol;
 
 use dfly_common::config::RuntimeConfig;

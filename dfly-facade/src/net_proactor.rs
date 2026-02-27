@@ -3,17 +3,17 @@
 //! This module models Dragonfly's top-level listener/proactor wiring choices:
 //! pick one multiplex API, then run one acceptor over a fixed I/O worker range.
 
-use std::fs;
-
 use dfly_common::config::RuntimeConfig;
+#[cfg(target_os = "linux")]
+use io_uring::IoUring;
 
 /// Multiplex backend selected for network I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiplexApi {
     /// Linux `io_uring` completion backend.
     IoUring,
-    /// Portable readiness backend (`epoll` on Linux in current implementation).
-    Epoll,
+    /// Portable readiness backend (`mio` with `epoll` on Linux).
+    Mio,
 }
 
 /// Resolved network multiplex decision used by startup logs and engine factory.
@@ -31,7 +31,7 @@ impl MultiplexSelection {
     pub fn api_label(&self) -> &'static str {
         match self.api {
             MultiplexApi::IoUring => "io_uring",
-            MultiplexApi::Epoll => "epoll",
+            MultiplexApi::Mio => "mio",
         }
     }
 }
@@ -72,13 +72,13 @@ impl NetworkProactorConfig {
 pub fn select_multiplex_backend(config: &RuntimeConfig) -> MultiplexSelection {
     if config.force_epoll {
         return MultiplexSelection {
-            api: MultiplexApi::Epoll,
-            fallback_reason: Some("forced by config force_epoll=true".to_owned()),
+            api: MultiplexApi::Mio,
+            fallback_reason: Some("forced by config force_epoll=true (mio backend)".to_owned()),
         };
     }
     if !cfg!(target_os = "linux") {
         return MultiplexSelection {
-            api: MultiplexApi::Epoll,
+            api: MultiplexApi::Mio,
             fallback_reason: Some(
                 "io_uring is Linux-only; current platform is development-only".to_owned(),
             ),
@@ -91,19 +91,22 @@ pub fn select_multiplex_backend(config: &RuntimeConfig) -> MultiplexSelection {
             fallback_reason: None,
         },
         Err(reason) => MultiplexSelection {
-            api: MultiplexApi::Epoll,
+            api: MultiplexApi::Mio,
             fallback_reason: Some(reason),
         },
     }
 }
 
+#[cfg(target_os = "linux")]
 fn probe_io_uring_support() -> Result<(), String> {
     let disabled_path = "/proc/sys/kernel/io_uring_disabled";
-    match fs::read_to_string(disabled_path) {
+    match std::fs::read_to_string(disabled_path) {
         Ok(raw) => {
             let value = raw.trim();
             if value == "0" {
-                Ok(())
+                IoUring::new(2).map(|_| ()).map_err(|error| {
+                    format!("io_uring probe failed: io_uring_queue_init_params returned {error}")
+                })
             } else {
                 Err(format!("io_uring probe failed: {disabled_path}={value}"))
             }
@@ -112,6 +115,11 @@ fn probe_io_uring_support() -> Result<(), String> {
             "io_uring probe failed: cannot read {disabled_path}: {error}"
         )),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_io_uring_support() -> Result<(), String> {
+    Err("io_uring is Linux-only".to_owned())
 }
 
 #[cfg(test)]
@@ -128,10 +136,10 @@ mod tests {
             force_epoll: true,
             ..RuntimeConfig::default()
         });
-        assert_that!(selection.api, eq(MultiplexApi::Epoll));
+        assert_that!(selection.api, eq(MultiplexApi::Mio));
         assert_eq!(
             selection.fallback_reason,
-            Some("forced by config force_epoll=true".to_owned())
+            Some("forced by config force_epoll=true (mio backend)".to_owned())
         );
     }
 
@@ -140,14 +148,14 @@ mod tests {
         let selection = select_multiplex_backend(&RuntimeConfig::default());
         if cfg!(target_os = "linux") {
             assert_that!(
-                selection.api == MultiplexApi::IoUring || selection.api == MultiplexApi::Epoll,
+                selection.api == MultiplexApi::IoUring || selection.api == MultiplexApi::Mio,
                 eq(true)
             );
             if selection.api == MultiplexApi::IoUring {
                 assert_that!(selection.fallback_reason.is_none(), eq(true));
             }
         } else {
-            assert_that!(selection.api, eq(MultiplexApi::Epoll));
+            assert_that!(selection.api, eq(MultiplexApi::Mio));
             assert_that!(selection.fallback_reason.is_some(), eq(true));
         }
     }

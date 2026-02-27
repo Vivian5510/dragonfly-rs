@@ -7,6 +7,9 @@ edition.workspace = true
 dfly-common = { path = "../dfly-common" }
 tokio = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.10"
+
 [dev-dependencies]
 googletest = { workspace = true }
 rstest = { workspace = true }
